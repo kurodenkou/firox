@@ -220,6 +220,7 @@ From then on it updates normally (`ujust update`). On your first login afterward
 | `ujust dark-mode [on\|off\|auto]` | Dark or light apps regardless of the look (`auto` follows it) |
 | `ujust power-saving [KEY=MINUTES...\|reset]` | Show or change the monitor-off, lock and sleep timers (e.g. `MONITOR_AC=10 SLEEP_BATTERY=20`; 0 = never) |
 | `ujust install-nvidia` / `ujust remove-nvidia` | Switch to / from the image with NVIDIA drivers |
+| `ujust install-sunshine` / `ujust remove-sunshine` | Install [Sunshine](https://app.lizardbyte.dev/Sunshine/) (Flathub) to stream games and the desktop to [Moonlight](https://moonlight-stream.org/) on a phone, tablet, TV or PC: sets up its virtual input devices, opens its streaming ports, starts it at login (Startup Programs) and opens its web page at `https://localhost:47990` |
 
 ## Customising
 
