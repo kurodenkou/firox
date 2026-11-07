@@ -1,0 +1,21 @@
+#!/usr/bin/bash
+# Which monitor to share, for xdg-desktop-portal-wlr's "simple" chooser
+# (/etc/xdg/xdg-desktop-portal-wlr/config). Prints "Monitor: NAME".
+#
+# One monitor: share it straight away, so apps that capture the screen
+# unattended (Sunshine at login, for example) don't wait for a click.
+# Several: pick one from a list (fuzzel), or click one if that isn't
+# available (slurp, xdg-desktop-portal-wlr's default).
+mapfile -t outputs < <(wlr-randr 2>/dev/null | awk '
+    /^[^ ]/ { name = $1 }
+    /^  Enabled: yes/ { print name }')
+if [ "${#outputs[@]}" -eq 1 ]; then
+    echo "Monitor: ${outputs[0]}"
+elif [ "${#outputs[@]}" -gt 1 ] && command -v fuzzel >/dev/null; then
+    cfg=()
+    [ -e "${XDG_CONFIG_HOME:-$HOME/.config}/fuzzel/fuzzel.ini" ] || cfg=(--config "$(firox-theme path fuzzel.ini)")
+    printf 'Monitor: %s\n' "${outputs[@]}" |
+        fuzzel "${cfg[@]}" --dmenu --prompt 'Share: ' --lines "${#outputs[@]}" --width 30
+else
+    exec slurp -f 'Monitor: %o' -or
+fi

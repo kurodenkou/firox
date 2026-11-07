@@ -110,14 +110,27 @@ install-sunshine:
         'Comment=Game and desktop streaming host for Moonlight' \
         "Exec=flatpak run --command=sunshine $APP" "Icon=$APP" 'X-GNOME-Autostart-enabled=true' \
         > ~/.config/autostart/$APP.desktop
-    # Capture with wlroots screencopy. Sunshine would otherwise try KMS first,
-    # which needs CAP_SYS_ADMIN, something a Flatpak can't have ("Failed to
-    # gain CAP_SYS_ADMIN"); labwc offers wlr-export-dmabuf and wlr-screencopy.
-    # A capture method chosen in the web UI is kept.
+    # Screen capture: the desktop portal (screen sharing), as Sunshine's docs
+    # recommend for the Flatpak. Its other Linux methods need CAP_SYS_ADMIN
+    # (KMS), which a Flatpak can't have ("Failed to gain CAP_SYS_ADMIN"), or
+    # GPU buffer sharing that didn't work here. A method you chose in
+    # Sunshine's web page is kept; "capture = wlr", suggested earlier, is
+    # replaced.
     CONF=~/.var/app/$APP/config/sunshine/sunshine.conf
     mkdir -p "$(dirname "$CONF")"
+    sed -i '/^[[:space:]]*capture[[:space:]]*=[[:space:]]*wlr[[:space:]]*$/d' "$CONF" 2>/dev/null || true
     if ! grep -Eq '^[[:space:]]*capture[[:space:]]*=' "$CONF" 2>/dev/null; then
-        echo 'capture = wlr' >> "$CONF"
+        echo 'capture = portal' >> "$CONF"
+    fi
+    # The portal runs while the desktop session is up (firox-session.target)
+    systemctl --user start firox-session.target 2>/dev/null || true
+    # NVIDIA: Flatpak apps need the Flatpak build of the same driver version
+    # for hardware encoding (NVENC)
+    if [ -r /sys/module/nvidia/version ]; then
+        nv="$(tr . - < /sys/module/nvidia/version)"
+        echo "Installing NVIDIA's driver for Flatpak apps (version ${nv//-/.})..."
+        flatpak install -y --or-update --user flathub "org.freedesktop.Platform.GL.nvidia-$nv" ||
+            echo "Not on Flathub yet: Sunshine will encode without the GPU until it is (ujust update installs it then)."
     fi
     # (Re)start it now, with the settings above
     flatpak kill "$APP" 2>/dev/null || true

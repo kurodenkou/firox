@@ -1,0 +1,6 @@
+# Screen sharing on Firox Linux (xdg-desktop-portal-wlr): which monitor to
+# share. With one monitor it's shared without asking; with several, pick one
+# from a list. Per-user override: ~/.config/xdg-desktop-portal-wlr/config
+[screencast]
+chooser_type=simple
+chooser_cmd=/usr/libexec/firox/screencast-chooser

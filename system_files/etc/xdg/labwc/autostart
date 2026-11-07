@@ -1,6 +1,14 @@
 # Firox Linux session autostart (run by labwc at login).
 # Per-user overrides: ~/.config/labwc/autostart replaces this file.
 
+# Tell systemd the desktop session has started (firox-session.target): the
+# desktop portal, which Flatpak apps use for screen sharing, file pickers and
+# light/dark mode, only runs during a graphical session. labwc has already
+# passed WAYLAND_DISPLAY etc. to systemd; the import covers nested or test
+# sessions. A personal ~/.config/labwc/autostart should keep these lines.
+systemctl --user import-environment WAYLAND_DISPLAY XDG_CURRENT_DESKTOP XDG_SESSION_TYPE XDG_SESSION_DESKTOP 2>/dev/null
+systemctl --user start firox-session.target 2>/dev/null
+
 # Classic or Modern look: see `firox-theme` and Settings > Appearance
 CFG="${XDG_CONFIG_HOME:-$HOME/.config}"
 
