@@ -75,6 +75,80 @@ install-app-store:
     echo "Installed. Open Start -> Bazaar."
     read -rp "Press Enter to close" _
 
+# Sunshine (the Flathub app, started at login) streams this computer's desktop
+# and games to Moonlight on a phone, tablet, TV or another PC
+# Install Sunshine to stream games and the desktop to Moonlight
+[group('Firox Linux')]
+install-sunshine:
+    #!/usr/bin/bash
+    set -euo pipefail
+    APP=dev.lizardbyte.app.Sunshine
+    echo "This installs Sunshine (from Flathub), lets it control the mouse, keyboard"
+    echo "and game controllers, opens its ports in the firewall and starts it at login."
+    read -rp "Continue? [y/N] " ans
+    [[ "${ans,,}" == y* ]] || exit 0
+    flatpak remote-add --if-not-exists --user flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+    flatpak install -y --user flathub "$APP"
+    echo
+    echo "Setting up input devices for streaming (a password window will appear)..."
+    # Sunshine's own helper: udev rules for its virtual mouse, keyboard and
+    # controllers. Run again after Sunshine updates if input stops working.
+    flatpak run --command=additional-install.sh "$APP"
+    echo
+    echo "Opening Sunshine's streaming ports in the firewall..."
+    zone="$(firewall-cmd --get-default-zone 2>/dev/null || echo FedoraWorkstation)"
+    # The web UI (47990) stays local: manage Sunshine from this computer
+    sudo firewall-cmd --permanent --zone="$zone" \
+        --add-port=47984/tcp --add-port=47989/tcp --add-port=48010/tcp \
+        --add-port=47998-48000/udp --add-port=48002/udp --add-port=48010/udp >/dev/null
+    sudo firewall-cmd --reload >/dev/null
+    # Start at login, through Startup Programs (where it can be unticked). Not
+    # Sunshine's systemd user service: that waits for graphical-session.target,
+    # which the Firox session doesn't start, so ignore the helper's tip about it.
+    mkdir -p ~/.config/autostart
+    printf '%s\n' '[Desktop Entry]' 'Type=Application' 'Name=Sunshine' \
+        'Comment=Game and desktop streaming host for Moonlight' \
+        "Exec=flatpak run --command=sunshine $APP" "Icon=$APP" 'X-GNOME-Autostart-enabled=true' \
+        > ~/.config/autostart/$APP.desktop
+    # Start it now
+    if ! flatpak ps --columns=application 2>/dev/null | grep -qx "$APP"; then
+        setsid -f flatpak run --command=sunshine "$APP" >/dev/null 2>&1
+        sleep 4
+    fi
+    echo
+    echo "Sunshine is running and will start whenever you log in."
+    echo
+    echo "1. Open https://localhost:47990 (opening it now). Your browser warns about"
+    echo "   the certificate: that's expected, continue. Create a username and password."
+    echo "2. Install Moonlight on the device you want to stream to and pick this computer."
+    echo "3. Moonlight shows a PIN: type it in Sunshine's web page under PIN."
+    xdg-open https://localhost:47990 >/dev/null 2>&1 || true
+    echo
+    read -rp "Press Enter to close" _
+
+# Remove Sunshine, its input rules, autostart entry and firewall ports
+[group('Firox Linux')]
+remove-sunshine:
+    #!/usr/bin/bash
+    set -uo pipefail
+    APP=dev.lizardbyte.app.Sunshine
+    if ! flatpak info "$APP" >/dev/null 2>&1; then
+        echo "Sunshine isn't installed."
+        exit 0
+    fi
+    read -rp "Remove Sunshine and its settings? [y/N] " ans
+    [[ "${ans,,}" == y* ]] || exit 0
+    flatpak kill "$APP" 2>/dev/null
+    flatpak run --command=remove-additional-install.sh "$APP"
+    flatpak uninstall -y --delete-data "$APP"
+    rm -f ~/.config/autostart/$APP.desktop
+    zone="$(firewall-cmd --get-default-zone 2>/dev/null || echo FedoraWorkstation)"
+    sudo firewall-cmd --permanent --zone="$zone" \
+        --remove-port=47984/tcp --remove-port=47989/tcp --remove-port=48010/tcp \
+        --remove-port=47998-48000/udp --remove-port=48002/udp --remove-port=48010/udp >/dev/null
+    sudo firewall-cmd --reload >/dev/null
+    echo "Sunshine removed."
+
 # Throw away your desktop customisations and go back to the Firox Linux defaults
 [group('Firox Linux')]
 reset-desktop:
