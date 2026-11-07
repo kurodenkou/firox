@@ -1,4 +1,8 @@
-# Run by labwc when the session ends
+# Run by labwc when the session ends (log off, restart, turn off).
+# Per-user override: ~/.config/labwc/shutdown replaces this file.
 pkill -u "$USER" -x firox-panel
 pkill -u "$USER" -x waybar
 pkill -u "$USER" -x swayidle
+
+# End the systemd side of the desktop session (see firox-session.target)
+systemctl --user stop firox-session.target 2>/dev/null

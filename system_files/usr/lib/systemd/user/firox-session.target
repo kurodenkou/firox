@@ -1,0 +1,14 @@
+# The Firox Linux desktop session, for systemd's user manager.
+#
+# Started by the session's autostart (/etc/xdg/labwc/autostart) once labwc
+# is up and has passed WAYLAND_DISPLAY etc. to systemd, and stopped by
+# /etc/xdg/labwc/shutdown when you log off. While it runs, so does
+# graphical-session.target, which xdg-desktop-portal requires
+# (Requisite=graphical-session.target): screen sharing, screen capture and
+# file pickers for Flatpak apps, and light/dark mode for them.
+[Unit]
+Description=Firox Linux desktop session
+Documentation=man:systemd.special(7)
+BindsTo=graphical-session.target
+Wants=graphical-session-pre.target
+After=graphical-session-pre.target
