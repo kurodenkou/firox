@@ -136,6 +136,7 @@ system_files/                 copied onto / in the image
   usr/share/themes/Firox-Luna/   window theme + SVG buttons
   usr/share/ublue-os/just/60-custom.just   `ujust` recipes
 disk_config/                  qcow2 / ISO definitions for bootc-image-builder
+scripts/nightly-build.sh      nightly build for your own machine (see below)
 Justfile                      local build helpers (from ublue image-template)
 ```
 
@@ -244,6 +245,23 @@ Each look's styling lives in `/usr/share/firox/themes/{classic,modern,glass}/` (
 ## Building and signing
 
 GitHub Actions (`.github/workflows/build.yml`) builds and pushes `ghcr.io/<owner>/firox` and `ghcr.io/<owner>/firox-nvidia-open` on every push to `main` and every day, and test-builds pull requests. Changes that only touch Markdown or `docs/` don't trigger a build. The website in `docs/` is served by GitHub Pages (Settings → Pages: deploy from the `main` branch, `/docs` folder). Disk images (`build-disk.yml`) are only built when started by hand. To sign images, generate a key pair with `cosign generate-key-pair` and add the private key as the `SIGNING_SECRET` repository secret. Without it, the build still runs and signing is skipped.
+
+### Building nightly on your own machine
+
+`scripts/nightly-build.sh` does what the GitHub build does, on a build box in your home lab, using the same Justfile recipes. It updates its own checkout of `main`, builds the standard and NVIDIA images, rechunks, tags, pushes (to ghcr.io and/or a registry on your network) and signs them. It can also build installer ISOs.
+
+- **Needs:** `git`, `just`, `podman`, `jq` and `python3` (plus `cosign` to sign). Allow about 50 GB of disk. ISOs need root: run the script as root, or give its user passwordless `sudo`.
+- **Settings:** copy `scripts/nightly-build.conf.example` to `~/.config/firox-build.conf`. To push to ghcr.io, put a [token with `write:packages`](https://github.com/settings/tokens/new?scopes=write:packages) in `~/.config/firox-ghcr-token` (`chmod 600`).
+- **Nightly with cron** (`crontab -e`):
+
+  ```
+  MAILTO=you@example.com
+  30 2 * * *  $HOME/firox/scripts/nightly-build.sh
+  ```
+
+- **Results:** a log per run in `~/.local/state/firox-build/` (kept 14 days), and a short summary on output. It exits non-zero if anything failed, so cron mails you. A night that finds the previous build still running skips itself.
+- **Options:** `--variant main|nvidia`, `--no-push`, `--dry-run`.
+- **GitHub's daily build:** to stop it while your box builds nightly, set the repository variable `FIROX_HOMELAB_NIGHTLY` to `true` (Settings → Secrets and variables → Actions → Variables). Builds on merge still run on GitHub.
 
 ## Known limitations
 

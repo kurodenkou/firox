@@ -1,0 +1,49 @@
+# Settings for scripts/nightly-build.sh. Copy to ~/.config/firox-build.conf
+# and change what you need; anything left out keeps the default shown here.
+# (It's a shell file: KEY=value, no spaces around the =.)
+
+# The repository and branch to build. The script keeps its own checkout in
+# REPO_DIR and resets it to the branch every run, so don't work in it.
+REPO_URL="https://github.com/kurodenkou/firox.git"
+REPO_DIR="$HOME/firox-build"
+BRANCH="main"
+
+# Which images: main (ghcr.io/.../firox) and/or nvidia (firox-nvidia-open)
+VARIANTS="main nvidia"
+
+# Rechunk like the GitHub build does (smaller downloads for installed systems)
+RECHUNK=1
+
+# --- Publishing to ghcr.io -------------------------------------------------
+# A GitHub personal access token (classic) with the write:packages scope,
+# alone in this file (chmod 600):
+#   https://github.com/settings/tokens/new?scopes=write:packages
+PUSH_GHCR=1
+GHCR_OWNER="kurodenkou"
+GHCR_USER="kurodenkou"
+GHCR_TOKEN_FILE="$HOME/.config/firox-ghcr-token"
+
+# Optional: sign what's pushed to ghcr.io, as the GitHub build does with the
+# SIGNING_SECRET secret (cosign generate-key-pair; install cosign first)
+COSIGN_KEY_FILE=""
+COSIGN_PASSWORD_FILE=""
+
+# --- A registry on your network (optional) ---------------------------------
+# Push here too, and point your Firox machines at it for fast LAN updates:
+#   sudo bootc switch 192.168.1.10:5000/firox:latest
+# A plain-HTTP registry also needs LOCAL_TLS_VERIFY=false here, and on each
+# machine an entry in /etc/containers/registries.conf.d/ marking it insecure.
+LOCAL_REGISTRY=""
+LOCAL_TLS_VERIFY=true
+
+# --- Installer ISOs (optional) ---------------------------------------------
+# Needs root: run the script as root, or let this user run sudo without a
+# password (e.g. /etc/sudoers.d/firox-build: "builder ALL=(root) NOPASSWD: ALL").
+BUILD_ISO=0
+ISO_VARIANTS="main"
+ISO_DIR="$HOME/firox-isos"
+ISO_KEEP=2
+
+# --- Logs ------------------------------------------------------------------
+LOG_DIR="$HOME/.local/state/firox-build"
+LOG_KEEP_DAYS=14
