@@ -12,26 +12,32 @@ systemctl --user start firox-session.target 2>/dev/null
 # Classic or Modern look: see `firox-theme` and Settings > Appearance
 CFG="${XDG_CONFIG_HOME:-$HOME/.config}"
 
+# keep-running starts the desktop and the taskbar again if they crash, e.g.
+# when a monitor switches off or wakes up (restarts are logged in
+# ~/.local/state/firox/session.log)
+KEEP=/usr/libexec/firox/keep-running
+STATE="${XDG_STATE_HOME:-$HOME/.local/state}/firox"
+mkdir -p "$STATE"
+
 # Desktop: wallpaper + Computer / Recycle Bin icons
 # (~/Desktop etc. must exist before pcmanfm-qt starts)
 xdg-user-dirs-update
-pcmanfm-qt --desktop --profile=firox >/dev/null 2>&1 &
+$KEEP pcmanfm-qt --desktop --profile=firox >/dev/null 2>&1 &
 
 # Taskbar: firox-panel (its log: ~/.local/state/firox/panel.log). If you
 # set up waybar yourself (~/.config/waybar), that runs instead; waybar is
 # also the fallback when firox-panel can't run here (it exits with 3).
-STATE="${XDG_STATE_HOME:-$HOME/.local/state}/firox"
-mkdir -p "$STATE"
 if [ -e "$CFG/waybar/config" ] || [ -e "$CFG/waybar/config.jsonc" ] || [ -e "$CFG/waybar/style.css" ]; then
     if [ -e "$CFG/waybar/style.css" ]; then
-        waybar >/dev/null 2>&1 &
+        $KEEP waybar >/dev/null 2>&1 &
     else
-        waybar -s "$(firox-theme path waybar.css)" >/dev/null 2>&1 &
+        $KEEP waybar -s "$(firox-theme path waybar.css)" >/dev/null 2>&1 &
     fi
 else
+    : >"$STATE/panel.log"
     (
-        firox-panel 2>"$STATE/panel.log"
-        [ $? -eq 3 ] && exec waybar -s "$(firox-theme path waybar.css)"
+        $KEEP firox-panel 2>>"$STATE/panel.log"
+        [ $? -eq 3 ] && exec $KEEP waybar -s "$(firox-theme path waybar.css)"
     ) >/dev/null 2>&1 &
 fi
 

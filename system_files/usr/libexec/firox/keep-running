@@ -1,0 +1,72 @@
+#!/usr/bin/bash
+# keep-running CMD [ARGS...]: run a desktop component (the desktop icons and
+# wallpaper, the taskbar) and start it again if it crashes. Used by the labwc
+# autostart.
+#
+# Monitors that switch off, sleep or wake up can disappear and come back, and
+# some programs crash when that happens (pcmanfm-qt does when a monitor is
+# removed). This brings them back instead of leaving an empty screen.
+#
+# It stops, passing on the exit status, when the program:
+#   - exits normally (0) or is told to stop (SIGTERM, SIGINT, SIGHUP)
+#   - exits with 3: firox-panel's "can't run here" (the autostart then
+#     starts waybar)
+#   - keeps crashing: 6 times within a minute
+# It also stops when the session ends (labwc has gone).
+# Each restart is logged in ~/.local/state/firox/session.log.
+set -u
+
+[ $# -gt 0 ] || { echo "usage: keep-running CMD [ARGS...]" >&2; exit 2; }
+name="$(basename "$1")"
+LOG="${XDG_STATE_HOME:-$HOME/.local/state}/firox/session.log"
+mkdir -p "$(dirname "$LOG")"
+
+log() {
+    echo "$(date '+%F %T') $name: $*" >>"$LOG"
+    # Keep the log short
+    if [ "$(wc -l <"$LOG")" -gt 400 ]; then
+        tail -n 200 "$LOG" >"$LOG.tmp" && mv -f "$LOG.tmp" "$LOG"
+    fi
+}
+
+session_alive() {
+    if [ -n "${LABWC_PID:-}" ]; then
+        kill -0 "$LABWC_PID" 2>/dev/null || return 1
+    fi
+    [ -S "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/${WAYLAND_DISPLAY:-wayland-0}" ]
+}
+
+# Some monitor (a wl_output) is there to draw on
+have_output() {
+    command -v wlr-randr >/dev/null || return 0
+    wlr-randr 2>/dev/null | grep -q 'Enabled: yes'
+}
+
+crashes=()
+while :; do
+    "$@"
+    status=$?
+    case $status in
+        0|3|129|130|143) exit $status ;;
+    esac
+    session_alive || exit $status
+
+    if [ $status -gt 128 ]; then why="crashed (signal $((status - 128)))"; else why="exited with $status"; fi
+    now=$(date +%s)
+    recent=()
+    for t in "${crashes[@]}"; do [ $((now - t)) -lt 60 ] && recent+=("$t"); done
+    crashes=("${recent[@]}" "$now")
+    if [ ${#crashes[@]} -ge 6 ]; then
+        log "$why; crashed 6 times in a minute, not starting it again"
+        exit $status
+    fi
+    log "$why; starting it again"
+
+    # Give the monitors a moment to come back (up to a minute), then restart
+    sleep 1
+    for _ in $(seq 60); do
+        session_alive || exit $status
+        have_output && break
+        sleep 1
+    done
+done
