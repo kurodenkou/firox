@@ -23,6 +23,11 @@ concurrency:
 jobs:
   build_push:
     name: Build and push image (${{ matrix.variant }})
+    # Building nightly on your own machine (scripts/nightly-build.sh)? Set the
+    # repository variable FIROX_HOMELAB_NIGHTLY to true (Settings > Secrets and
+    # variables > Actions > Variables) to skip GitHub's daily build. Builds on
+    # merge and manual runs still happen here.
+    if: github.event_name != 'schedule' || vars.FIROX_HOMELAB_NIGHTLY != 'true'
     runs-on: ubuntu-26.04
     strategy:
       fail-fast: false
