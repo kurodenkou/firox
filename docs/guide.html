@@ -95,9 +95,8 @@ COMMAND=pipes.sh</code></pre></div>
 
 <h2 id="building">Building and signing</h2>
 <ul>
-    <li><b>What's built:</b> GitHub Actions builds and publishes <code>ghcr.io/&lt;owner&gt;/firox</code> and <code>ghcr.io/&lt;owner&gt;/firox-nvidia-open</code> on every push to <code>main</code> and every day.</li>
-    <li><b>What doesn't trigger a build:</b> changes that only touch Markdown or <code>docs/</code> (this website), and pull requests.</li>
-    <li><b>Disk images:</b> <code>build-disk.yml</code> only runs when started by hand.</li>
+    <li><b>What's built:</b> <code>ghcr.io/&lt;owner&gt;/firox</code> and <code>ghcr.io/&lt;owner&gt;/firox-nvidia-open</code>, built and published nightly by <code>scripts/nightly-build.sh</code> on a home lab build box (below).</li>
+    <li><b>GitHub Actions:</b> doesn't run on its own: not on pushes, pull requests or a schedule. If the build box is out of action, start <b>Actions → Build container image → Run workflow</b> by hand. Disk images (<code>build-disk.yml</code>) are manual too.</li>
     <li><b>Signing:</b> generate a key pair with <code>cosign generate-key-pair</code> and add the private key as the <code>SIGNING_SECRET</code> repository secret. Without it, images still build and signing is skipped.</li>
 </ul>
 
@@ -122,7 +121,7 @@ COMMAND=pipes.sh</code></pre></div>
     <li><b>Results:</b> each run writes a log to <code>~/.local/state/firox-build/</code> (kept 14 days) and prints a short summary. It exits non-zero if anything failed, so cron mails you.</li>
     <li><b>Overlaps:</b> a night that finds the previous build still running skips itself.</li>
     <li><b>Options:</b> <code>--variant main|nvidia</code>, <code>--no-push</code>, <code>--dry-run</code>.</li>
-    <li><b>GitHub's daily build:</b> to stop it while your box builds nightly, set the repository variable <code>FIROX_HOMELAB_NIGHTLY</code> to <code>true</code> (Settings → Secrets and variables → Actions → Variables). Builds on merge still run on GitHub.</li>
+    <li><b>Testing a pull request:</b> <code>--pr 42</code> (or <code>--branch NAME</code>) builds it without publishing anything or making ISOs, so you can check it builds before merging.</li>
 </ul>
 
 <h2 id="layout">Repository layout</h2>

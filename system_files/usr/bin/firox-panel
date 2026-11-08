@@ -1876,7 +1876,9 @@ class Panel:
 
     def add_bar(self, monitor):
         if monitor not in self.bars:
-            self.bars[monitor] = Bar(self, monitor)
+            bar = Bar(self, monitor)
+            self.bars[monitor] = bar
+            bar.connect("destroy", lambda b: self.on_bar_gone(monitor, b))
             self.refresh()
 
     def remove_bar(self, monitor):
@@ -1884,6 +1886,21 @@ class Panel:
         if bar is not None:
             bar.destroy()
             self.refresh()
+
+    def on_bar_gone(self, monitor, bar):
+        """A bar closed without its monitor going away (the compositor can
+        close it when a monitor sleeps or wakes up): put a new one there."""
+        if self.bars.get(monitor) is not bar:
+            return                      # removed with its monitor, or replaced
+        del self.bars[monitor]
+        print("firox-panel: a taskbar was closed; putting it back", file=sys.stderr)
+
+        def again():
+            display = Gdk.Display.get_default()
+            if any(display.get_monitor(i) == monitor for i in range(display.get_n_monitors())):
+                self.add_bar(monitor)
+            return False
+        GLib.timeout_add(500, again)
 
     def refresh(self):
         windows = self.toplevels.ordered()
