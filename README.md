@@ -244,7 +244,7 @@ Each look's styling lives in `/usr/share/firox/themes/{classic,modern,glass}/` (
 
 ## Building and signing
 
-GitHub Actions (`.github/workflows/build.yml`) builds and pushes `ghcr.io/<owner>/firox` and `ghcr.io/<owner>/firox-nvidia-open` on every push to `main` and every day, and test-builds pull requests. Changes that only touch Markdown or `docs/` don't trigger a build. The website in `docs/` is served by GitHub Pages (Settings → Pages: deploy from the `main` branch, `/docs` folder). Disk images (`build-disk.yml`) are only built when started by hand. To sign images, generate a key pair with `cosign generate-key-pair` and add the private key as the `SIGNING_SECRET` repository secret. Without it, the build still runs and signing is skipped.
+Images (`ghcr.io/<owner>/firox` and `ghcr.io/<owner>/firox-nvidia-open`) are built and published by `scripts/nightly-build.sh` on a home lab build box (below). The GitHub Actions workflows don't run on their own: not on pushes, pull requests or a schedule. Start `build.yml` by hand (**Actions → Build container image → Run workflow**) if the build box is out of action. The website in `docs/` is served by GitHub Pages (Settings → Pages: deploy from the `main` branch, `/docs` folder). Disk images (`build-disk.yml`) are only built when started by hand. To sign images, generate a key pair with `cosign generate-key-pair` and add the private key as the `SIGNING_SECRET` repository secret. Without it, the build still runs and signing is skipped.
 
 ### Building nightly on your own machine
 
@@ -261,7 +261,7 @@ GitHub Actions (`.github/workflows/build.yml`) builds and pushes `ghcr.io/<owner
 
 - **Results:** a log per run in `~/.local/state/firox-build/` (kept 14 days), and a short summary on output. It exits non-zero if anything failed, so cron mails you. A night that finds the previous build still running skips itself.
 - **Options:** `--variant main|nvidia`, `--no-push`, `--dry-run`.
-- **GitHub's daily build:** to stop it while your box builds nightly, set the repository variable `FIROX_HOMELAB_NIGHTLY` to `true` (Settings → Secrets and variables → Actions → Variables). Builds on merge still run on GitHub.
+- **Testing a pull request:** `scripts/nightly-build.sh --pr 42` (or `--branch NAME`) builds it without publishing anything or making ISOs, so you can check it builds before merging.
 
 ## Known limitations
 

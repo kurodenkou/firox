@@ -1,16 +1,9 @@
 ---
 name: Build container image
 on:
-  # No build on pull requests: the image is built (and published) once,
-  # after merging to main
-  schedule:
-    - cron: '05 10 * * *'  # 10:05am UTC everyday
-  push:
-    branches:
-      - main
-    paths-ignore:
-      - '**/*.md'
-      - 'docs/**'
+  # Manual only (Actions > Build container image > Run workflow). Images are
+  # built and published by scripts/nightly-build.sh on a home lab build box,
+  # so nothing here runs on pushes, pull requests or a schedule.
   workflow_dispatch:
 
 env:
@@ -23,11 +16,6 @@ concurrency:
 jobs:
   build_push:
     name: Build and push image (${{ matrix.variant }})
-    # Building nightly on your own machine (scripts/nightly-build.sh)? Set the
-    # repository variable FIROX_HOMELAB_NIGHTLY to true (Settings > Secrets and
-    # variables > Actions > Variables) to skip GitHub's daily build. Builds on
-    # merge and manual runs still happen here.
-    if: github.event_name != 'schedule' || vars.FIROX_HOMELAB_NIGHTLY != 'true'
     runs-on: ubuntu-26.04
     strategy:
       fail-fast: false

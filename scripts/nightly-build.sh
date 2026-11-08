@@ -10,6 +10,10 @@
 #   scripts/nightly-build.sh --variant nvidia     only one variant
 #   scripts/nightly-build.sh --no-push    build (and ISO) but don't publish
 #   scripts/nightly-build.sh --dry-run    show what would run
+#   scripts/nightly-build.sh --pr 42      test-build a pull request
+#   scripts/nightly-build.sh --branch NAME        test-build a branch
+#
+# A test build (--pr, --branch) only builds: it never publishes or makes ISOs.
 #
 # Settings: ~/.config/firox-build.conf (or the file in $FIROX_BUILD_CONF);
 # copy scripts/nightly-build.conf.example there. Nightly with cron:
@@ -52,16 +56,26 @@ CONF="${FIROX_BUILD_CONF:-$HOME/.config/firox-build.conf}"
 
 DRY=0
 PUSH=1
+TEST=""                          # set by --pr / --branch
 while [ $# -gt 0 ]; do
     case "$1" in
         --variant) VARIANTS="$2"; ISO_VARIANTS="$2"; shift ;;
         --no-push) PUSH=0 ;;
         --dry-run) DRY=1 ;;
-        -h|--help) sed -n '2,24s/^# \{0,1\}//p' "$0"; exit 0 ;;
+        --pr) TEST="PR #$2"; FETCH="pull/$2/head"; shift ;;
+        --branch) TEST="branch $2"; FETCH="$2"; shift ;;
+        -h|--help) sed -n '2,26s/^# \{0,1\}//p' "$0"; exit 0 ;;
         *) echo "Unknown option: $1 (see --help)" >&2; exit 2 ;;
     esac
     shift
 done
+
+FETCH="${FETCH:-$BRANCH}"
+if [ -n "$TEST" ]; then
+    # Never publish or replace ISOs from something that isn't merged
+    PUSH=0
+    BUILD_ISO=0
+fi
 
 # ------------------------------------------------------------------ helpers --
 mkdir -p "$LOG_DIR"
@@ -99,6 +113,7 @@ finish() {
         echo
         echo "Firox nightly build $STAMP on $(hostname)"
         [ "$DRY" = 1 ] && echo "  (dry run: nothing was actually built, pushed or signed)"
+        [ -n "$TEST" ] && echo "  (test build of $TEST at ${COMMIT:-?}: not published)"
         printf '  %s\n' "${SUMMARY[@]}"
         echo "Log: $LOG"
     } | tee -a "$LOG" >&3
@@ -121,15 +136,15 @@ if [ ${#missing[@]} -gt 0 ]; then
 fi
 
 # ----------------------------------------------------------- update source --
-say "Updating $REPO_DIR from $REPO_URL ($BRANCH)"
+say "Updating $REPO_DIR from $REPO_URL (${TEST:-$BRANCH})"
 if [ ! -d "$REPO_DIR/.git" ]; then
     run git clone --branch "$BRANCH" "$REPO_URL" "$REPO_DIR" || { fail "git clone"; finish; }
 fi
 cd "$REPO_DIR" || { fail "no checkout at $REPO_DIR"; finish; }
 # A clean tree, exactly the branch: the image labels and tags carry its commit
-if ! { run git fetch --quiet origin "$BRANCH" &&
-       run git checkout --quiet -B "$BRANCH" "origin/$BRANCH" &&
-       run git reset --quiet --hard "origin/$BRANCH" &&
+if ! { run git fetch --quiet origin "$FETCH" &&
+       run git checkout --quiet -B firox-build FETCH_HEAD &&
+       run git reset --quiet --hard FETCH_HEAD &&
        run git clean -ffdxq; }; then
     fail "git update"
     finish
