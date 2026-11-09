@@ -110,6 +110,30 @@ def human_size(n):
         n /= 1024
 
 
+PROGRAM_TYPES = {"application/x-executable", "application/x-pie-executable", "application/x-sharedlib",
+                 "application/vnd.appimage", "application/x-iso9660-appimage", "application/x-appimage"}
+SCRIPT_TYPES = {"application/x-shellscript", "text/x-shellscript", "application/x-sh", "text/x-python",
+                "text/x-python3", "application/x-python", "text/x-perl", "application/x-perl"}
+
+
+def program_kind(item):
+    """"appimage", "binary", "script" (only if marked runnable) or None."""
+    if not item.path or item.is_dir or item.app is not None:
+        return None
+    ct = item.content_type or ""
+    if item.path.lower().endswith(".appimage") or "appimage" in ct:
+        return "appimage"
+    if ct in PROGRAM_TYPES:
+        # Shared libraries (.so) are typed like programs; only real programs run
+        if ct == "application/x-sharedlib" and (".so" in os.path.basename(item.path)
+                                                or not os.access(item.path, os.X_OK)):
+            return None
+        return "binary"
+    if ct in SCRIPT_TYPES and os.access(item.path, os.X_OK):
+        return "script"
+    return None
+
+
 def trash_has_items():
     try:
         return any(True for _ in os.scandir(TRASH_FILES))
@@ -900,11 +924,86 @@ class Desktop:
                     self.error(f"Couldn't start {item.name}", err.message)
             elif item.is_dir:
                 spawn(["pcmanfm-qt", item.path])           # the file manager (as firox-open)
+            elif program_kind(item):
+                self.run_program(item)
             else:
                 try:
                     Gio.AppInfo.launch_default_for_uri(item.uri, None)
                 except GLib.Error as err:
                     self.error(f"Couldn't open {item.name}", err.message)
+
+    # ---- programs (AppImages, binaries, scripts): run them, like .exe files
+    def run_program(self, item):
+        kind = program_kind(item)
+        executable = os.access(item.path, os.X_OK)
+        if kind == "script":
+            # Like pcmanfm: a script might be meant to run or to read
+            choice = self.ask(f"Run “{item.name}” or open it?",
+                              "It's a script: a small program written as text.",
+                              [("Cancel", 0), ("Open", 1), ("Run", 2)], default=1)
+            if choice == 1:
+                try:
+                    Gio.AppInfo.launch_default_for_uri(item.uri, None)
+                except GLib.Error as err:
+                    self.error(f"Couldn't open {item.name}", err.message)
+                return
+            if choice != 2:
+                return
+        elif not executable:
+            # Downloaded programs aren't allowed to run until you say so
+            if self.ask(f"Run “{item.name}”?",
+                        "This program isn't marked as one you can run yet, which is normal for "
+                        "downloads. Programs can harm your computer: only run ones from people "
+                        "you trust.", [("Cancel", 0), ("Run", 2)], default=0) != 2:
+                return
+        if not executable and not self.set_executable(item, True):
+            return
+        self.launch_program(item, ["/bin/sh", item.path] if kind == "script" and not executable
+                            else [item.path])
+
+    def set_executable(self, item, on):
+        try:
+            mode = os.stat(item.path).st_mode
+            os.chmod(item.path, (mode | 0o100 | ((mode & 0o044) >> 2)) if on else (mode & ~0o111))
+            return True
+        except OSError as err:
+            self.error(f"Couldn't change “{item.name}”", str(err))
+            return False
+
+    def launch_program(self, item, argv):
+        """Start it from its own folder. If it quits within a few seconds
+        with an error (a missing library, say), show what it said."""
+        logdir = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
+                              "firox", "programs")
+        os.makedirs(logdir, exist_ok=True)
+        log = os.path.join(logdir, os.path.basename(item.path) + ".log")
+        try:
+            out = open(log, "w")
+            proc = subprocess.Popen(argv, cwd=os.path.dirname(item.path), start_new_session=True,
+                                    stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT)
+            out.close()
+        except OSError as err:
+            self.error(f"Couldn't start {item.name}", str(err))
+            return
+        started = time.time()
+
+        def check():
+            code = proc.poll()
+            if code is None:
+                return time.time() - started < 5      # still running: fine
+            if code != 0:
+                try:
+                    with open(log, errors="replace") as fh:
+                        tail = fh.read()[-1500:].strip()
+                except OSError:
+                    tail = ""
+                hint = ""
+                if "fuse" in tail.lower():
+                    hint = ("\n\nAppImages need FUSE; this one may need "
+                            "“--appimage-extract-and-run” added (run it from a terminal).")
+                self.error(f"{item.name} stopped straight away", (tail or f"Exit code {code}") + hint)
+            return False
+        GLib.timeout_add(500, check)
 
     def open_with(self, item):
         dlg = Gtk.AppChooserDialog.new(None, Gtk.DialogFlags.MODAL, Gio.File.new_for_path(item.path))
@@ -1167,6 +1266,11 @@ class Desktop:
             val = Gtk.Label(label=v, xalign=0, selectable=True, wrap=True, max_width_chars=44)
             grid.attach(val, 1, n, 1, 1)
         box.pack_start(grid, False, False, 0)
+        if item.path and not item.is_dir and item.app is None:
+            run = Gtk.CheckButton(label="Allow running this file as a program")
+            run.set_active(os.access(item.path, os.X_OK))
+            run.connect("toggled", lambda b: self.set_executable(item, b.get_active()))
+            box.pack_start(run, False, False, 4)
         dlg.show_all()
         dlg.connect("response", lambda d, _r: d.destroy())
 
@@ -1176,13 +1280,29 @@ class Desktop:
         dlg = Gtk.MessageDialog(message_type=Gtk.MessageType.ERROR, buttons=Gtk.ButtonsType.CLOSE, text=title)
         if detail:
             dlg.format_secondary_text(detail)
+        dlg.set_title("Desktop")
         dlg.connect("response", lambda d, _r: d.destroy())
         dlg.show()
+
+    @staticmethod
+    def ask(title, detail, buttons, default=0):
+        """A question with buttons [(label, id)]; returns the id clicked."""
+        dlg = Gtk.MessageDialog(message_type=Gtk.MessageType.QUESTION, buttons=Gtk.ButtonsType.NONE,
+                                text=title)
+        dlg.format_secondary_text(detail)
+        dlg.set_title("Desktop")
+        for label, rid in buttons:
+            dlg.add_button(label, rid)
+        dlg.set_default_response(default)
+        answer = dlg.run()
+        dlg.destroy()
+        return answer
 
     @staticmethod
     def confirm(title, detail, ok):
         dlg = Gtk.MessageDialog(message_type=Gtk.MessageType.WARNING, buttons=Gtk.ButtonsType.NONE, text=title)
         dlg.format_secondary_text(detail)
+        dlg.set_title("Desktop")
         dlg.add_button("Cancel", Gtk.ResponseType.CANCEL)
         btn = dlg.add_button(ok, Gtk.ResponseType.OK)
         btn.get_style_context().add_class("destructive-action")
@@ -1215,7 +1335,8 @@ class Desktop:
         files = [i for i in sel if i.is_file and not i.special]
         one = sel[0] if len(sel) == 1 else None
         menu = self.menu()
-        self.add(menu, "_Open", lambda: self.open_items(sel), bold=True)
+        run = one is not None and program_kind(one) in ("appimage", "binary")
+        self.add(menu, "_Run" if run else "_Open", lambda: self.open_items(sel), bold=True)
         if one is not None and one.is_file and not one.special and not one.is_dir and one.app is None:
             self.add(menu, "Open _With…", lambda: self.open_with(one))
         if one is not None and one.special == "Trash":
