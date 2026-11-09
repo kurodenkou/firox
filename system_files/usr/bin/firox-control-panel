@@ -7,6 +7,7 @@ settings applets.
     firox-control-panel system     open System Properties directly
     firox-control-panel datetime   open Date and Time directly
     firox-control-panel display    open Display directly
+    firox-control-panel background open Desktop Background directly
     firox-control-panel appearance open Appearance directly
     firox-control-panel power      open Power Options directly
     firox-control-panel screensaver open Screen Saver directly
@@ -18,6 +19,7 @@ settings applets.
     firox-control-panel defaults   open Default Programs directly
 """
 
+import concurrent.futures
 import json
 import os
 import glob
@@ -41,6 +43,7 @@ except (ValueError, ImportError):
 
 sys.path.insert(0, "/usr/lib/firox/python")
 import firox_monitors  # noqa: E402
+import firox_wallpaper  # noqa: E402
 
 # (icon, title, description, argv). Shown in alphabetical order of title.
 APPLETS = [
@@ -57,8 +60,7 @@ APPLETS = [
     ("system-run", "Startup Programs", "Choose what starts when you log in", ["firox-startup"]),
     ("preferences-desktop-default-applications", "Default Programs",
      "Web browser, email, music, pictures and more", ["@defaults"]),
-    ("preferences-desktop-wallpaper", "Desktop Background", "Wallpaper and desktop icons",
-     ["pcmanfm-qt", "--profile=firox", "--desktop-pref=background"]),
+    ("preferences-desktop-wallpaper", "Desktop Background", "Wallpaper and desktop icons", ["@background"]),
     ("multimedia-volume-control", "Sounds and Audio Devices", "Speakers, microphones and volume", ["pavucontrol"]),
     ("audio-card", "Sound Troubleshooter", "Fix silent or crackling Realtek onboard audio",
      ["foot", "-T", "Sound Troubleshooter", "--", "sh", "-c",
@@ -1206,6 +1208,214 @@ class DisplayDialog(Gtk.Dialog):
             subprocess.run(["firox-displays", "main", self.pending], check=False)
 
 
+THUMB_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=3)
+
+
+class BackgroundDialog(Gtk.Dialog):
+    """XP-style Desktop tab: a preview monitor, the wallpapers, position,
+    colour and which icons are on the desktop (firox-desktop)."""
+
+    FOLDERS = ["/usr/share/backgrounds/firox", "/usr/share/backgrounds/fedora-workstation",
+               "/usr/share/backgrounds/f44/default", "/usr/share/backgrounds/images"]
+    NAMES = {"default.svg": "Firox Classic", "modern.svg": "Firox Modern", "glass.svg": "Firox Glass"}
+    EXTS = (".svg", ".png", ".jpg", ".jpeg", ".webp", ".jxl", ".bmp", ".gif", ".tif", ".tiff")
+
+    def __init__(self, parent):
+        super().__init__(title="Desktop Background", transient_for=parent, modal=True)
+        self.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        self.add_button("Apply", Gtk.ResponseType.APPLY)
+        self.set_default_size(620, 640)
+        self.settings = firox_wallpaper.read()
+        self.cache = {}
+        box = self.get_content_area()
+        box.set_spacing(10)
+        box.set_border_width(16)
+
+        self.preview = Gtk.DrawingArea()
+        self.preview.set_size_request(280, 180)
+        self.preview.set_halign(Gtk.Align.CENTER)
+        self.preview.connect("draw", self.on_preview)
+        box.pack_start(self.preview, False, False, 0)
+
+        box.pack_start(Gtk.Label(label="Background:", xalign=0), False, False, 0)
+        self.flow = Gtk.FlowBox()
+        self.flow.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        self.flow.set_max_children_per_line(6)
+        self.flow.set_min_children_per_line(2)
+        self.flow.set_homogeneous(True)
+        self.flow.set_column_spacing(6)
+        self.flow.set_row_spacing(6)
+        self.flow.connect("child-activated", self.on_picked)
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroll.set_min_content_height(190)
+        scroll.set_shadow_type(Gtk.ShadowType.IN)
+        scroll.add(self.flow)
+        box.pack_start(scroll, True, True, 0)
+
+        row = Gtk.Box(spacing=8)
+        browse = Gtk.Button(label="Browse\u2026")
+        browse.connect("clicked", self.on_browse)
+        row.pack_start(browse, False, False, 0)
+        row.pack_start(Gtk.Label(label="Position:"), False, False, 6)
+        self.mode = Gtk.ComboBoxText()
+        for key, label in firox_wallpaper.MODES:
+            self.mode.append(key, label)
+        self.mode.set_active_id(self.settings.get("WallpaperMode") or "zoom")
+        if self.mode.get_active_id() is None:
+            self.mode.set_active_id("zoom")
+        self.mode.connect("changed", lambda c: self.update(WallpaperMode=c.get_active_id()))
+        row.pack_start(self.mode, False, False, 0)
+        row.pack_start(Gtk.Label(label="Colour:"), False, False, 6)
+        self.color = Gtk.ColorButton.new_with_rgba(firox_wallpaper.rgba(self.settings.get("BgColor")))
+        self.color.set_tooltip_text("Shown around or instead of the picture")
+        self.color.connect("color-set", self.on_color)
+        row.pack_start(self.color, False, False, 0)
+        box.pack_start(row, False, False, 0)
+
+        box.pack_start(Gtk.Label(label="Desktop icons:", xalign=0), False, False, 4)
+        icons = Gtk.Box(spacing=14)
+        self.shortcuts = {}
+        on = firox_wallpaper.shortcuts(self.settings)
+        for key, label in firox_wallpaper.SHORTCUTS:
+            cb = Gtk.CheckButton(label=label)
+            cb.set_active(key in on)
+            icons.pack_start(cb, False, False, 0)
+            self.shortcuts[key] = cb
+        box.pack_start(icons, False, False, 0)
+        note = Gtk.Label(xalign=0, wrap=True, max_width_chars=70,
+                         label="The wallpaper is on every monitor; the icons are on the main display "
+                               "(Settings \u2192 Display). Files you put in your Desktop folder show up there too.")
+        note.get_style_context().add_class("dim-label")
+        box.pack_start(note, False, False, 0)
+
+        self.fill()
+        self.show_all()
+
+    # ---- the list of pictures
+    def pictures(self):
+        seen, out = set(), []
+        for folder in self.FOLDERS:
+            try:
+                names = sorted(os.listdir(folder))
+            except OSError:
+                continue
+            for name in names:
+                path = os.path.join(folder, name)
+                if name.lower().endswith(self.EXTS) and os.path.isfile(path) and path not in seen:
+                    seen.add(path)
+                    out.append(path)
+        cur = self.settings.get("Wallpaper") or ""
+        if cur and cur not in seen and os.path.isfile(cur):
+            out.insert(0, cur)
+        return out
+
+    def label_for(self, path):
+        name = os.path.basename(path)
+        if path.startswith("/usr/share/backgrounds/firox/") and name in self.NAMES:
+            return self.NAMES[name]
+        stem = os.path.splitext(name)[0].replace("_", " ").replace("-", " ")
+        return stem[:1].upper() + stem[1:]
+
+    def fill(self):
+        cur = self.settings.get("Wallpaper") or ""
+        entries = [(None, "(None)")] + [(p, self.label_for(p)) for p in self.pictures()]
+        for path, label in entries:
+            child = Gtk.FlowBoxChild()
+            child.path = path
+            col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+            img = Gtk.Image()
+            img.set_size_request(120, 68)
+            if path is None:
+                img.set_from_icon_name("image-missing", Gtk.IconSize.DIALOG)
+            else:
+                self.load_thumb(img, path)
+            col.pack_start(img, False, False, 0)
+            lab = Gtk.Label(label=label, ellipsize=3, max_width_chars=16)
+            col.pack_start(lab, False, False, 0)
+            child.add(col)
+            child.set_tooltip_text(path or "Just the colour")
+            self.flow.add(child)
+            if path == (cur or None):
+                # After the window is up (the list would select its first item)
+                GLib.idle_add(lambda c=child: self.flow.select_child(c) or c.grab_focus() or False)
+
+    @staticmethod
+    def load_thumb(img, path):
+        """Thumbnails load in a background thread (some formats are slow to
+        decode), so the window opens straight away and they fill in."""
+        def work():
+            try:
+                pix = GdkPixbuf.Pixbuf.new_from_file_at_scale(path, 120, 68, True)
+            except GLib.Error:
+                pix = None
+            GLib.idle_add(show, pix)
+
+        def show(pix):
+            if pix is not None:
+                img.set_from_pixbuf(pix)
+            else:
+                img.set_from_icon_name("image-x-generic", Gtk.IconSize.DIALOG)
+            return False
+        THUMB_POOL.submit(work)
+
+    # ---- changes (shown in the preview, saved on Apply)
+    def update(self, **kw):
+        self.settings.update({k: v for k, v in kw.items() if v is not None})
+        self.preview.queue_draw()
+
+    def on_picked(self, _flow, child):
+        self.update(Wallpaper=child.path or "")
+
+    def on_color(self, btn):
+        c = btn.get_rgba()
+        self.update(BgColor="#%02x%02x%02x" % (round(c.red * 255), round(c.green * 255), round(c.blue * 255)))
+
+    def on_browse(self, _btn):
+        dlg = Gtk.FileChooserNative.new("Choose a picture", self, Gtk.FileChooserAction.OPEN, "_Open", "_Cancel")
+        filt = Gtk.FileFilter()
+        filt.set_name("Pictures")
+        filt.add_pixbuf_formats()
+        dlg.add_filter(filt)
+        pictures = GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_PICTURES)
+        if pictures and os.path.isdir(pictures):
+            dlg.set_current_folder(pictures)
+        if dlg.run() == Gtk.ResponseType.ACCEPT:
+            path = dlg.get_filename()
+            if path:
+                self.update(Wallpaper=path)
+                self.flow.unselect_all()
+        dlg.destroy()
+
+    def on_preview(self, widget, cr):
+        a = widget.get_allocation()
+        # A little monitor: bezel, then the screen in 16:9
+        bw, bh = 260, 160
+        x0, y0 = (a.width - bw) / 2, 4
+        cr.set_source_rgb(0.16, 0.17, 0.2)
+        cr.rectangle(x0, y0, bw, bh)
+        cr.fill()
+        cr.rectangle(x0 + bw / 2 - 30, y0 + bh, 60, 10)
+        cr.fill()
+        sx, sy, sw, sh = x0 + 8, y0 + 8, bw - 16, bh - 16
+        cr.save()
+        cr.rectangle(sx, sy, sw, sh)
+        cr.clip()
+        cr.translate(sx, sy)
+        mon_w, mon_h = 1920, 1080
+        cr.scale(sw / mon_w, sh / mon_h)
+        firox_wallpaper.paint(cr, mon_w, mon_h, self.settings, self.cache)
+        cr.restore()
+        return False
+
+    def apply(self):
+        on = [key for key, _label in firox_wallpaper.SHORTCUTS if self.shortcuts[key].get_active()]
+        firox_wallpaper.write({"Wallpaper": self.settings.get("Wallpaper") or "",
+                               "WallpaperMode": self.settings.get("WallpaperMode") or "zoom",
+                               "BgColor": self.settings.get("BgColor") or "#3a3c3f",
+                               "DesktopShortcuts": ",".join(on)})
+
+
 class PowerDialog(Gtk.Dialog):
     """XP-style Power Options: idle timers for the monitor, lock and sleep."""
 
@@ -1569,6 +1779,11 @@ class ControlPanel(Gtk.ApplicationWindow):
             if dlg.run() == Gtk.ResponseType.APPLY:
                 dlg.apply()
             dlg.destroy()
+        elif argv == ["@background"]:
+            dlg = BackgroundDialog(self)
+            if dlg.run() == Gtk.ResponseType.APPLY:
+                dlg.apply()
+            dlg.destroy()
         elif argv == ["@display"]:
             dlg = DisplayDialog(self)
             if dlg.run() == Gtk.ResponseType.APPLY:
@@ -1611,7 +1826,8 @@ class App(Gtk.Application):
                   "screensaver": ["@screensaver"], "clipboard": ["@clipboard"],
                   "mouse": ["@mouse"], "keyboard": ["@keyboard"],
                   "taskbar": ["@taskbar"], "defaults": ["@defaults"],
-                  "display": ["@display"], "startup": ["firox-startup"]}
+                  "display": ["@display"], "background": ["@background"],
+                  "startup": ["firox-startup"]}
         if page in direct and self.win is None:
             # Open just the applet, without the panel window
             if direct[page][0].startswith("@"):
@@ -1621,6 +1837,7 @@ class App(Gtk.Application):
                        "power": PowerDialog, "screensaver": ScreenSaverDialog,
                        "clipboard": ClipboardDialog, "taskbar": TaskbarDialog,
                        "defaults": DefaultsDialog, "display": DisplayDialog,
+                       "background": BackgroundDialog,
                        "mouse": MouseDialog, "keyboard": KeyboardDialog}[page]
                 dlg = cls(None)
                 if dlg.run() == Gtk.ResponseType.APPLY:

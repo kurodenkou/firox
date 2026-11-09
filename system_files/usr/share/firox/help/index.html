@@ -28,6 +28,7 @@
 <main>
 <nav>
   <a href="#start">The Start menu</a>
+  <a href="#desktop">The desktop</a>
   <a href="#taskbar">The taskbar</a>
   <a href="#clipboard">Copy and paste</a>
   <a href="#snip">Screenshots</a>
@@ -52,6 +53,10 @@
 <h2 id="start">The Start menu</h2>
 <p>Click the <b>firox</b> button (or tap the <kbd>Super</kbd> key) to open the Start menu. The left side has your pinned programs and the ones you use most. The right side opens your folders, Settings, the Bazaar app store and system tools. <b>All Programs</b> lists everything installed, grouped into folders; you can also just start typing to search.</p>
 <p>To change the picture at the top of the Start menu, click it (or open <b>Settings &rarr; User Accounts</b>) and pick one of the built-in pictures or <b>Browse for more pictures&hellip;</b> to use your own photo. The same picture appears next to your name on the welcome screen when you log on.</p>
+
+<h2 id="desktop">The desktop</h2>
+<p>The wallpaper is on every monitor; the icons (<b>Computer</b>, your home folder, <b>Network</b>, the <b>Recycle Bin</b> and everything in your Desktop folder) are on the main display. Double-click an icon to open it. Drag icons to put them where you like (they stay there), onto a folder to move files into it, onto the Recycle Bin to delete them, or into another program. Drop files from other programs onto the desktop to copy them there (hold Shift to move them instead).</p>
+<p>Right-click an icon to open it with another program, cut, copy, rename (or press F2), move it to the Recycle Bin (or press Delete) or see its properties. Right-click the desktop to arrange the icons by name, type, size or date, paste, or make a new folder or text document. To change the wallpaper, its position and colour, or which icons are shown, right-click the desktop and choose <b>Desktop Background</b> (also in Settings).</p>
 
 <h2 id="taskbar">The taskbar</h2>
 <p>Each open window has a button on the taskbar. Click it to switch to the window, or click it again to minimise it. Right-click it for <b>Restore</b>, <b>Minimize</b>, <b>Maximize</b> and <b>Close</b>; a middle-click closes it.</p>
@@ -173,7 +178,7 @@
 <p><b>Resolution and arrangement.</b> In <b>Settings &rarr; Display</b>, click <b>Resolution and arrangement</b>, change resolution, refresh rate, scale or arrangement, and close the window. Your layout is saved when you close it and comes back at every login. Each combination of monitors (for example, laptop alone vs. docked) remembers its own layout. If you write your own <code>~/.config/kanshi/config</code>, Firox leaves it alone. If a layout doesn't come back, the details are in <code>~/.local/state/firox/displays.log</code>.</p>
 
 <h2 id="customize">Customizing</h2>
-<p>The desktop is <b>labwc</b> (window manager), <b>firox-panel</b> (taskbar; add your own styling in <code>~/.config/firox/panel.css</code>) and <b>pcmanfm-qt</b> (desktop icons and wallpaper). Run <code>ujust customize-desktop</code> to copy the defaults into <code>~/.config</code>, where you can edit them. <code>ujust reset-desktop</code> puts the defaults back.</p>
+<p>The desktop is <b>labwc</b> (window manager), <b>firox-panel</b> (taskbar; add your own styling in <code>~/.config/firox/panel.css</code>) and <b>firox-desktop</b> (desktop icons and wallpaper). Run <code>ujust customize-desktop</code> to copy the defaults into <code>~/.config</code>, where you can edit them. <code>ujust reset-desktop</code> puts the defaults back.</p>
 </article>
 </main>
 </body>

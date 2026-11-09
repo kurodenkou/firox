@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <openbox_menu>
-  <!-- Right-click on an empty desktop (fallback when pcmanfm-qt isn't drawing it) -->
+  <!-- Right-click on an empty desktop (fallback when firox-desktop isn't drawing it) -->
   <menu id="root-menu" label="">
     <item label="Arrange Icons / Refresh">
       <action name="Reconfigure" />

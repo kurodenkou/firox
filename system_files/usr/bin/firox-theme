@@ -60,40 +60,18 @@ link_labwc_theme() {
 }
 
 # Change the wallpaper only if the user is still on one of our defaults
-switch_wallpaper() {
-    local new user_conf cur
-    new="$(setting "$1" WALLPAPER)"
-    [ -n "$new" ] || return 0
-    user_conf="$CONF/pcmanfm-qt/firox/settings.conf"
-    cur="$(sed -n 's/^Wallpaper=//p' "$user_conf" 2>/dev/null | head -n1)"
-    case "$cur" in
-        ""|/usr/share/backgrounds/firox/*) ;;
-        *) return 0 ;;
-    esac
-    pcmanfm-qt --profile=firox --set-wallpaper "$new" >/dev/null 2>&1 || true
-}
-
-# Before the desktop starts (login): write the theme's wallpaper into the
-# user's desktop settings, again only if they're on one of our defaults.
-# pcmanfm-qt reads either the user's file or the system one (no merging),
-# so a new user file starts as a copy of the system defaults.
-seed_wallpaper() {
-    local new user_conf cur
-    new="$(setting "$1" WALLPAPER)"
-    [ -n "$new" ] || return 0
-    user_conf="$CONF/pcmanfm-qt/firox/settings.conf"
-    cur="$(sed -n 's/^Wallpaper=//p' "$user_conf" 2>/dev/null | head -n1)"
-    case "$cur" in
-        ""|/usr/share/backgrounds/firox/*|/usr/share/backgrounds/firefoxos/*) ;;
-        *) return 0 ;;
-    esac
-    [ "$cur" = "$new" ] && return 0
+# Write WALLPAPER into the user's desktop settings (firox-desktop reads them
+# and redraws straight away; so does the Glass taskbar). The desktop reads
+# either the user's file or the system one (no merging), so a new user file
+# starts as a copy of the system defaults.
+write_wallpaper() {
+    local user_conf="$CONF/pcmanfm-qt/firox/settings.conf" new="$1"
     if [ ! -f "$user_conf" ]; then
         mkdir -p "$(dirname "$user_conf")"
         cp /etc/xdg/pcmanfm-qt/firox/settings.conf "$user_conf" 2>/dev/null || printf '[Desktop]\n' > "$user_conf"
     fi
     python3 - "$user_conf" "$new" <<'PY'
-import configparser, sys
+import configparser, os, sys
 path, wallpaper = sys.argv[1], sys.argv[2]
 p = configparser.ConfigParser(interpolation=None, strict=False)
 p.optionxform = str
@@ -101,9 +79,37 @@ p.read(path)
 if not p.has_section("Desktop"):
     p.add_section("Desktop")
 p["Desktop"]["Wallpaper"] = wallpaper
-with open(path, "w") as fh:
+with open(path + ".tmp", "w") as fh:
     p.write(fh, space_around_delimiters=False)
+os.replace(path + ".tmp", path)
 PY
+}
+
+# Theme switch: use the new theme's wallpaper, unless you chose your own
+switch_wallpaper() {
+    local new cur
+    new="$(setting "$1" WALLPAPER)"
+    [ -n "$new" ] || return 0
+    cur="$(sed -n 's/^Wallpaper=//p' "$CONF/pcmanfm-qt/firox/settings.conf" 2>/dev/null | head -n1)"
+    case "$cur" in
+        ""|/usr/share/backgrounds/firox/*) ;;
+        *) return 0 ;;
+    esac
+    [ "$cur" = "$new" ] || write_wallpaper "$new"
+}
+
+# Before the desktop starts (login): the same, also moving people off the
+# old FirefoxOS wallpapers
+seed_wallpaper() {
+    local new cur
+    new="$(setting "$1" WALLPAPER)"
+    [ -n "$new" ] || return 0
+    cur="$(sed -n 's/^Wallpaper=//p' "$CONF/pcmanfm-qt/firox/settings.conf" 2>/dev/null | head -n1)"
+    case "$cur" in
+        ""|/usr/share/backgrounds/firox/*|/usr/share/backgrounds/firefoxos/*) ;;
+        *) return 0 ;;
+    esac
+    [ "$cur" = "$new" ] || write_wallpaper "$new"
 }
 
 restart_detached() {
