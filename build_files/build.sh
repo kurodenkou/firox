@@ -51,7 +51,9 @@ PACKAGES=(
     kanshi
     wdisplays                    # Display settings GUI
     swayidle
-    swaylock
+    swaylock                     # fallback lock screen
+    gtk-session-lock             # firox-lock (ext-session-lock for GTK)
+    python3-pam                  # firox-lock password check
     wlopm
     mako                         # notifications
     libnotify

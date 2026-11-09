@@ -1,0 +1,423 @@
+#!/usr/bin/python3
+"""
+firox-lock: the Firox Linux lock screen ("This computer is locked").
+
+    firox-lock              lock now (returns when you unlock)
+    firox-lock -f           lock, and return as soon as the screen is locked
+                            (for sleep and the idle timer: firox-open lock)
+
+It looks like the login screen (the theme's welcome.css), with your account
+picture, the time and date, and a password box on every monitor; your
+wallpaper is behind it. Turn off computer offers Sleep, Turn Off and
+Restart. The password is checked with PAM (/etc/pam.d/firox-lock).
+
+Locking uses the Wayland ext-session-lock protocol (gtk-session-lock): if
+the lock screen ever crashed, the screen would stay locked, not open. Exits
+with 2 if the compositor can't lock this way (firox-open then uses swaylock).
+"""
+
+import os
+import pwd
+import subprocess
+import sys
+import threading
+import time
+
+THEMES = "/usr/share/firox/themes"
+DEFAULT_FACE = "/usr/share/firox/icons/user-default.svg"
+PAM_SERVICE = "firox-lock"
+CONFIG = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "firox")
+
+EXTRA_CSS = b"""
+#logo.clock { font-size: 64px; }
+#hint.date { font-size: 18px; }
+#hint.locked { font-size: 14px; opacity: 0.85; }
+.tile .caps { color: #ffd479; font-size: 12px; }
+"""
+
+
+def theme_name():
+    for path in (os.path.join(CONFIG, "theme"), "/etc/firox/theme"):
+        try:
+            with open(path) as fh:
+                name = fh.read().strip()
+            if name and os.path.exists(os.path.join(THEMES, name, "welcome.css")):
+                return name
+        except OSError:
+            continue
+    return "modern" if os.path.exists(os.path.join(THEMES, "modern", "welcome.css")) else "classic"
+
+
+def already_running():
+    me = os.getpid()
+    try:
+        out = subprocess.run(["pgrep", "-u", str(os.getuid()), "-x", "firox-lock"],
+                             capture_output=True, text=True, timeout=5).stdout.split()
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return any(int(p) not in (me, os.getppid()) for p in out)
+
+
+def daemonize():
+    """Fork; the parent returns (exits) once the child has locked the
+    screen, so `firox-lock -f; systemctl suspend` never sleeps unlocked.
+    Done before GTK connects to the display."""
+    r, w = os.pipe()
+    pid = os.fork()
+    if pid:
+        os.close(w)
+        with os.fdopen(r, "rb") as fh:
+            ok = fh.read(1) == b"1"
+        sys.exit(0 if ok else 1)
+    os.close(r)
+    os.setsid()
+    return w
+
+
+def main():
+    args = sys.argv[1:]
+    if any(a in ("-h", "--help") for a in args):
+        print(__doc__.strip())
+        return 0
+    if already_running():
+        return 0                        # already locked
+    notify_fd = daemonize() if any(a in ("-f", "--daemonize") for a in args) else None
+    run(notify_fd)
+
+
+def run(notify_fd):
+    import gi
+    gi.require_version("Gtk", "3.0")
+    gi.require_version("Gdk", "3.0")
+    gi.require_version("GdkPixbuf", "2.0")
+    try:
+        gi.require_version("GtkSessionLock", "0.1")
+        from gi.repository import GtkSessionLock
+    except (ValueError, ImportError):
+        GtkSessionLock = None
+    from gi.repository import Gdk, GdkPixbuf, GLib, Gtk
+
+    sys.path.insert(0, "/usr/lib/firox/python")
+    try:
+        import firox_wallpaper
+    except ImportError:
+        firox_wallpaper = None
+
+    if GtkSessionLock is None or not GtkSessionLock.is_supported():
+        print("firox-lock: the compositor doesn't support ext-session-lock", file=sys.stderr)
+        sys.exit(2)
+
+    user = pwd.getpwuid(os.getuid())
+    username = user.pw_name
+    realname = (user.pw_gecos or "").split(",")[0] or username
+
+    def picture(size):
+        for path in (os.path.expanduser("~/.face"), os.path.expanduser("~/.face.icon"),
+                     f"/var/lib/AccountsService/icons/{username}", DEFAULT_FACE):
+            try:
+                if os.path.isfile(path):
+                    return GdkPixbuf.Pixbuf.new_from_file_at_scale(path, size, size, False)
+            except GLib.Error:
+                continue
+        return None
+
+    # ---- the look: the login screen's theme, with your wallpaper behind
+    screen = Gdk.Screen.get_default()
+    theme = theme_name()
+    css = Gtk.CssProvider()
+    try:
+        css.load_from_path(os.path.join(THEMES, theme, "welcome.css"))
+    except GLib.Error as err:
+        print(f"firox-lock: {err.message}", file=sys.stderr)
+    Gtk.StyleContext.add_provider_for_screen(screen, css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+    extra = Gtk.CssProvider()
+    data = EXTRA_CSS
+    wallpaper = firox_wallpaper.read().get("Wallpaper", "") if firox_wallpaper else ""
+    if wallpaper and os.path.isfile(wallpaper):
+        uri = GLib.filename_to_uri(wallpaper, None).replace('"', "%22")
+        data += f'#middle {{ background-image: url("{uri}"); background-size: cover; }}\n'.encode()
+    extra.load_from_data(data)
+    Gtk.StyleContext.add_provider_for_screen(screen, extra, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 1)
+
+    state = {"busy": False, "unlocked": False, "fails": 0}
+    windows = {}                        # GdkMonitor -> LockWindow
+
+    class LockWindow(Gtk.Window):
+        """The lock screen on one monitor."""
+
+        def __init__(self):
+            super().__init__(title="Locked")
+            self.set_name("welcome")
+            root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+            self.add(root)
+            top = Gtk.Box()
+            top.set_name("topbar")
+            root.pack_start(top, False, False, 0)
+            line = Gtk.Box()
+            line.set_name("topline")
+            root.pack_start(line, False, False, 0)
+
+            middle = Gtk.Box()
+            middle.set_name("middle")
+            root.pack_start(middle, True, True, 0)
+            left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            left.set_name("left")
+            left.set_valign(Gtk.Align.CENTER)
+            self.clock = Gtk.Label(xalign=1)
+            self.clock.set_name("logo")
+            self.clock.get_style_context().add_class("clock")
+            left.pack_start(self.clock, False, False, 0)
+            self.date = Gtk.Label(xalign=1)
+            self.date.set_name("hint")
+            self.date.get_style_context().add_class("date")
+            left.pack_start(self.date, False, False, 0)
+            locked = Gtk.Label(label="This computer is locked", xalign=1)
+            locked.set_name("hint")
+            locked.get_style_context().add_class("locked")
+            left.pack_start(locked, False, False, 0)
+            middle.pack_start(left, True, True, 0)
+            divider = Gtk.Box()
+            divider.set_name("divider")
+            middle.pack_start(divider, False, False, 0)
+
+            right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+            right.set_name("right")
+            right.set_valign(Gtk.Align.CENTER)
+            right.set_halign(Gtk.Align.START)
+            tile = Gtk.EventBox()
+            tile.set_visible_window(True)
+            tile.get_style_context().add_class("tile")
+            tile.get_style_context().add_class("selected")
+            tile.set_size_request(400, -1)
+            row = Gtk.Box(spacing=14)
+            row.get_style_context().add_class("tile-row")
+            frame = Gtk.Box()
+            frame.get_style_context().add_class("picture")
+            frame.set_valign(Gtk.Align.START)
+            pb = picture(56)
+            img = Gtk.Image.new_from_pixbuf(pb) if pb else Gtk.Image.new_from_icon_name(
+                "avatar-default", Gtk.IconSize.DIALOG)
+            frame.add(img)
+            row.pack_start(frame, False, False, 0)
+            col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            col.set_valign(Gtk.Align.CENTER)
+            name = Gtk.Label(label=realname, xalign=0)
+            name.get_style_context().add_class("name")
+            col.pack_start(name, False, False, 0)
+            self.prompt = Gtk.Label(label="Type your password to unlock", xalign=0)
+            self.prompt.get_style_context().add_class("prompt")
+            col.pack_start(self.prompt, False, False, 0)
+            entry_row = Gtk.Box(spacing=6)
+            self.entry = Gtk.Entry(visibility=False, width_chars=22)
+            self.entry.set_input_purpose(Gtk.InputPurpose.PASSWORD)
+            self.entry.connect("activate", lambda _e: submit(self))
+            self.entry.connect("key-press-event", lambda _e, ev: self.on_key(self, ev))
+            entry_row.pack_start(self.entry, False, False, 0)
+            self.go = Gtk.Button()
+            self.go.get_style_context().add_class("go")
+            self.go.add(Gtk.Label(label="→"))
+            self.go.set_tooltip_text("Unlock")
+            self.go.connect("clicked", lambda _b: submit(self))
+            entry_row.pack_start(self.go, False, False, 0)
+            col.pack_start(entry_row, False, False, 0)
+            self.message = Gtk.Label(xalign=0, wrap=True, max_width_chars=34)
+            self.message.get_style_context().add_class("message")
+            self.message.set_no_show_all(True)
+            col.pack_start(self.message, False, False, 0)
+            self.caps = Gtk.Label(label="Caps Lock is on", xalign=0)
+            self.caps.get_style_context().add_class("caps")
+            self.caps.set_no_show_all(True)
+            col.pack_start(self.caps, False, False, 0)
+            row.pack_start(col, True, True, 0)
+            tile.add(row)
+            right.pack_start(tile, False, False, 0)
+            middle.pack_start(right, True, True, 0)
+
+            bottomline = Gtk.Box()
+            bottomline.set_name("bottomline")
+            root.pack_start(bottomline, False, False, 0)
+            bottom = Gtk.Box(spacing=10)
+            bottom.set_name("bottombar")
+            power = Gtk.Button()
+            power.set_name("power")
+            pbox = Gtk.Box(spacing=8)
+            pbox.pack_start(Gtk.Image.new_from_icon_name("system-shutdown", Gtk.IconSize.LARGE_TOOLBAR),
+                            False, False, 0)
+            pbox.pack_start(Gtk.Label(label="Turn off computer"), False, False, 0)
+            power.add(pbox)
+            power.connect("clicked", lambda _b: power_menu(self))
+            bottom.pack_start(power, False, False, 0)
+            self.tip = Gtk.Label(xalign=1)
+            self.tip.set_name("tip")
+            bottom.pack_end(self.tip, False, False, 0)
+            root.pack_start(bottom, False, False, 0)
+
+            self.connect("key-press-event", self.on_key)
+            self.connect("key-release-event", lambda *_: self.update_caps() or False)
+            self.update_clock()
+
+        def update_clock(self):
+            now = time.localtime()
+            self.clock.set_text(time.strftime("%H:%M", now))
+            self.date.set_text(time.strftime("%A, %d %B", now))
+
+        def update_caps(self):
+            keymap = Gdk.Keymap.get_for_display(Gdk.Display.get_default())
+            self.caps.set_visible(bool(keymap and keymap.get_caps_lock_state()))
+
+        def on_key(self, _w, event):
+            if event.keyval == Gdk.KEY_Escape:
+                self.entry.set_text("")
+                self.say("")
+                return True
+            # Enter is handled here: a text box on a lock surface doesn't
+            # always get its "activate"
+            if event.keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter, Gdk.KEY_ISO_Enter):
+                submit(self)
+                return True
+            if not self.entry.has_focus() and self.entry.get_sensitive():
+                self.entry.grab_focus()         # typing anywhere goes to the password box
+            self.update_caps()
+            return False
+
+        def say(self, text):
+            self.message.set_text(text)
+            self.message.set_visible(bool(text))
+
+        def set_busy(self, busy):
+            self.entry.set_sensitive(not busy)
+            self.go.set_sensitive(not busy)
+            self.prompt.set_text("Checking…" if busy else "Type your password to unlock")
+            if not busy:
+                self.entry.grab_focus()
+
+    def everywhere(fn):
+        for win in list(windows.values()):
+            fn(win)
+
+    def submit(win):
+        if state["busy"]:
+            return
+        password = win.entry.get_text()
+        if not password:
+            win.say("Type your password, then press Enter.")
+            return
+        state["busy"] = True
+        everywhere(lambda w: w.set_busy(True))
+        everywhere(lambda w: w.say(""))
+
+        def check():
+            ok = False
+            try:
+                import pam
+                ok = bool(pam.pam().authenticate(username, password, service=PAM_SERVICE))
+            except Exception as err:  # noqa: BLE001 - never crash while locked
+                print(f"firox-lock: PAM: {err}", file=sys.stderr)
+            GLib.idle_add(checked, win, ok)
+        threading.Thread(target=check, daemon=True).start()
+
+    def checked(win, ok):
+        if ok:
+            unlock()
+            return False
+        state["fails"] += 1
+        # A short pause after each wrong try, longer after several
+        delay = 1500 if state["fails"] < 3 else 4000
+
+        def again():
+            state["busy"] = False
+            everywhere(lambda w: w.entry.set_text(""))
+            everywhere(lambda w: w.set_busy(False))
+            everywhere(lambda w: w.say("The password is incorrect. Try again."))
+            return False
+        GLib.timeout_add(delay, again)
+        return False
+
+    def power_menu(win):
+        dlg = Gtk.Dialog(title="Turn off computer", transient_for=win, modal=True)
+        dlg.set_name("power-dialog")
+        dlg.set_decorated(False)
+        area = dlg.get_content_area()
+        area.set_spacing(14)
+        area.set_border_width(20)
+        title = Gtk.Label(label="Turn off computer")
+        title.get_style_context().add_class("title")
+        area.pack_start(title, False, False, 0)
+        row = Gtk.Box(spacing=24, halign=Gtk.Align.CENTER)
+        for icon, label, cmd in (("system-suspend", "Sleep", ["systemctl", "suspend"]),
+                                 ("system-shutdown", "Turn Off", ["systemctl", "poweroff"]),
+                                 ("system-reboot", "Restart", ["systemctl", "reboot"])):
+            b = Gtk.Button()
+            b.get_style_context().add_class("power-choice")
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            img = Gtk.Image.new_from_icon_name(icon, Gtk.IconSize.DIALOG)
+            img.set_pixel_size(40)
+            box.pack_start(img, False, False, 0)
+            box.pack_start(Gtk.Label(label=label), False, False, 0)
+            b.add(box)
+            b.connect("clicked", lambda _b, c=cmd: (dlg.destroy(), subprocess.Popen(c)))
+            row.pack_start(b, False, False, 0)
+        area.pack_start(row, False, False, 0)
+        cancel = Gtk.Button(label="Cancel", halign=Gtk.Align.END)
+        cancel.connect("clicked", lambda _b: dlg.destroy())
+        area.pack_start(cancel, False, False, 0)
+        dlg.show_all()
+
+    # ---- locking
+    lock = GtkSessionLock.prepare_lock()
+    locked_at = time.strftime("%H:%M")
+
+    def add_monitor(mon):
+        if mon in windows or state["unlocked"]:
+            return
+        win = LockWindow()
+        win.tip.set_text(f"Locked at {locked_at}. Press Super+L to lock it again any time.")
+        windows[mon] = win
+        lock.new_surface(win, mon)
+        win.show_all()
+        win.entry.grab_focus()
+
+    def on_locked(_lock):
+        if notify_fd is not None:
+            try:
+                os.write(notify_fd, b"1")
+                os.close(notify_fd)
+            except OSError:
+                pass
+
+    def on_finished(_lock):
+        # The compositor refused (another lock screen is up) or ended the lock
+        if not state["unlocked"]:
+            print("firox-lock: the compositor ended the lock", file=sys.stderr)
+            Gtk.main_quit()
+
+    def unlock():
+        state["unlocked"] = True
+        lock.unlock_and_destroy()
+        # Make sure the compositor has the unlock, then just leave: tearing
+        # the lock windows down ourselves afterwards is a protocol error
+        display = Gdk.Display.get_default()
+        display.flush()
+        display.sync()
+        GLib.timeout_add(150, lambda: Gtk.main_quit() or False)
+
+    lock.connect("locked", on_locked)
+    lock.connect("finished", on_finished)
+    lock.lock_lock()
+    display = Gdk.Display.get_default()
+    for i in range(display.get_n_monitors()):
+        add_monitor(display.get_monitor(i))
+    display.connect("monitor-added", lambda _d, m: add_monitor(m))
+    display.connect("monitor-removed", lambda _d, m: windows.pop(m, None))
+
+    def tick():
+        everywhere(lambda w: w.update_clock())
+        return True
+    GLib.timeout_add_seconds(10, tick)
+    Gtk.main()
+    if not state["unlocked"]:
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)
