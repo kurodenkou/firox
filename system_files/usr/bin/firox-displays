@@ -6,6 +6,15 @@ firox-displays: remember and restore the monitor layout.
                                     runs this when the settings window closes)
     firox-displays restore          at login: make the screens match the saved
                                     layout if kanshi didn't (or couldn't)
+    firox-displays main             show the main display and the others
+    firox-displays main NAME|NUMBER make that monitor the main display (the
+                                    taskbar's tray and clock, the Sidebar and
+                                    notifications go there)
+    firox-displays mako-conf [FILE] write the notification settings (FILE, the
+                                    theme's mako.conf) with the main display
+                                    added, and print where they are
+    firox-displays apply-main       update the notifications after the main
+                                    display or the monitors changed
 
 The layout is stored per set of connected monitors in
 ~/.config/firox/displays.json and mirrored into ~/.config/kanshi/config, so
@@ -26,6 +35,9 @@ import os
 import subprocess
 import sys
 import time
+
+sys.path.insert(0, "/usr/lib/firox/python")
+import firox_monitors  # noqa: E402
 
 CFG = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
 STATE = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
@@ -244,12 +256,126 @@ def restore():
     return 0 if ok else 1
 
 
+# ---- the main display ------------------------------------------------------
+
+RUNTIME = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp", "firox")
+MAKO_CONF = os.path.join(RUNTIME, "mako.conf")
+USER_MAKO = os.path.join(CFG, "mako", "config")
+
+
+def show_main():
+    outs = firox_monitors.outputs()
+    if not outs:
+        print("No monitors found (is this a Wayland session?)", file=sys.stderr)
+        return 1
+    main = firox_monitors.main_name(outs)
+    for n, o in firox_monitors.numbered(outs):
+        tag = "  (main display)" if o["name"] == main else ""
+        print(f"{n}. {o['name']}: {o['description']}{tag}")
+    for o in outs:
+        if not o["enabled"]:
+            print(f"-  {o['name']}: {o['description']}  (turned off)")
+    return 0
+
+
+def set_main(arg):
+    outs = firox_monitors.outputs()
+    name = arg
+    if arg.isdigit():
+        name = next((o["name"] for n, o in firox_monitors.numbered(outs) if n == int(arg)), arg)
+    o = next((o for o in outs if o["name"] == name), None)
+    if o is None:
+        print(f"firox-displays: no monitor called {arg} (see `firox-displays main`)", file=sys.stderr)
+        return 2
+    if not o["enabled"]:
+        print(f"firox-displays: {name} is turned off; turn it on first", file=sys.stderr)
+        return 2
+    firox_monitors.set_main(name, outs)
+    log(f"main display [{firox_monitors.profile_key(outs)}]: {name}")
+    apply_main()
+    return 0
+
+
+def mako_text(source, outs):
+    try:
+        with open(source) as fh:
+            body = fh.read()
+    except OSError:
+        body = ""
+    head = f"# written by firox-displays from: {source}\n"
+    # Only pin pop-ups to a monitor when there's a choice to make
+    if sum(o["enabled"] for o in outs) > 1:
+        name = firox_monitors.main_name(outs)
+        if name:
+            # Global options must come before any [section]
+            head += f"output={name}\n"
+    return head + body
+
+
+def mako_conf(source=None):
+    """Write the runtime mako config and return its path."""
+    if os.path.exists(USER_MAKO):
+        return USER_MAKO                # your own config: left as it is
+    if source is None:
+        source = mako_source()
+    if source is None:
+        r = subprocess.run(["firox-theme", "path", "mako.conf"], capture_output=True, text=True)
+        source = r.stdout.strip()
+    text = mako_text(source, firox_monitors.outputs())
+    os.makedirs(RUNTIME, exist_ok=True)
+    try:
+        with open(MAKO_CONF) as fh:
+            if fh.read() == text:
+                return MAKO_CONF
+    except OSError:
+        pass
+    with open(MAKO_CONF + ".tmp", "w") as fh:
+        fh.write(text)
+    os.replace(MAKO_CONF + ".tmp", MAKO_CONF)
+    return MAKO_CONF
+
+
+def mako_source():
+    try:
+        with open(MAKO_CONF) as fh:
+            first = fh.readline()
+    except OSError:
+        return None
+    prefix = "# written by firox-displays from: "
+    return first[len(prefix):].strip() if first.startswith(prefix) else None
+
+
+def apply_main():
+    """Point notifications at the (possibly new) main display."""
+    if os.path.exists(USER_MAKO) or mako_source() is None:
+        return 0
+    try:
+        with open(MAKO_CONF) as fh:
+            before = fh.read()
+    except OSError:
+        before = ""
+    mako_conf()
+    with open(MAKO_CONF) as fh:
+        if fh.read() != before:
+            subprocess.run(["makoctl", "reload"], check=False,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return 0
+
+
 def main():
-    cmd = next((a for a in sys.argv[1:] if not a.startswith("-")), "save")
+    args = [a for a in sys.argv[1:] if not a.startswith("-")]
+    cmd = args[0] if args else "save"
     if cmd == "save":
         return save()
     if cmd == "restore":
         return restore()
+    if cmd == "main":
+        return set_main(args[1]) if len(args) > 1 else show_main()
+    if cmd == "mako-conf":
+        print(mako_conf(args[1] if len(args) > 1 else None))
+        return 0
+    if cmd == "apply-main":
+        return apply_main()
     print(__doc__.strip(), file=sys.stderr)
     return 2
 

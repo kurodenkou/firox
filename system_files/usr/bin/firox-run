@@ -72,7 +72,7 @@ ALIASES = {
     "wmplayer": [["vlc"]],
     "mplayer2": [["vlc"]],
     "appwiz.cpl": [["firox-open", "software"]],
-    "desk.cpl": [["firox-display"]],
+    "desk.cpl": [["firox-control-panel", "display"]],
     "main.cpl": [["firox-control-panel", "mouse"]],
     "mmsys.cpl": [["pavucontrol"]],
     "ncpa.cpl": [["nm-connection-editor"]],

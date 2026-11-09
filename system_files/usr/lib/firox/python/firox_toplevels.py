@@ -14,6 +14,10 @@ import sys
 
 from gi.repository import GLib, Gtk
 from pywayland.client import Display
+try:
+    from pywayland._ffi import lib as wl_lib
+except ImportError:
+    wl_lib = None
 from pywayland.protocol.wayland import WlOutput, WlSeat
 from pywayland.protocol.xdg_output_unstable_v1 import ZxdgOutputManagerV1
 
@@ -223,13 +227,38 @@ class Toplevels:
             self.on_lost()
             return False
         try:
-            self.display.dispatch(block=True)
-            self.display.flush()
+            self.read_and_dispatch()
         except Exception as err:  # noqa: BLE001
             print(f"Wayland error: {err}", file=sys.stderr)
             self.on_lost()
             return False
         return True
+
+    def read_and_dispatch(self):
+        """Read what the compositor sent and handle it, without ever waiting.
+
+        display.dispatch(block=True) waits for new data whenever its queue is
+        empty, even if GLib woke us for data that has already been read.
+        That froze the whole taskbar (seen when a monitor went away during
+        the screen saver) until the next window event. This is libwayland's
+        non-blocking sequence instead: prepare, read what's there, dispatch.
+        """
+        d = self.display
+        ptr = getattr(d, "_ptr", None)
+        if ptr is None or wl_lib is None or not hasattr(wl_lib, "wl_display_prepare_read"):
+            d.dispatch(block=True)          # older pywayland: the old way
+            d.flush()
+            return
+        while wl_lib.wl_display_prepare_read(ptr) != 0:
+            if wl_lib.wl_display_dispatch_pending(ptr) == -1:
+                raise RuntimeError("dispatch failed")
+        wl_lib.wl_display_flush(ptr)
+        # The socket is non-blocking: with nothing to read this returns at once
+        if wl_lib.wl_display_read_events(ptr) == -1:
+            raise RuntimeError(f"read failed ({wl_lib.wl_display_get_error(ptr)})")
+        if wl_lib.wl_display_dispatch_pending(ptr) == -1:
+            raise RuntimeError(f"dispatch failed ({wl_lib.wl_display_get_error(ptr)})")
+        wl_lib.wl_display_flush(ptr)
 
     def changed(self):
         if not self.pending:

@@ -116,7 +116,7 @@
     <doubleClickTime>500</doubleClickTime>
     <!--
       The desktop itself (icons, wallpaper, right-click menu) is drawn by
-      pcmanfm-qt, so labwc's Root context only matters if it isn't running.
+      firox-desktop, so labwc's Root context only matters if it isn't running.
     -->
     <context name="Root">
       <mousebind button="Right" action="Press">

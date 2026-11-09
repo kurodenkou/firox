@@ -19,10 +19,15 @@ KEEP=/usr/libexec/firox/keep-running
 STATE="${XDG_STATE_HOME:-$HOME/.local/state}/firox"
 mkdir -p "$STATE"
 
-# Desktop: wallpaper + Computer / Recycle Bin icons
-# (~/Desktop etc. must exist before pcmanfm-qt starts)
+# Desktop: wallpaper on every monitor, icons (Computer, Recycle Bin, the
+# files in ~/Desktop) on the main display: firox-desktop. pcmanfm-qt's
+# desktop is the fallback if it can't run here (it exits with 3).
+# (~/Desktop etc. must exist first)
 xdg-user-dirs-update
-$KEEP pcmanfm-qt --desktop --profile=firox >/dev/null 2>&1 &
+(
+    $KEEP firox-desktop 2>"$STATE/desktop.log"
+    [ $? -eq 3 ] && exec $KEEP pcmanfm-qt --desktop --profile=firox
+) >/dev/null 2>&1 &
 
 # Taskbar: firox-panel (its log: ~/.local/state/firox/panel.log). If you
 # set up waybar yourself (~/.config/waybar), that runs instead; waybar is
@@ -49,7 +54,8 @@ firox-notifications daemon >/dev/null 2>&1 &
 if [ -f "$CFG/mako/config" ]; then
     mako >/dev/null 2>&1 &
 else
-    mako -c "$(firox-theme path mako.conf)" >/dev/null 2>&1 &
+    # (the theme's settings, shown on the main display: firox-displays)
+    mako -c "$(firox-displays mako-conf "$(firox-theme path mako.conf)")" >/dev/null 2>&1 &
 fi
 
 # Network and Bluetooth: the taskbar's own icons and pop-ups (firox-network,

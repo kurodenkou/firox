@@ -8,6 +8,11 @@ One bar along the bottom of every monitor:
 
     start button | Quick Launch | window buttons | notification area | clock
 
+With several monitors, the main display (Settings > Display, see
+firox-displays and firox_monitors) has the full bar; the others get the start
+button, their own window buttons and the clock. ALL_DISPLAYS=0 shows a bar
+on the main display only, with every window on it.
+
 Window buttons are grouped: when an app has two or more windows open they
 share one button ("3  Firefox ▴"); click it to pick a window. Right-click a
 button for Restore / Minimize / Maximize / Close, Minimize/Close group, or Pin
@@ -21,8 +26,8 @@ a waiting update, the notification bell and the clock.
 Styled by the theme's panel.css (/usr/share/firox/themes/NAME/panel.css),
 reloaded when the theme changes; add your own rules in
 ~/.config/firox/panel.css. Settings (Settings > Taskbar, applied straight
-away): ~/.config/firox/panel.conf with GROUP, AUTOHIDE, QUICKLAUNCH and
-SECONDS (1 or 0). Quick Launch: ~/.config/firox/quicklaunch (see
+away): ~/.config/firox/panel.conf with GROUP, AUTOHIDE, QUICKLAUNCH,
+SECONDS and ALL_DISPLAYS (1 or 0). Quick Launch: ~/.config/firox/quicklaunch (see
 firox-quicklaunch).
 
 Exits with status 3 if it can't run here (no layer-shell or window list
@@ -55,6 +60,7 @@ try:
     gi.require_version("GtkLayerShell", "0.1")
     from gi.repository import Gdk, GdkPixbuf, Gio, GLib, Gtk, GtkLayerShell  # noqa: E402
     import firox_toplevels  # noqa: E402
+    import firox_monitors  # noqa: E402
     from firox_toplevels import Toplevels  # noqa: E402
 except (ImportError, ValueError) as err:
     cant_run(f"missing library: {err}")
@@ -82,7 +88,8 @@ QL_BUILTIN = {
     "firox:show-desktop": ("show-desktop", ["firox-open", "show-desktop"], "Show the desktop"),
     "firox:computer": ("system-file-manager", ["firox-open", "computer"], "Computer"),
 }
-SETTING_DEFAULTS = {"GROUP": "1", "AUTOHIDE": "0", "QUICKLAUNCH": "1", "SECONDS": "0"}
+SETTING_DEFAULTS = {"GROUP": "1", "AUTOHIDE": "0", "QUICKLAUNCH": "1", "SECONDS": "0",
+                    "ALL_DISPLAYS": "1"}
 
 
 # --------------------------------------------------------------- helpers --
@@ -1571,11 +1578,14 @@ class Bar(Gtk.Window):
             cr.paint()
         return False
 
-    def __init__(self, panel, monitor):
+    def __init__(self, panel, monitor, main=True):
         super().__init__()
         self.panel = panel
         self.monitor = monitor
+        self.main = main                  # main display: the full bar
         self.set_name("panel")
+        if not main:
+            self.get_style_context().add_class("extended")
         self.set_title("Taskbar")
         self.set_decorated(False)
         GtkLayerShell.init_for_window(self)
@@ -1628,12 +1638,15 @@ class Bar(Gtk.Window):
         area.set_name("notification-area")
         tray_row = Gtk.Box()
         area.add(tray_row)
-        tray_row.pack_start(TrayView(panel.tray), False, False, 0)
-        for ind in panel.indicators:
+        # Other monitors: just the clock (tray icons live on the main display)
+        indicators = panel.indicators if main else [panel.clock]
+        if main:
+            tray_row.pack_start(TrayView(panel.tray), False, False, 0)
+        for ind in indicators:
             tray_row.pack_start(ind.make(), False, False, 0)
         row.pack_end(area, False, False, 0)
         self.show_all()
-        for ind in panel.indicators:
+        for ind in indicators:
             ind.set()
         self.apply_settings()
 
@@ -1669,7 +1682,8 @@ class Bar(Gtk.Window):
         self.show_ql()
 
     def show_ql(self):
-        on = self.panel.settings.get("QUICKLAUNCH", "1") != "0" and bool(self.ql.get_children())
+        on = (self.main and self.panel.settings.get("QUICKLAUNCH", "1") != "0"
+              and bool(self.ql.get_children()))
         self.ql.set_visible(on)
         self.ql_sep.set_visible(on)
 
@@ -1835,11 +1849,13 @@ class Panel:
         self.theme_mon.connect("changed", self.on_config_changed)
 
         display = Gdk.Display.get_default()
-        display.connect("monitor-added", lambda _d, m: self.add_bar(m))
+        self.sync_timer = None
+        self.main_name = None
+        display.connect("monitor-added", lambda _d, m: self.schedule_sync())
         display.connect("monitor-removed", lambda _d, m: self.remove_bar(m))
-        for i in range(display.get_n_monitors()):
-            self.add_bar(display.get_monitor(i))
-        self.refresh()
+        # Monitors moved, resized or got their details (kanshi, Settings > Display)
+        Gdk.Screen.get_default().connect("monitors-changed", lambda _s: self.schedule_sync())
+        self.sync_bars()
 
     def load_css(self):
         if getattr(self, "glass", None) is not None:
@@ -1870,22 +1886,63 @@ class Panel:
             self.clock.set_seconds(self.settings.get("SECONDS", "0") != "0")
             for bar in self.bars.values():
                 bar.apply_settings()
+            self.schedule_sync()            # ALL_DISPLAYS
         elif name == "quicklaunch":
             for bar in self.bars.values():
                 bar.fill_ql()
+        elif name == "main-display":
+            self.schedule_sync()
+
+    # ---- one bar per monitor: the full one on the main display
+    def wanted_bars(self):
+        """{GdkMonitor: is_main} for the bars there should be."""
+        display = Gdk.Display.get_default()
+        outs = firox_monitors.outputs()
+        main = firox_monitors.main_gdk_monitor(display, outs)
+        name = firox_monitors.main_name(outs)
+        if name != self.main_name:
+            self.main_name = name
+            # Notifications follow the main display
+            spawn(["firox-displays", "apply-main"])
+        everywhere = self.settings.get("ALL_DISPLAYS", "1") != "0"
+        return {m: m == main for m in firox_monitors.gdk_monitors(display)
+                if everywhere or m == main}
+
+    def sync_bars(self):
+        self.sync_timer = None
+        want = self.wanted_bars()
+        changed = False
+        for monitor, bar in list(self.bars.items()):
+            if want.get(monitor) != bar.main:
+                del self.bars[monitor]        # before destroy: see on_bar_gone
+                bar.destroy()
+                changed = True
+        for monitor, main in want.items():
+            if monitor not in self.bars:
+                bar = Bar(self, monitor, main)
+                self.bars[monitor] = bar
+                bar.connect("destroy", lambda b, m=monitor: self.on_bar_gone(m, b))
+                changed = True
+        if changed:
+            self.refresh()
+        return False
+
+    def schedule_sync(self, delay=300):
+        """Re-check the bars soon: a new monitor's size and position arrive
+        a moment after it does."""
+        if self.sync_timer is not None:
+            GLib.source_remove(self.sync_timer)
+        self.sync_timer = GLib.timeout_add(delay, self.sync_bars)
 
     def add_bar(self, monitor):
-        if monitor not in self.bars:
-            bar = Bar(self, monitor)
-            self.bars[monitor] = bar
-            bar.connect("destroy", lambda b: self.on_bar_gone(monitor, b))
-            self.refresh()
+        self.sync_bars()
 
     def remove_bar(self, monitor):
         bar = self.bars.pop(monitor, None)
         if bar is not None:
             bar.destroy()
             self.refresh()
+        self.schedule_sync()
 
     def on_bar_gone(self, monitor, bar):
         """A bar closed without its monitor going away (the compositor can
@@ -1895,12 +1952,7 @@ class Panel:
         del self.bars[monitor]
         print("firox-panel: a taskbar was closed; putting it back", file=sys.stderr)
 
-        def again():
-            display = Gdk.Display.get_default()
-            if any(display.get_monitor(i) == monitor for i in range(display.get_n_monitors())):
-                self.add_bar(monitor)
-            return False
-        GLib.timeout_add(500, again)
+        GLib.timeout_add(500, self.sync_bars)
 
     def refresh(self):
         windows = self.toplevels.ordered()

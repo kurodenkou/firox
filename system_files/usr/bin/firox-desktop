@@ -1,0 +1,1298 @@
+#!/usr/bin/python3
+"""
+firox-desktop: the Firox Linux desktop (wallpaper and desktop icons).
+
+    firox-desktop           run it (started at login)
+
+The wallpaper is drawn on every monitor. The icons (Computer, your home
+folder, Network, the Recycle Bin and what's in ~/Desktop) are on the main
+display only (Settings > Display, see firox_monitors), and move with it.
+
+Icons: double-click (or Enter) opens; drag them to move them (where you put
+them is remembered in ~/.config/firox/desktop-icons.json) or onto a folder,
+the Recycle Bin or another program; drop files from other programs onto the
+desktop to copy them here (hold Shift to move). Right-click an icon for Open,
+Open With, Cut, Copy, Rename, Move to Recycle Bin and Properties; right-click
+the desktop for Arrange Icons By, Refresh, Paste, New Folder / Text Document,
+Display and Desktop Background settings. Keys: Delete, Shift+Delete, F2, F5,
+Enter, Ctrl+A, Ctrl+C, Ctrl+X, Ctrl+V, Escape.
+
+Settings (Settings > Desktop Background) are read from the desktop settings
+file, see firox_wallpaper. Exits with status 3 if it can't run here (no
+layer-shell); the session then starts pcmanfm-qt's desktop instead.
+"""
+
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.parse
+
+sys.path.insert(0, "/usr/lib/firox/python")
+
+CANT_RUN = 3
+
+
+def cant_run(why):
+    print(f"firox-desktop: {why}", file=sys.stderr)
+    sys.exit(CANT_RUN)
+
+
+try:
+    import gi
+    gi.require_version("Gtk", "3.0")
+    gi.require_version("Gdk", "3.0")
+    gi.require_version("GdkPixbuf", "2.0")
+    gi.require_version("GtkLayerShell", "0.1")
+    gi.require_version("Pango", "1.0")
+    gi.require_version("PangoCairo", "1.0")
+    from gi.repository import Gdk, GdkPixbuf, Gio, GLib, Gtk, GtkLayerShell, Pango, PangoCairo  # noqa: E402
+    import firox_monitors  # noqa: E402
+    import firox_wallpaper  # noqa: E402
+except (ImportError, ValueError) as err:
+    cant_run(f"missing library: {err}")
+
+CONFIG = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "firox")
+POSITIONS = os.path.join(CONFIG, "desktop-icons.json")
+DATA = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+TRASH_FILES = os.path.join(DATA, "Trash", "files")
+HOME = os.path.expanduser("~")
+
+CELL_W, CELL_H = 92, 90         # one icon's slot
+MARGIN_X, MARGIN_TOP = 10, 10
+MARGIN_BOTTOM = 44              # the taskbar
+DRAG_THRESHOLD = 6
+URI_TARGETS = [Gtk.TargetEntry.new("text/uri-list", 0, 0)]
+DOUBLE = getattr(Gdk.EventType, "DOUBLE_BUTTON_PRESS", None) or getattr(Gdk.EventType, "_2BUTTON_PRESS")
+
+
+def desktop_dir():
+    d = GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_DESKTOP)
+    if not d or os.path.realpath(d) == os.path.realpath(HOME):
+        d = os.path.join(HOME, "Desktop")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def spawn(argv):
+    try:
+        subprocess.Popen(argv, start_new_session=True, stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError as err:
+        print(f"firox-desktop: can't run {argv[0]}: {err}", file=sys.stderr)
+
+
+def unique_path(folder, name):
+    """folder/name, or "name (2)", "name (3)"... if that's taken."""
+    path = os.path.join(folder, name)
+    if not os.path.lexists(path):
+        return path
+    stem, ext = os.path.splitext(name)
+    if name.startswith(".") or os.path.isdir(path):
+        stem, ext = name, ""
+    n = 2
+    while os.path.lexists(os.path.join(folder, f"{stem} ({n}){ext}")):
+        n += 1
+    return os.path.join(folder, f"{stem} ({n}){ext}")
+
+
+def uri_to_path(uri):
+    if uri.startswith("file://"):
+        return urllib.parse.unquote(urllib.parse.urlparse(uri).path)
+    return None
+
+
+def human_size(n):
+    for unit in ("bytes", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:.0f} {unit}" if unit == "bytes" else f"{n:.1f} {unit}"
+        n /= 1024
+
+
+def trash_has_items():
+    try:
+        return any(True for _ in os.scandir(TRASH_FILES))
+    except OSError:
+        return False
+
+
+# ------------------------------------------------------------------ items --
+
+class Item:
+    """One desktop icon."""
+
+    def __init__(self, ident, name, uri, gicon, path=None, is_dir=False, special=None,
+                 app=None, content_type="", size=0, mtime=0, thumb=None):
+        self.id = ident
+        self.name = name
+        self.uri = uri
+        self.gicon = gicon
+        self.path = path            # on disk, for files in ~/Desktop
+        self.is_dir = is_dir
+        self.special = special      # "Computer", "Home", "Network", "Trash" or None
+        self.app = app              # Gio.DesktopAppInfo for .desktop launchers
+        self.content_type = content_type
+        self.size = size
+        self.mtime = mtime
+        self.thumb = thumb
+        self.cell = None            # (col, row)
+        self.surface = None         # cached icon
+
+    @property
+    def is_file(self):
+        return self.path is not None
+
+    def accepts_drop(self):
+        return self.special == "Trash" or self.is_dir or self.special == "Home"
+
+
+def special_items(settings):
+    user = os.environ.get("USER") or os.path.basename(HOME)
+    full = trash_has_items()
+    table = {
+        "Computer": ("Computer", "computer:///", "computer"),
+        "Home": (user, Gio.File.new_for_path(HOME).get_uri(), "user-home"),
+        "Network": ("Network", "network:///", "network-workgroup"),
+        "Trash": ("Recycle Bin", "trash:///", "user-trash-full" if full else "user-trash"),
+    }
+    out = []
+    for key in ("Computer", "Home", "Network", "Trash"):
+        if key in firox_wallpaper.shortcuts(settings):
+            name, uri, icon = table[key]
+            out.append(Item(f"special:{key}", name, uri, Gio.ThemedIcon.new(icon), special=key,
+                            path=HOME if key == "Home" else None, is_dir=key == "Home"))
+    return out
+
+
+def file_items(folder, show_hidden=False):
+    attrs = ",".join(["standard::name", "standard::display-name", "standard::icon", "standard::type",
+                      "standard::is-hidden", "standard::content-type", "standard::size",
+                      "time::modified", "thumbnail::path"])
+    out = []
+    try:
+        enum = Gio.File.new_for_path(folder).enumerate_children(attrs, Gio.FileQueryInfoFlags.NONE, None)
+    except GLib.Error as err:
+        print(f"firox-desktop: {folder}: {err.message}", file=sys.stderr)
+        return out
+    for info in enum:
+        name = info.get_name()
+        if (info.get_is_hidden() or name.startswith(".")) and not show_hidden:
+            continue
+        path = os.path.join(folder, name)
+        gfile = Gio.File.new_for_path(path)
+        label = info.get_display_name()
+        gicon = info.get_icon()
+        app = None
+        if name.endswith(".desktop"):
+            try:
+                app = Gio.DesktopAppInfo.new_from_filename(path)
+            except TypeError:
+                app = None
+            if app is not None:
+                label = app.get_display_name() or label
+                gicon = app.get_icon() or gicon
+        out.append(Item(f"file:{name}", label, gfile.get_uri(), gicon, path=path,
+                        is_dir=info.get_file_type() == Gio.FileType.DIRECTORY, app=app,
+                        content_type=info.get_content_type() or "", size=info.get_size(),
+                        mtime=info.get_attribute_uint64("time::modified"),
+                        thumb=info.get_attribute_byte_string("thumbnail::path")))
+    out.sort(key=lambda i: (not i.is_dir, i.name.casefold()))
+    return out
+
+
+# --------------------------------------------------------------- the view --
+
+class DesktopView(Gtk.DrawingArea):
+    """The wallpaper, and on the main display the icons."""
+
+    def __init__(self, app, window):
+        super().__init__()
+        self.app = app
+        self.window = window
+        self.icons = False
+        self.hover = None
+        self.press = None           # (x, y, item, button, event-state) of a press on an icon
+        self.band = None            # rubber band (x0, y0, x1, y1)
+        self.drop_hover = None
+        self.drag_items = []
+        self.drag_origin = None
+        self.wall_cache = {}
+        self.set_can_focus(True)
+        self.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK
+                        | Gdk.EventMask.POINTER_MOTION_MASK | Gdk.EventMask.LEAVE_NOTIFY_MASK
+                        | Gdk.EventMask.KEY_PRESS_MASK)
+        self.connect("draw", self.on_draw)
+        self.connect("button-press-event", self.on_press)
+        self.connect("button-release-event", self.on_release)
+        self.connect("motion-notify-event", self.on_motion)
+        self.connect("leave-notify-event", self.on_leave)
+        self.connect("key-press-event", self.on_key)
+        self.connect("size-allocate", lambda *_: self.app.layout_icons())
+        self.set_has_tooltip(True)
+        self.connect("query-tooltip", self.on_tooltip)
+        # Drag and drop: files out to other programs, files in from them
+        self.drag_dest_set(Gtk.DestDefaults.ALL, URI_TARGETS,
+                           Gdk.DragAction.COPY | Gdk.DragAction.MOVE | Gdk.DragAction.LINK)
+        self.connect("drag-data-received", self.on_drop)
+        self.connect("drag-motion", self.on_drag_motion)
+        self.connect("drag-leave", lambda *_: self.set_drop_hover(None))
+        self.connect("drag-data-get", self.on_drag_get)
+        self.connect("drag-end", self.on_drag_end)
+
+    # ---- geometry
+    def grid(self):
+        a = self.get_allocation()
+        cols = max(1, (a.width - 2 * MARGIN_X) // CELL_W)
+        rows = max(1, (a.height - MARGIN_TOP - MARGIN_BOTTOM) // CELL_H)
+        return cols, rows
+
+    @staticmethod
+    def cell_rect(cell):
+        col, row = cell
+        return (MARGIN_X + col * CELL_W, MARGIN_TOP + row * CELL_H, CELL_W, CELL_H)
+
+    def cell_at(self, x, y):
+        cols, rows = self.grid()
+        col = int((x - MARGIN_X) // CELL_W)
+        row = int((y - MARGIN_TOP) // CELL_H)
+        return (min(max(col, 0), cols - 1), min(max(row, 0), rows - 1))
+
+    def item_rects(self, item):
+        """(icon rect, label rect) for hit-testing and highlighting."""
+        x, y, w, _h = self.cell_rect(item.cell)
+        size = self.app.icon_size
+        ix = x + (w - size) / 2
+        iy = y + 4
+        layout = self.label_layout(item)
+        _ink, logical = layout.get_pixel_extents()
+        lw = min(w - 4, logical.width + 8)
+        lx = x + (w - lw) / 2
+        ly = iy + size + 3
+        return (ix, iy, size, size), (lx, ly, lw, logical.height + 2)
+
+    def item_at(self, x, y):
+        if not self.icons:
+            return None
+        for item in self.app.items:
+            if item.cell is None:
+                continue
+            for rx, ry, rw, rh in self.item_rects(item):
+                if rx <= x <= rx + rw and ry <= y <= ry + rh:
+                    return item
+        return None
+
+    def label_layout(self, item, full=False):
+        layout = self.create_pango_layout(item.name)
+        layout.set_alignment(Pango.Alignment.CENTER)
+        layout.set_width((CELL_W - 10) * Pango.SCALE)
+        layout.set_wrap(Pango.WrapMode.WORD_CHAR)
+        if not full:
+            layout.set_ellipsize(Pango.EllipsizeMode.END)
+            layout.set_height(-2)                       # two lines at most
+        return layout
+
+    # ---- drawing
+    def on_draw(self, _w, cr):
+        a = self.get_allocation()
+        firox_wallpaper.paint(cr, a.width, a.height, self.app.settings, self.wall_cache,
+                              self.get_scale_factor())
+        if not self.icons:
+            return False
+        fg = firox_wallpaper.rgba(self.app.settings.get("FgColor"), "#ffffff")
+        shadow = firox_wallpaper.rgba(self.app.settings.get("ShadowColor"), "#000000")
+        for item in self.app.items:
+            if item.cell is None:
+                continue
+            (ix, iy, isz, _), (lx, ly, lw, lh) = self.item_rects(item)
+            selected = item.id in self.app.selected
+            dim = item.uri in self.app.cut_uris
+            if selected or item is self.drop_hover:
+                cr.set_source_rgba(0.19, 0.42, 0.86, 0.45)
+                self.rounded(cr, ix - 4, iy - 4, isz + 8, isz + 8, 4)
+                cr.fill()
+            elif item is self.hover:
+                cr.set_source_rgba(1, 1, 1, 0.14)
+                self.rounded(cr, ix - 4, iy - 4, isz + 8, isz + 8, 4)
+                cr.fill()
+            surf = self.app.icon_surface(item, self.get_scale_factor())
+            if surf is not None:
+                cr.set_source_surface(surf, ix, iy)
+                cr.paint_with_alpha(0.5 if dim else 1.0)
+            layout = self.label_layout(item, full=selected and len(self.app.selected) == 1)
+            _ink, logical = layout.get_pixel_extents()
+            tx = self.cell_rect(item.cell)[0] + 5        # the layout centres each line
+            if selected:
+                cr.set_source_rgba(0.19, 0.42, 0.86, 0.95)
+                self.rounded(cr, lx, ly, lw, logical.height + 2, 3)
+                cr.fill()
+                cr.set_source_rgb(1, 1, 1)
+                cr.move_to(tx, ly + 1)
+                PangoCairo.show_layout(cr, layout)
+            else:
+                cr.set_source_rgba(shadow.red, shadow.green, shadow.blue, 0.85)
+                cr.move_to(tx + 1, ly + 2)
+                PangoCairo.show_layout(cr, layout)
+                cr.set_source_rgba(fg.red, fg.green, fg.blue, 0.5 if dim else 1.0)
+                cr.move_to(tx, ly + 1)
+                PangoCairo.show_layout(cr, layout)
+        if self.band:
+            x0, y0, x1, y1 = self.band
+            cr.rectangle(min(x0, x1) + 0.5, min(y0, y1) + 0.5, abs(x1 - x0), abs(y1 - y0))
+            cr.set_source_rgba(0.19, 0.42, 0.86, 0.25)
+            cr.fill_preserve()
+            cr.set_source_rgba(0.19, 0.42, 0.86, 0.9)
+            cr.set_line_width(1)
+            cr.stroke()
+        return False
+
+    @staticmethod
+    def rounded(cr, x, y, w, h, r):
+        cr.new_sub_path()
+        cr.arc(x + w - r, y + r, r, -1.5708, 0)
+        cr.arc(x + w - r, y + h - r, r, 0, 1.5708)
+        cr.arc(x + r, y + h - r, r, 1.5708, 3.1416)
+        cr.arc(x + r, y + r, r, 3.1416, 4.7124)
+        cr.close_path()
+
+    # ---- mouse
+    def on_press(self, _w, event):
+        if not self.icons:
+            if event.button == 3:
+                self.app.desktop_menu(self, event)
+            return True
+        self.grab_focus()
+        item = self.item_at(event.x, event.y)
+        ctrl = bool(event.state & Gdk.ModifierType.CONTROL_MASK)
+        if event.type == DOUBLE and event.button == 1:
+            if item is not None:
+                self.app.open_items([item])
+            self.press = None
+            return True
+        if event.type != Gdk.EventType.BUTTON_PRESS:
+            return True
+        if item is None:
+            if not ctrl:
+                self.app.select([])
+            if event.button == 1:
+                self.band = (event.x, event.y, event.x, event.y)
+            elif event.button == 3:
+                self.app.desktop_menu(self, event)
+            return True
+        if ctrl and event.button == 1:
+            self.app.toggle_select(item)
+        elif item.id not in self.app.selected:
+            self.app.select([item])
+        if event.button == 1:
+            self.press = (event.x, event.y, item, event.button)
+        elif event.button == 3:
+            self.app.item_menu(self, event)
+        return True
+
+    def on_motion(self, _w, event):
+        if not self.icons:
+            return False
+        if self.band is not None:
+            x0, y0, _x1, _y1 = self.band
+            self.band = (x0, y0, event.x, event.y)
+            bx0, bx1 = sorted((x0, event.x))
+            by0, by1 = sorted((y0, event.y))
+            hits = []
+            for item in self.app.items:
+                if item.cell is None:
+                    continue
+                for rx, ry, rw, rh in self.item_rects(item):
+                    if rx < bx1 and rx + rw > bx0 and ry < by1 and ry + rh > by0:
+                        hits.append(item)
+                        break
+            self.app.select(hits)
+            self.queue_draw()
+            return True
+        if self.press is not None and event.state & Gdk.ModifierType.BUTTON1_MASK:
+            px, py, item, button = self.press
+            if abs(event.x - px) + abs(event.y - py) > DRAG_THRESHOLD:
+                self.press = None
+                self.drag_items = [i for i in self.app.items if i.id in self.app.selected]
+                self.drag_origin = (px, py)
+                targets = Gtk.TargetList.new(URI_TARGETS)
+                ctx = self.drag_begin_with_coordinates(
+                    targets, Gdk.DragAction.MOVE | Gdk.DragAction.COPY | Gdk.DragAction.LINK,
+                    button, event, int(px), int(py))
+                if ctx is not None and item.cell is not None:
+                    surf = self.app.icon_surface(item, self.get_scale_factor())
+                    if surf is not None:
+                        Gtk.drag_set_icon_surface(ctx, surf)
+            return True
+        hover = self.item_at(event.x, event.y)
+        if hover is not self.hover:
+            self.hover = hover
+            self.queue_draw()
+        return False
+
+    def on_release(self, _w, event):
+        if self.band is not None:
+            self.band = None
+            self.queue_draw()
+        if self.press is not None and self.app.single_click() and event.button == 1:
+            _px, _py, item, _b = self.press
+            if not event.state & (Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK):
+                self.app.open_items([item])
+        self.press = None
+        return True
+
+    def on_leave(self, _w, _event):
+        if self.hover is not None:
+            self.hover = None
+            self.queue_draw()
+        return False
+
+    def on_tooltip(self, _w, x, y, _keyboard, tooltip):
+        item = self.item_at(x, y)
+        if item is None or self.band is not None:
+            return False
+        if item.special:
+            text = {"Computer": "Your drives and devices", "Home": f"Your files ({HOME})",
+                    "Network": "Computers and shared folders on your network",
+                    "Trash": "Files you deleted. Open it to put them back"}[item.special]
+        else:
+            kind = item.app.get_description() if item.app else Gio.content_type_get_description(item.content_type)
+            text = f"{item.name}\n{kind or ''}"
+            if not item.is_dir and not item.app:
+                text += f"\nSize: {human_size(item.size)}"
+        tooltip.set_text(text.strip())
+        (ix, iy, isz, _), _lbl = self.item_rects(item)
+        rect = Gdk.Rectangle()
+        rect.x, rect.y, rect.width, rect.height = int(ix), int(iy), int(isz), int(isz)
+        tooltip.set_tip_area(rect)
+        return True
+
+    # ---- keyboard
+    def on_key(self, _w, event):
+        if not self.icons:
+            return False
+        key = event.keyval
+        ctrl = bool(event.state & Gdk.ModifierType.CONTROL_MASK)
+        shift = bool(event.state & Gdk.ModifierType.SHIFT_MASK)
+        sel = self.app.selected_items()
+        if key in (Gdk.KEY_Return, Gdk.KEY_KP_Enter) and sel:
+            self.app.open_items(sel)
+        elif key == Gdk.KEY_Delete and sel:
+            if shift:
+                self.app.delete_forever(sel)
+            else:
+                self.app.trash(sel)
+        elif key == Gdk.KEY_F2 and len(sel) == 1:
+            self.app.rename(sel[0])
+        elif key == Gdk.KEY_F5:
+            self.app.reload()
+        elif key == Gdk.KEY_Escape:
+            self.app.select([])
+        elif ctrl and key in (Gdk.KEY_a, Gdk.KEY_A):
+            self.app.select(list(self.app.items))
+        elif ctrl and key in (Gdk.KEY_c, Gdk.KEY_C) and sel:
+            self.app.copy(sel, cut=False)
+        elif ctrl and key in (Gdk.KEY_x, Gdk.KEY_X) and sel:
+            self.app.copy(sel, cut=True)
+        elif ctrl and key in (Gdk.KEY_v, Gdk.KEY_V):
+            self.app.paste()
+        else:
+            return False
+        return True
+
+    # ---- drag and drop
+    def on_drag_get(self, _w, _ctx, data, _info, _time):
+        data.set_uris([i.uri for i in self.drag_items])
+
+    def on_drag_end(self, *_):
+        self.drag_items = []
+        self.drag_origin = None
+        self.set_drop_hover(None)
+
+    def set_drop_hover(self, item):
+        if item is not self.drop_hover:
+            self.drop_hover = item
+            self.queue_draw()
+
+    def on_drag_motion(self, _w, _ctx, x, y, _time):
+        item = self.item_at(x, y) if self.icons else None
+        if item is not None and (not item.accepts_drop() or item in self.drag_items):
+            item = None
+        self.set_drop_hover(item)
+        return False
+
+    def on_drop(self, _w, ctx, x, y, data, _info, _time):
+        uris = [u for u in (data.get_uris() or []) if u]
+        target = self.item_at(x, y) if self.icons else None
+        internal = Gtk.drag_get_source_widget(ctx) is self
+        self.set_drop_hover(None)
+        if target is not None and target.accepts_drop() and target not in self.drag_items:
+            if target.special == "Trash":
+                self.app.trash_uris(uris)
+            else:
+                move = internal or ctx.get_selected_action() == Gdk.DragAction.MOVE
+                self.app.transfer(uris, target.path, move=move)
+            return
+        if internal:
+            # Moving icons around the desktop
+            ox, oy = self.drag_origin or (x, y)
+            self.app.move_icons(self.drag_items, x - ox, y - oy, self)
+            return
+        move = ctx.get_selected_action() == Gdk.DragAction.MOVE
+        self.app.transfer(uris, self.app.folder, move=move, at=self.cell_at(x, y))
+
+
+class DesktopWindow(Gtk.Window):
+    """A layer-shell background surface covering one monitor."""
+
+    def __init__(self, app, monitor):
+        super().__init__(application=app.gtk_app, title="Desktop")
+        self.monitor = monitor
+        self.set_decorated(False)
+        GtkLayerShell.init_for_window(self)
+        GtkLayerShell.set_namespace(self, "firox-desktop")
+        GtkLayerShell.set_layer(self, GtkLayerShell.Layer.BACKGROUND)
+        GtkLayerShell.set_monitor(self, monitor)
+        for edge in (GtkLayerShell.Edge.TOP, GtkLayerShell.Edge.BOTTOM,
+                     GtkLayerShell.Edge.LEFT, GtkLayerShell.Edge.RIGHT):
+            GtkLayerShell.set_anchor(self, edge, True)
+        GtkLayerShell.set_exclusive_zone(self, -1)          # under the taskbar too
+        self.view = DesktopView(app, self)
+        # An overlay so the rename box can sit right over an icon's label
+        self.overlay = Gtk.Overlay()
+        self.overlay.add(self.view)
+        self.add(self.overlay)
+        self.set_icons(False)
+        self.show_all()
+
+    def set_icons(self, on):
+        self.view.icons = on
+        # Keys (Delete, F2, Ctrl+C...) only where the icons are
+        GtkLayerShell.set_keyboard_mode(self, GtkLayerShell.KeyboardMode.ON_DEMAND if on
+                                        else GtkLayerShell.KeyboardMode.NONE)
+        self.view.queue_draw()
+
+
+# ---------------------------------------------------------------- the app --
+
+class Desktop:
+    def __init__(self, gtk_app):
+        self.gtk_app = gtk_app
+        self.settings = firox_wallpaper.read()
+        self.folder = desktop_dir()
+        self.items = []
+        self.selected = set()
+        self.cut_uris = set()
+        self.positions = self.load_positions()
+        self.icon_cache = {}
+        self.windows = {}
+        self.sync_timer = None
+        self.reload_timer = None
+        self.reload()
+
+        # Changes to watch: ~/Desktop, the Recycle Bin, settings, icon theme,
+        # monitors and the main display
+        self.watch = []
+        self.watch_dir(self.folder, lambda: self.schedule_reload())
+        os.makedirs(TRASH_FILES, exist_ok=True)
+        self.watch_dir(TRASH_FILES, lambda: self.schedule_reload())
+        os.makedirs(os.path.dirname(firox_wallpaper.USER_CONF), exist_ok=True)
+        self.watch_dir(os.path.dirname(firox_wallpaper.USER_CONF), self.settings_changed)
+        os.makedirs(CONFIG, exist_ok=True)
+        self.watch_dir(CONFIG, self.config_changed)
+        Gtk.IconTheme.get_default().connect("changed", lambda *_: self.icons_changed())
+        display = Gdk.Display.get_default()
+        display.connect("monitor-added", lambda *_: self.schedule_sync())
+        display.connect("monitor-removed", lambda _d, m: self.remove_window(m))
+        Gdk.Screen.get_default().connect("monitors-changed", lambda *_: self.schedule_sync())
+        self.sync_windows()
+
+    # ---- watching
+    def watch_dir(self, path, callback):
+        try:
+            mon = Gio.File.new_for_path(path).monitor_directory(Gio.FileMonitorFlags.WATCH_MOVES, None)
+        except GLib.Error:
+            return
+        mon.connect("changed", lambda *_: callback())
+        self.watch.append(mon)
+
+    def settings_changed(self):
+        new = firox_wallpaper.read()
+        if new == self.settings:
+            return
+        old = self.settings
+        self.settings = new
+        if (old.get("DesktopShortcuts") != new.get("DesktopShortcuts")
+                or old.get("DesktopIconSize") != new.get("DesktopIconSize")):
+            self.icon_cache.clear()
+            self.reload()
+        self.redraw()
+
+    def config_changed(self):
+        self.schedule_sync()                # the main display may have changed
+
+    def icons_changed(self):
+        self.icon_cache.clear()
+        for item in self.items:
+            item.surface = None
+        self.redraw()
+
+    # ---- monitors: a window on each, icons on the main display
+    def schedule_sync(self, delay=300):
+        if self.sync_timer is not None:
+            GLib.source_remove(self.sync_timer)
+        self.sync_timer = GLib.timeout_add(delay, self.sync_windows)
+
+    def sync_windows(self):
+        self.sync_timer = None
+        display = Gdk.Display.get_default()
+        monitors = firox_monitors.gdk_monitors(display)
+        main = firox_monitors.main_gdk_monitor(display)
+        for mon in list(self.windows):
+            if mon not in monitors:
+                self.remove_window(mon)
+        for mon in monitors:
+            if mon not in self.windows:
+                win = DesktopWindow(self, mon)
+                self.windows[mon] = win
+                win.connect("destroy", lambda w, m=mon: self.window_gone(m, w))
+        for mon, win in self.windows.items():
+            if win.view.icons != (mon == main):
+                win.set_icons(mon == main)
+        self.layout_icons()
+        return False
+
+    def remove_window(self, mon):
+        win = self.windows.pop(mon, None)
+        if win is not None:
+            win.destroy()
+        self.schedule_sync()
+
+    def window_gone(self, mon, win):
+        # Closed by the compositor (a monitor going to sleep, say): rebuild
+        if self.windows.get(mon) is win:
+            del self.windows[mon]
+            self.schedule_sync(500)
+
+    def main_view(self):
+        for win in self.windows.values():
+            if win.view.icons:
+                return win.view
+        return None
+
+    def redraw(self):
+        for win in self.windows.values():
+            win.view.queue_draw()
+
+    # ---- items
+    @property
+    def icon_size(self):
+        try:
+            return max(16, min(128, int(self.settings.get("DesktopIconSize", "48"))))
+        except ValueError:
+            return 48
+
+    def single_click(self):
+        return self.settings.get("SingleClick", "false").lower() == "true"
+
+    def schedule_reload(self):
+        if self.reload_timer is not None:
+            GLib.source_remove(self.reload_timer)
+        self.reload_timer = GLib.timeout_add(200, self.reload)
+
+    def reload(self):
+        self.reload_timer = None
+        show_hidden = self.settings.get("ShowHidden", "false").lower() == "true"
+        self.items = special_items(self.settings) + file_items(self.folder, show_hidden)
+        ids = {i.id for i in self.items}
+        self.selected &= ids
+        self.layout_icons()
+        return False
+
+    def icon_surface(self, item, scale):
+        size = self.icon_size
+        key = (item.thumb or (item.gicon.to_string() if item.gicon else ""), size, scale)
+        if key in self.icon_cache:
+            return self.icon_cache[key]
+        pix = None
+        if item.thumb and os.path.exists(item.thumb):
+            try:
+                pix = GdkPixbuf.Pixbuf.new_from_file_at_scale(item.thumb, size * scale, size * scale, True)
+            except GLib.Error:
+                pix = None
+        if pix is None:
+            theme = Gtk.IconTheme.get_default()
+            info = None
+            if item.gicon is not None:
+                info = theme.lookup_by_gicon_for_scale(item.gicon, size, scale, Gtk.IconLookupFlags.FORCE_SIZE)
+            if info is None:
+                info = theme.lookup_icon_for_scale("text-x-generic", size, scale, Gtk.IconLookupFlags.FORCE_SIZE)
+            try:
+                pix = info.load_icon() if info is not None else None
+            except GLib.Error:
+                pix = None
+        surf = None
+        if pix is not None:
+            # Thumbnails keep their shape: centre them in the icon square
+            if pix.get_width() != size * scale or pix.get_height() != size * scale:
+                canvas = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, True, 8, size * scale, size * scale)
+                canvas.fill(0)
+                pix.copy_area(0, 0, pix.get_width(), pix.get_height(), canvas,
+                              (size * scale - pix.get_width()) // 2, (size * scale - pix.get_height()) // 2)
+                pix = canvas
+            surf = Gdk.cairo_surface_create_from_pixbuf(pix, scale, None)
+        self.icon_cache[key] = surf
+        return surf
+
+    # ---- positions
+    def load_positions(self):
+        try:
+            with open(POSITIONS) as fh:
+                data = json.load(fh)
+            return {k: tuple(v) for k, v in data.items() if isinstance(v, list) and len(v) == 2}
+        except (OSError, ValueError):
+            return {}
+
+    def save_positions(self):
+        data = {i.id: list(i.cell) for i in self.items if i.cell is not None}
+        # Keep places of icons that are just hidden for now (e.g. a shortcut
+        # turned off), but forget files that are gone
+        for k, v in self.positions.items():
+            if k.startswith("file:") and not os.path.lexists(os.path.join(self.folder, k[5:])):
+                continue
+            data.setdefault(k, list(v))
+        self.positions = {k: tuple(v) for k, v in data.items()}
+        os.makedirs(CONFIG, exist_ok=True)
+        with open(POSITIONS + ".tmp", "w") as fh:
+            json.dump(data, fh, indent=0)
+        os.replace(POSITIONS + ".tmp", POSITIONS)
+
+    def layout_icons(self):
+        """Give every icon a cell: its remembered one if it fits and is free,
+        else the next free one down the columns, like Windows."""
+        view = self.main_view()
+        if view is None:
+            return
+        cols, rows = view.grid()
+        taken = set()
+        pending = []
+        for item in self.items:
+            cell = self.positions.get(item.id)
+            if cell and cell[0] < cols and cell[1] < rows and cell not in taken:
+                item.cell = tuple(cell)
+                taken.add(item.cell)
+            else:
+                item.cell = None
+                pending.append(item)
+        free = ((c, r) for c in range(cols) for r in range(rows) if (c, r) not in taken)
+        placed = False
+        for item in pending:
+            cell = next(free, None)
+            if cell is None:
+                break                       # more icons than fit
+            item.cell = cell
+            taken.add(cell)
+            placed = True
+        # Remember new icons' places, so deleting one doesn't shuffle the rest
+        # (not while the window is still being set up and tiny)
+        if placed and view.get_allocated_height() > 300:
+            self.save_positions()
+        self.redraw()
+
+    def place_new(self, names, at):
+        """Icons for newly dropped/pasted files start at the drop point."""
+        if at is None:
+            return
+        view = self.main_view()
+        if view is None:
+            return
+        cols, rows = view.grid()
+        taken = {i.cell for i in self.items if i.cell is not None}
+        cells = [(c, r) for c in range(cols) for r in range(rows)]
+        start = cells.index(at) if at in cells else 0
+        for name in names:
+            for cell in cells[start:] + cells[:start]:
+                if cell not in taken:
+                    self.positions[f"file:{name}"] = cell
+                    taken.add(cell)
+                    break
+        self.save_positions()
+
+    def move_icons(self, items, dx, dy, view):
+        cols, rows = view.grid()
+        moving = {i.id for i in items}
+        taken = {i.cell for i in self.items if i.cell is not None and i.id not in moving}
+        dc = round(dx / CELL_W)
+        dr = round(dy / CELL_H)
+        for item in sorted(items, key=lambda i: i.cell or (0, 0)):
+            if item.cell is None:
+                continue
+            c = min(max(item.cell[0] + dc, 0), cols - 1)
+            r = min(max(item.cell[1] + dr, 0), rows - 1)
+            # Next free cell down the column if that one's taken
+            cells = [(cc, rr) for cc in range(cols) for rr in range(rows)]
+            start = cells.index((c, r))
+            for cell in cells[start:] + cells[:start]:
+                if cell not in taken:
+                    item.cell = cell
+                    taken.add(cell)
+                    break
+        self.save_positions()
+        self.redraw()
+
+    def arrange(self, by):
+        specials = [i for i in self.items if i.special]
+        files = [i for i in self.items if not i.special]
+        keys = {
+            "name": lambda i: (not i.is_dir, i.name.casefold()),
+            "type": lambda i: (not i.is_dir, Gio.content_type_get_description(i.content_type) or "",
+                               i.name.casefold()),
+            "size": lambda i: (not i.is_dir, -i.size, i.name.casefold()),
+            "date": lambda i: (not i.is_dir, -i.mtime, i.name.casefold()),
+        }
+        files.sort(key=keys[by])
+        self.positions = {}
+        view = self.main_view()
+        if view is None:
+            return
+        cols, rows = view.grid()
+        cells = ((c, r) for c in range(cols) for r in range(rows))
+        for item in specials + files:
+            item.cell = next(cells, None)
+        self.save_positions()
+        self.redraw()
+
+    # ---- selection
+    def select(self, items):
+        new = {i.id for i in items}
+        if new != self.selected:
+            self.selected = new
+            self.redraw()
+
+    def toggle_select(self, item):
+        self.selected ^= {item.id}
+        self.redraw()
+
+    def selected_items(self):
+        return [i for i in self.items if i.id in self.selected]
+
+    # ---- actions
+    def open_items(self, items):
+        for item in items:
+            if item.special:
+                spawn(["firox-open", {"Computer": "computer", "Home": "home",
+                                      "Network": "network", "Trash": "trash"}[item.special]])
+            elif item.app is not None:
+                try:
+                    item.app.launch([], None)
+                except GLib.Error as err:
+                    self.error(f"Couldn't start {item.name}", err.message)
+            elif item.is_dir:
+                spawn(["pcmanfm-qt", item.path])           # the file manager (as firox-open)
+            else:
+                try:
+                    Gio.AppInfo.launch_default_for_uri(item.uri, None)
+                except GLib.Error as err:
+                    self.error(f"Couldn't open {item.name}", err.message)
+
+    def open_with(self, item):
+        dlg = Gtk.AppChooserDialog.new(None, Gtk.DialogFlags.MODAL, Gio.File.new_for_path(item.path))
+        dlg.set_title(f"Open {item.name} with")
+        if dlg.run() == Gtk.ResponseType.OK:
+            app = dlg.get_app_info()
+            if app is not None:
+                try:
+                    app.launch([Gio.File.new_for_path(item.path)], None)
+                except GLib.Error as err:
+                    self.error(f"Couldn't open {item.name}", err.message)
+        dlg.destroy()
+
+    def copy(self, items, cut):
+        uris = [i.uri for i in items if i.is_file and not i.special]
+        if not uris:
+            return
+        payload = ("cut" if cut else "copy") + "\n" + "\n".join(uris)
+        try:
+            p = subprocess.Popen(["wl-copy", "--type", "x-special/gnome-copied-files"],
+                                 stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            p.communicate(payload.encode(), timeout=5)
+        except (OSError, subprocess.SubprocessError) as err:
+            self.error("Couldn't copy", str(err))
+            return
+        self.cut_uris = set(uris) if cut else set()
+        self.redraw()
+
+    @staticmethod
+    def clipboard_files():
+        """(action, uris) from the clipboard, or (None, [])."""
+        try:
+            types = subprocess.run(["wl-paste", "--list-types"], capture_output=True, text=True,
+                                   timeout=3).stdout.split()
+        except (OSError, subprocess.SubprocessError):
+            return None, []
+        for t in ("x-special/gnome-copied-files", "text/uri-list"):
+            if t in types:
+                try:
+                    text = subprocess.run(["wl-paste", "--no-newline", "--type", t], capture_output=True,
+                                          text=True, timeout=3).stdout
+                except (OSError, subprocess.SubprocessError):
+                    return None, []
+                lines = [ln.strip() for ln in text.splitlines() if ln.strip() and not ln.startswith("#")]
+                action = "copy"
+                if t.startswith("x-special") and lines and lines[0] in ("copy", "cut"):
+                    action = lines.pop(0)
+                return action, [ln for ln in lines if "://" in ln]
+        return None, []
+
+    def paste(self, at=None):
+        action, uris = self.clipboard_files()
+        if not uris:
+            return
+        self.transfer(uris, self.folder, move=action == "cut", at=at)
+        if action == "cut":
+            self.cut_uris = set()
+            subprocess.run(["wl-copy", "--clear"], check=False)
+
+    def transfer(self, uris, dest, move=False, at=None):
+        """Copy (or move) files into the folder `dest`, never overwriting."""
+        names = []
+        for uri in uris:
+            src = uri_to_path(uri)
+            if src is not None:
+                if os.path.dirname(os.path.abspath(src)) == os.path.abspath(dest):
+                    if move:
+                        continue                # already here
+                    target = unique_path(dest, os.path.basename(src))
+                else:
+                    target = unique_path(dest, os.path.basename(src.rstrip("/")))
+                argv = (["mv", "-n", "--", src, target] if move else ["cp", "-a", "--", src, target])
+            else:
+                base = urllib.parse.unquote(os.path.basename(urllib.parse.urlparse(uri).path.rstrip("/"))) or "file"
+                target = unique_path(dest, base)
+                argv = ["gio", "move" if move else "copy", "--", uri, target]
+            names.append(os.path.basename(target))
+            spawn_with_error(argv, self, f"Couldn't {'move' if move else 'copy'} {os.path.basename(target)}")
+        if dest == self.folder:
+            self.place_new(names, at)
+
+    def trash(self, items):
+        self.trash_uris([i.uri for i in items if i.is_file and not i.special])
+
+    def trash_uris(self, uris):
+        failed = []
+        for uri in uris:
+            if uri.startswith(("trash:", "computer:", "network:")) or uri_to_path(uri) == HOME:
+                continue
+            try:
+                Gio.File.new_for_uri(uri).trash(None)
+            except GLib.Error as err:
+                failed.append(f"{urllib.parse.unquote(os.path.basename(uri))}: {err.message}")
+        if failed:
+            self.error("Some files couldn't be moved to the Recycle Bin", "\n".join(failed[:8]))
+
+    def delete_forever(self, items):
+        items = [i for i in items if i.is_file and not i.special]
+        if not items:
+            return
+        what = f"“{items[0].name}”" if len(items) == 1 else f"these {len(items)} items"
+        if not self.confirm(f"Delete {what} permanently?",
+                            "They won't go to the Recycle Bin, so you can't get them back.",
+                            "Delete"):
+            return
+        for item in items:
+            spawn_with_error(["rm", "-rf", "--", item.path], self, f"Couldn't delete {item.name}")
+
+    def empty_trash(self):
+        if not trash_has_items():
+            return
+        if self.confirm("Empty the Recycle Bin?", "Everything in it will be deleted permanently.",
+                        "Empty Recycle Bin"):
+            spawn_with_error(["gio", "trash", "--empty"], self, "Couldn't empty the Recycle Bin")
+
+    def new_item(self, kind, at=None):
+        if kind == "folder":
+            path = unique_path(self.folder, "New Folder")
+            try:
+                os.mkdir(path)
+            except OSError as err:
+                self.error("Couldn't make a folder", str(err))
+                return
+        else:
+            path = unique_path(self.folder, "New Text Document.txt")
+            try:
+                open(path, "x").close()
+            except OSError as err:
+                self.error("Couldn't make a file", str(err))
+                return
+        name = os.path.basename(path)
+        self.place_new([name], at)
+        self.reload()
+        item = next((i for i in self.items if i.id == f"file:{name}"), None)
+        if item is not None:
+            self.select([item])
+            self.rename(item)
+
+    def rename(self, item):
+        """An edit box over the icon's label, like Windows: Enter or clicking
+        elsewhere renames, Escape cancels."""
+        if not item.is_file or item.special:
+            return
+        view = self.main_view()
+        if view is None or item.cell is None:
+            return
+        if getattr(self, "rename_entry", None) is not None:
+            self.rename_entry.destroy()
+        x, _y, w, _h = view.cell_rect(item.cell)
+        _icon, (_lx, ly, _lw, _lh) = view.item_rects(item)
+        entry = Gtk.Entry()
+        entry.set_text(os.path.basename(item.path))
+        entry.set_halign(Gtk.Align.START)
+        entry.set_valign(Gtk.Align.START)
+        width = max(w + 40, min(320, 8 * len(entry.get_text()) + 24))
+        entry.set_size_request(width, -1)
+        entry.set_margin_start(max(0, int(x + w / 2 - width / 2)))
+        entry.set_margin_top(int(ly) - 2)
+        view.window.overlay.add_overlay(entry)
+        entry.show()
+        self.rename_entry = entry
+        stem, ext = os.path.splitext(entry.get_text())
+        entry.grab_focus()
+        entry.select_region(0, len(stem) if (ext and not item.is_dir) else -1)
+        state = {"done": False}
+
+        def finish(apply):
+            if state["done"]:
+                return
+            state["done"] = True
+            new = entry.get_text().strip()
+            self.rename_entry = None
+            GLib.idle_add(entry.destroy)
+            view.grab_focus()
+            if apply:
+                self.do_rename(item, new)
+
+        def on_key(_e, event):
+            if event.keyval == Gdk.KEY_Escape:
+                finish(False)
+                return True
+            if event.keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):
+                finish(True)
+                return True
+            return False
+        entry.connect("key-press-event", on_key)
+        entry.connect("activate", lambda _e: finish(True))
+        entry.connect("focus-out-event", lambda *_: finish(True) or False)
+
+    def do_rename(self, item, new):
+        if not new or new == os.path.basename(item.path):
+            return
+        if "/" in new:
+            self.error("Couldn't rename", "A name can't contain “/”.")
+            return
+        target = os.path.join(self.folder, new)
+        if os.path.lexists(target):
+            self.error("Couldn't rename", f"There's already something called “{new}” here.")
+            return
+        if item.cell is not None:
+            self.positions[f"file:{new}"] = item.cell
+            self.positions.pop(item.id, None)
+            self.save_positions()
+        try:
+            os.rename(item.path, target)
+        except OSError as err:
+            self.error("Couldn't rename", str(err))
+
+    def properties(self, item):
+        dlg = Gtk.Dialog(title=f"{item.name} Properties", modal=True)
+        dlg.add_button("Close", Gtk.ResponseType.CLOSE)
+        box = dlg.get_content_area()
+        box.set_border_width(16)
+        box.set_spacing(10)
+        head = Gtk.Box(spacing=12)
+        img = Gtk.Image.new_from_gicon(item.gicon or Gio.ThemedIcon.new("text-x-generic"), Gtk.IconSize.DIALOG)
+        img.set_pixel_size(48)
+        head.pack_start(img, False, False, 0)
+        name = Gtk.Label(label=item.name, xalign=0, selectable=True, wrap=True)
+        name.get_style_context().add_class("title")
+        head.pack_start(name, True, True, 0)
+        box.pack_start(head, False, False, 0)
+        grid = Gtk.Grid(column_spacing=14, row_spacing=6)
+        rows = []
+        kind = "Folder" if item.is_dir else (
+            item.app.get_description() or "Shortcut to a program" if item.app
+            else Gio.content_type_get_description(item.content_type))
+        rows.append(("Type:", kind or "File"))
+        if item.path:
+            rows.append(("Location:", os.path.dirname(item.path)))
+        if item.is_dir and item.path:
+            try:
+                count = sum(1 for _ in os.scandir(item.path))
+                rows.append(("Contains:", f"{count} item{'s' if count != 1 else ''}"))
+            except OSError:
+                pass
+        elif item.path:
+            rows.append(("Size:", f"{human_size(item.size)} ({item.size:,} bytes)"))
+        if item.mtime:
+            rows.append(("Modified:", time.strftime("%A, %d %B %Y, %H:%M", time.localtime(item.mtime))))
+        if item.app is not None and item.app.get_commandline():
+            rows.append(("Runs:", item.app.get_commandline()))
+        for n, (k, v) in enumerate(rows):
+            grid.attach(Gtk.Label(label=k, xalign=0), 0, n, 1, 1)
+            val = Gtk.Label(label=v, xalign=0, selectable=True, wrap=True, max_width_chars=44)
+            grid.attach(val, 1, n, 1, 1)
+        box.pack_start(grid, False, False, 0)
+        dlg.show_all()
+        dlg.connect("response", lambda d, _r: d.destroy())
+
+    # ---- dialogs
+    @staticmethod
+    def error(title, detail=""):
+        dlg = Gtk.MessageDialog(message_type=Gtk.MessageType.ERROR, buttons=Gtk.ButtonsType.CLOSE, text=title)
+        if detail:
+            dlg.format_secondary_text(detail)
+        dlg.connect("response", lambda d, _r: d.destroy())
+        dlg.show()
+
+    @staticmethod
+    def confirm(title, detail, ok):
+        dlg = Gtk.MessageDialog(message_type=Gtk.MessageType.WARNING, buttons=Gtk.ButtonsType.NONE, text=title)
+        dlg.format_secondary_text(detail)
+        dlg.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        btn = dlg.add_button(ok, Gtk.ResponseType.OK)
+        btn.get_style_context().add_class("destructive-action")
+        dlg.set_default_response(Gtk.ResponseType.CANCEL)
+        answer = dlg.run() == Gtk.ResponseType.OK
+        dlg.destroy()
+        return answer
+
+    # ---- menus
+    def menu(self):
+        menu = Gtk.Menu()
+        menu.connect("deactivate", lambda m: GLib.idle_add(m.destroy))
+        return menu
+
+    @staticmethod
+    def add(menu, label, callback=None, sensitive=True, bold=False):
+        item = Gtk.MenuItem.new_with_mnemonic(label)
+        if bold:
+            item.get_child().set_markup(f"<b>{GLib.markup_escape_text(label.replace('_', ''))}</b>")
+        item.set_sensitive(sensitive and callback is not None)
+        if callback is not None:
+            item.connect("activate", lambda _i: callback())
+        menu.append(item)
+        return item
+
+    def item_menu(self, view, event):
+        sel = self.selected_items()
+        if not sel:
+            return
+        files = [i for i in sel if i.is_file and not i.special]
+        one = sel[0] if len(sel) == 1 else None
+        menu = self.menu()
+        self.add(menu, "_Open", lambda: self.open_items(sel), bold=True)
+        if one is not None and one.is_file and not one.special and not one.is_dir and one.app is None:
+            self.add(menu, "Open _With…", lambda: self.open_with(one))
+        if one is not None and one.special == "Trash":
+            menu.append(Gtk.SeparatorMenuItem())
+            self.add(menu, "_Empty Recycle Bin", self.empty_trash, sensitive=trash_has_items())
+        if files:
+            menu.append(Gtk.SeparatorMenuItem())
+            self.add(menu, "Cu_t", lambda: self.copy(files, cut=True))
+            self.add(menu, "_Copy", lambda: self.copy(files, cut=False))
+            if one is not None and one.is_dir:
+                self.add(menu, "_Paste into Folder", lambda: self.paste_into(one))
+            menu.append(Gtk.SeparatorMenuItem())
+            self.add(menu, "_Rename", (lambda: self.rename(one)) if one is not None else None)
+            self.add(menu, "_Move to Recycle Bin", lambda: self.trash(files))
+        if one is not None and (one.is_file or one.special == "Home"):
+            menu.append(Gtk.SeparatorMenuItem())
+            self.add(menu, "P_roperties", lambda: self.properties(one))
+        menu.show_all()
+        menu.popup_at_pointer(event)
+
+    def paste_into(self, folder_item):
+        action, uris = self.clipboard_files()
+        if uris:
+            self.transfer(uris, folder_item.path, move=action == "cut")
+
+    def desktop_menu(self, view, event):
+        at = view.cell_at(event.x, event.y) if view.icons else None
+        menu = self.menu()
+        if view.icons:
+            arrange = Gtk.Menu()
+            for label, by in (("_Name", "name"), ("_Type", "type"), ("_Size", "size"), ("_Date modified", "date")):
+                self.add(arrange, label, lambda b=by: self.arrange(b))
+            sub = Gtk.MenuItem.new_with_mnemonic("Arrange _Icons By")
+            sub.set_submenu(arrange)
+            menu.append(sub)
+            self.add(menu, "R_efresh", self.reload)
+            menu.append(Gtk.SeparatorMenuItem())
+            action, uris = self.clipboard_files()
+            self.add(menu, "_Paste", (lambda: self.paste(at)) if uris else None)
+            menu.append(Gtk.SeparatorMenuItem())
+            new = Gtk.Menu()
+            self.add(new, "_Folder", lambda: self.new_item("folder", at))
+            self.add(new, "_Text Document", lambda: self.new_item("text", at))
+            sub = Gtk.MenuItem.new_with_mnemonic("Ne_w")
+            sub.set_submenu(new)
+            menu.append(sub)
+            menu.append(Gtk.SeparatorMenuItem())
+        self.add(menu, "_Display Settings", lambda: spawn(["firox-control-panel", "display"]))
+        self.add(menu, "Desktop _Background", lambda: spawn(["firox-control-panel", "background"]))
+        menu.show_all()
+        menu.popup_at_pointer(event)
+
+
+def spawn_with_error(argv, desktop, title):
+    """Run a file operation in the background; tell the user if it fails."""
+    try:
+        proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.PIPE, text=True)
+    except OSError as err:
+        desktop.error(title, str(err))
+        return
+
+    def check():
+        if proc.poll() is None:
+            return True
+        if proc.returncode != 0:
+            desktop.error(title, (proc.stderr.read() or "").strip()[:500])
+        desktop.schedule_reload()
+        return False
+    GLib.timeout_add(150, check)
+
+
+class App(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id="org.firox.Desktop", flags=Gio.ApplicationFlags.FLAGS_NONE)
+        self.desktop = None
+
+    def do_activate(self):
+        if self.desktop is None:
+            self.hold()
+            self.desktop = Desktop(self)
+
+
+def main():
+    if Gdk.Display.get_default() is None:
+        cant_run("no display")
+    if not GtkLayerShell.is_supported():
+        cant_run("the compositor doesn't support layer-shell")
+    # One desktop per session (e.g. after a restart from a terminal)
+    me = os.getpid()
+    try:
+        out = subprocess.run(["pgrep", "-u", str(os.getuid()), "-x", "firox-desktop"],
+                             capture_output=True, text=True, timeout=5).stdout.split()
+    except (OSError, subprocess.SubprocessError):
+        out = []
+    for pid in out:
+        if int(pid) != me:
+            try:
+                os.kill(int(pid), 15)
+            except OSError:
+                pass
+    time.sleep(0.2 if len(out) > 1 else 0)
+    sys.exit(App().run([sys.argv[0]]))
+
+
+if __name__ == "__main__":
+    main()
