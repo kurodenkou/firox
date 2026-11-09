@@ -7,6 +7,9 @@ stays pcmanfm-qt).
     firox-explorer [FOLDER|URI]     open a window there (default: Home)
     firox-explorer --connect-saved  connect the connections marked "Connect
                                     when I log in", then exit (run at login)
+    firox-explorer --test NAME      check a saved connection step by step and
+                                    write a report (secrets blanked) to
+                                    ~/.local/state/firox/mounts/ID-test.log
 
 Browse your files, drives and network places; Icons or Details view; Back,
 Forward, Up, an address bar and filtering as you type in the search box.
@@ -14,11 +17,18 @@ Cut, Copy, Paste (shared with the desktop), Rename, New Folder, Move to
 Recycle Bin, Delete, Properties, Open With, drag and drop, and Restore /
 Empty in the Recycle Bin.
 
+A menu bar (File, Edit, View, Go, Bookmarks, Tools, Help): sort by name,
+size, type or date; select none / invert; copy location; new text document;
+bookmarks shared with GTK's file dialogs (~/.config/gtk-3.0/bookmarks) and
+shown in the sidebar; Options and Keyboard Shortcuts. View settings are kept
+in ~/.config/firox/explorer.conf.
+
 Connect to Server mounts Windows shares, SFTP, FTP, WebDAV, Amazon S3 (and
 S3-compatible storage such as Wasabi, R2 or MinIO) and Backblaze B2 in your
 session only, with passwords in your login keyring (see firox_mounts).
 """
 
+import configparser
 import os
 import subprocess
 import sys
@@ -46,15 +56,17 @@ ATTRS = ",".join(["standard::name", "standard::display-name", "standard::icon", 
                   "trash::deletion-date", "standard::target-uri"])
 # model columns
 (C_NAME, C_PIX, C_URI, C_DIR, C_SIZE, C_MTIME, C_TYPE, C_SIZE_TEXT, C_DATE_TEXT,
- C_HIDDEN, C_SMALL, C_ORIG) = range(12)
+ C_HIDDEN, C_SMALL, C_ORIG, C_MOUNTABLE) = range(13)
 
 
 def spawn(argv, cwd=None):
     try:
         subprocess.Popen(argv, cwd=cwd, start_new_session=True, stdin=subprocess.DEVNULL,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
     except OSError as err:
         print(f"firox-explorer: {argv[0]}: {err}", file=sys.stderr)
+        return False
 
 
 def human_size(n):
@@ -151,6 +163,86 @@ def clipboard_get():
                 action = lines.pop(0)
             return action, [ln for ln in lines if "://" in ln]
     return None, []
+
+
+def copy_text(text):
+    try:
+        subprocess.run(["wl-copy", "--", text], timeout=5, check=False,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+# ------------------------------------------------- settings and bookmarks --
+
+CONF = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"),
+                    "firox", "explorer.conf")
+SETTINGS_DEFAULT = {"view": "icons", "sort": "name", "descending": "false", "folders_first": "true",
+                    "hidden": "false", "toolbar": "true", "sidebar": "true", "statusbar": "true",
+                    "thumbnails": "true"}
+MNEMONICS = {getattr(Gdk, "KEY_" + c) for c in "fevgbth"}     # File Edit View Go Bookmarks Tools Help
+SORTS = [("name", "_Name"), ("size", "_Size"), ("type", "_Type"), ("mtime", "_Date modified")]
+
+
+def read_settings():
+    p = configparser.ConfigParser(interpolation=None)
+    try:
+        p.read(CONF)
+    except configparser.Error:
+        pass
+    out = dict(SETTINGS_DEFAULT)
+    if p.has_section("Explorer"):
+        out.update({k: v for k, v in p["Explorer"].items() if k in out})
+    return out
+
+
+def write_settings(settings):
+    p = configparser.ConfigParser(interpolation=None)
+    p["Explorer"] = settings
+    try:
+        os.makedirs(os.path.dirname(CONF), exist_ok=True)
+        with open(CONF + ".tmp", "w") as fh:
+            p.write(fh)
+        os.replace(CONF + ".tmp", CONF)
+    except OSError:
+        pass
+
+
+# The GTK bookmarks file, so bookmarks also show up in every program's
+# Open and Save dialogs. One "URI [label]" per line.
+BOOKMARKS = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"),
+                         "gtk-3.0", "bookmarks")
+
+
+def bookmark_label(uri):
+    gfile = Gio.File.new_for_uri(uri)
+    if gfile.get_path() == HOME:
+        return os.environ.get("USER") or "Home"
+    return gfile.get_basename() if gfile.get_path() else (urllib.parse.unquote(uri.rstrip("/").rsplit("/", 1)[-1])
+                                                           or uri)
+
+
+def read_bookmarks():
+    out = []
+    try:
+        with open(BOOKMARKS) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or "://" not in line:
+                    continue
+                uri, _, label = line.partition(" ")
+                out.append((uri, label.strip() or bookmark_label(uri)))
+    except OSError:
+        pass
+    return out
+
+
+def write_bookmarks(marks):
+    os.makedirs(os.path.dirname(BOOKMARKS), exist_ok=True)
+    with open(BOOKMARKS + ".tmp", "w") as fh:
+        for uri, label in marks:
+            fh.write(uri + ("" if label == bookmark_label(uri) else " " + label) + "\n")
+    os.replace(BOOKMARKS + ".tmp", BOOKMARKS)
 
 
 # --------------------------------------------------------- file operations --
@@ -260,6 +352,16 @@ def enter_ok(entry, dialog):
             return True
         return False
     entry.connect("key-press-event", on_key)
+
+
+def esc_closes(dialog):
+    """Escape closes the dialog (handled directly, like Enter above)."""
+    def on_key(_d, ev):
+        if ev.keyval == Gdk.KEY_Escape and not isinstance(dialog.get_focus(), Gtk.Entry):  # not mid-rename
+            dialog.response(Gtk.ResponseType.CLOSE)
+            return True
+        return False
+    dialog.connect("key-press-event", on_key)
 
 
 def ask_text(parent, title, label, value, select_stem=False):
@@ -408,16 +510,18 @@ class Explorer(Gtk.ApplicationWindow):
         self.set_icon_name("system-file-manager")
         self.history, self.future = [], []
         self.current = None
-        self.show_hidden = False
+        self.settings = read_settings()
+        self.show_hidden = self.flag("hidden")
         self.loading = None
         self.monitor = None
         self.cut_uris = set()
-        self.view_mode = "icons"
+        self.view_mode = "details" if self.settings["view"] == "details" else "icons"
 
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         self.add(root)
+        root.pack_start(self.build_menubar(), False, False, 0)
         # toolbar
-        bar = Gtk.Box(spacing=4)
+        bar = self.toolbar = Gtk.Box(spacing=4)
         bar.set_border_width(4)
         self.back = self.tool("go-previous", "Back (Alt+Left)", self.go_back)
         self.fwd = self.tool("go-next", "Forward (Alt+Right)", self.go_forward)
@@ -459,14 +563,14 @@ class Explorer(Gtk.ApplicationWindow):
         self.side.get_selection().set_select_function(
             lambda _sel, model, path, _cur: model[path][3] != "header")
         self.side.connect("button-press-event", self.on_side_press)
-        sscroll = Gtk.ScrolledWindow()
+        sscroll = self.side_scroll = Gtk.ScrolledWindow()
         sscroll.set_size_request(210, -1)
         sscroll.add(self.side)
         paned.pack1(sscroll, False, False)
 
         # main views on one model
         self.store = Gtk.ListStore(str, GdkPixbuf.Pixbuf, str, bool, GObjectInt64(), GObjectInt64(),
-                                   str, str, str, bool, GdkPixbuf.Pixbuf, str)
+                                   str, str, str, bool, GdkPixbuf.Pixbuf, str, bool)
         self.store.set_default_sort_func(self.sort_func)
         self.store.set_sort_column_id(Gtk.TREE_SORTABLE_DEFAULT_SORT_COLUMN_ID, Gtk.SortType.ASCENDING)
         self.filter = self.store.filter_new()
@@ -528,9 +632,20 @@ class Explorer(Gtk.ApplicationWindow):
         vm = Gio.VolumeMonitor.get()
         for sig in ("mount-added", "mount-removed", "volume-added", "volume-removed", "mount-changed"):
             vm.connect(sig, lambda *_: GLib.idle_add(self.fill_sidebar))
+        # bookmarks changed here, in another window or in a file dialog
+        try:
+            self.marks_monitor = Gio.File.new_for_path(BOOKMARKS).monitor_file(Gio.FileMonitorFlags.NONE, None)
+            self.marks_monitor.connect("changed", lambda *_: GLib.idle_add(self.fill_sidebar))
+        except GLib.Error:
+            self.marks_monitor = None
         self.show_all()
+        self.toolbar.set_visible(self.flag("toolbar"))
+        self.side_scroll.set_visible(self.flag("sidebar"))
+        self.status.set_visible(self.flag("statusbar"))
+        self.set_view(self.view_mode, save=False)
         self.navigate(location, remember=False)
         self.fill_sidebar()
+        self.refill_menus()
 
     # ---- small helpers
     @staticmethod
@@ -563,7 +678,13 @@ class Explorer(Gtk.ApplicationWindow):
         items.append(("user-trash", "Recycle Bin", "trash:///"))
         for icon, label, target in items:
             self.side_store.append(places, [icon, GLib.markup_escape_text(label), target, "place"])
-        drives = self.side_store.append(None, ["", "<b>Computer</b>", None, "header"])
+        marks = read_bookmarks()
+        if marks:
+            parent = self.side_store.append(None, ["", "<b>Bookmarks</b>", None, "header"])
+            for uri, label in marks:
+                self.side_store.append(parent, ["folder-remote" if uri.split(":", 1)[0] != "file" else "folder",
+                                                GLib.markup_escape_text(label), uri, "bookmark"])
+        drives =self.side_store.append(None, ["", "<b>Computer</b>", None, "header"])
         self.side_store.append(drives, ["computer", "Computer", "computer:///", "place"])
         self.side_store.append(drives, ["drive-harddisk", "File System", "/", "place"])
         vm = Gio.VolumeMonitor.get()
@@ -606,7 +727,7 @@ class Explorer(Gtk.ApplicationWindow):
         if it is None:
             return
         kind = model[it][3]
-        if kind == "place":
+        if kind in ("place", "bookmark"):
             self.navigate(model[it][2])
 
     def on_side_activated(self, view, path, _col):
@@ -641,6 +762,10 @@ class Explorer(Gtk.ApplicationWindow):
                                (lambda: self.disconnect(payload)) if on else (lambda: self.open_connection(payload)))
                 menu.append(Gtk.SeparatorMenuItem())
                 self.menu_item(menu, "_Edit…", lambda: self.edit_connection(payload))
+                self.menu_item(menu, "_Test Connection…", lambda: self.test_connection(payload))
+                self.menu_item(menu, "Show _Log", lambda: self.show_log(payload),
+                               os.path.exists(firox_mounts.log_path(payload)))
+                menu.append(Gtk.SeparatorMenuItem())
                 self.menu_item(menu, "Re_move", lambda: self.remove_connection(payload))
             elif kind in ("volume", "mount"):
                 mount = payload.get_mount() if kind == "volume" else payload
@@ -650,6 +775,12 @@ class Explorer(Gtk.ApplicationWindow):
                                    lambda: self.eject(mount))
                 else:
                     self.menu_item(menu, "_Mount", lambda: self.open_volume(payload))
+            elif kind == "bookmark":
+                self.menu_item(menu, "_Open", lambda: self.navigate(payload))
+                self.menu_item(menu, "Open in New _Window", lambda: spawn([sys.argv[0], payload]))
+                menu.append(Gtk.SeparatorMenuItem())
+                self.menu_item(menu, "Re_name…", lambda: self.rename_bookmark(payload))
+                self.menu_item(menu, "_Remove Bookmark", lambda: self.remove_bookmark(payload))
             else:
                 return False
             menu.show_all()
@@ -937,8 +1068,12 @@ class Explorer(Gtk.ApplicationWindow):
                     gf.mount_enclosing_volume_finish(res)
                     self.load()
                 except GLib.Error as e:
+                    if e.matches(Gio.io_error_quark(), Gio.IOErrorEnum.ALREADY_MOUNTED):
+                        self.load()
+                        return
                     self.status.set_text("")
-                    error_box(self, "Couldn't open the location", e.message)
+                    if not e.matches(Gio.io_error_quark(), Gio.IOErrorEnum.FAILED_HANDLED):
+                        error_box(self, "Couldn't open the location", e.message)
             f.mount_enclosing_volume(Gio.MountMountFlags.NONE, op, None, mounted)
             return
         self.status.set_text("")
@@ -947,22 +1082,29 @@ class Explorer(Gtk.ApplicationWindow):
 
     def add_row(self, folder, info):
         name = info.get_display_name()
-        is_dir = info.get_file_type() == Gio.FileType.DIRECTORY
+        ftype = info.get_file_type()
         child = folder.get_child(info.get_name())
         target = info.get_attribute_string("standard::target-uri")
         uri = target or child.get_uri()
+        # In Network and Computer, servers, shares and drives are shortcuts
+        # or mountables: open them like folders (mounting first if needed)
+        is_dir = ftype == Gio.FileType.DIRECTORY or (
+            ftype in (Gio.FileType.SHORTCUT, Gio.FileType.MOUNTABLE) and (
+                target is not None or ftype == Gio.FileType.MOUNTABLE))
+        mountable = ftype == Gio.FileType.MOUNTABLE and target is None
         mtime = info.get_attribute_uint64("time::modified")
-        size = info.get_size()
+        size = info.get_size() if info.has_attribute("standard::size") else 0
         ct = info.get_content_type() or ""
-        thumb = info.get_attribute_byte_string("thumbnail::path")
+        thumb = info.get_attribute_byte_string("thumbnail::path") if self.flag("thumbnails") else None
         gicon = info.get_icon()
-        hidden = info.get_is_hidden() or info.get_is_backup() or info.get_name().startswith(".")
+        hidden = (info.has_attribute("standard::is-hidden") and info.get_is_hidden()) or (
+            info.has_attribute("standard::is-backup") and info.get_is_backup()) or info.get_name().startswith(".")
         orig = info.get_attribute_byte_string("trash::orig-path") or ""
         self.store.append([name, ICONS.get(gicon, ICON_SIZE_BIG, thumb), uri, is_dir, size, mtime,
                            "Folder" if is_dir else (Gio.content_type_get_description(ct) or "File"),
                            "" if is_dir else human_size(size),
                            time.strftime("%d/%m/%Y %H:%M", time.localtime(mtime)) if mtime else "",
-                           hidden, ICONS.get(gicon, ICON_SIZE_SMALL), orig])
+                           hidden, ICONS.get(gicon, ICON_SIZE_SMALL), orig, mountable])
 
     def loaded(self):
         try:
@@ -1005,11 +1147,45 @@ class Explorer(Gtk.ApplicationWindow):
         GLib.timeout_add(100, reselect)
 
     def sort_func(self, model, a, b, _data=None):
-        da, db = model[a][C_DIR], model[b][C_DIR]
-        if da != db:
-            return -1 if da else 1
-        na, nb = model[a][C_NAME].casefold(), model[b][C_NAME].casefold()
-        return (na > nb) - (na < nb)
+        ra, rb = model[a], model[b]
+        if self.flag("folders_first") and ra[C_DIR] != rb[C_DIR]:
+            return -1 if ra[C_DIR] else 1
+        na, nb = (ra[C_NAME] or "").casefold(), (rb[C_NAME] or "").casefold()
+        key = self.settings["sort"]
+        if key == "size":
+            ka, kb = (0 if ra[C_DIR] else ra[C_SIZE], na), (0 if rb[C_DIR] else rb[C_SIZE], nb)
+        elif key == "type":
+            ka, kb = ((ra[C_TYPE] or "").casefold(), na), ((rb[C_TYPE] or "").casefold(), nb)
+        elif key == "mtime":
+            ka, kb = (ra[C_MTIME], na), (rb[C_MTIME], nb)
+        else:
+            ka, kb = na, nb
+        res = (ka > kb) - (ka < kb)
+        return -res if self.flag("descending") else res
+
+    # ---- settings
+    def flag(self, key):
+        return self.settings.get(key) == "true"
+
+    def set_setting(self, key, value):
+        self.settings[key] = value if isinstance(value, str) else ("true" if value else "false")
+        write_settings(self.settings)
+
+    def resort(self):
+        self.store.set_default_sort_func(self.sort_func)     # sorts again
+
+    def set_sort(self, key=None, descending=None, folders_first=None):
+        if key is not None:
+            self.set_setting("sort", key)
+        if descending is not None:
+            self.set_setting("descending", descending)
+        if folders_first is not None:
+            self.set_setting("folders_first", folders_first)
+        self.resort()
+
+    def set_bar(self, key, widget, on):
+        widget.set_visible(on)
+        self.set_setting(key, on)
 
     def visible_func(self, model, it, _data=None):
         if model[it][C_HIDDEN] and not self.show_hidden:
@@ -1034,10 +1210,20 @@ class Explorer(Gtk.ApplicationWindow):
         self.status.set_text(text)
 
     def toggle_view(self):
-        self.view_mode = "details" if self.view_mode == "icons" else "icons"
+        self.set_view("details" if self.view_mode == "icons" else "icons")
+
+    def set_view(self, mode, save=True):
+        selected = {r[C_URI] for r in self.selected_rows()} if save else set()
+        self.view_mode = mode
         self.stack.set_visible_child_name(self.view_mode)
         self.view_btn.set_image(Gtk.Image.new_from_icon_name(
             "view-grid" if self.view_mode == "details" else "view-list-details", Gtk.IconSize.LARGE_TOOLBAR))
+        for i, row in enumerate(self.filter):
+            if row[C_URI] in selected:
+                path = Gtk.TreePath.new_from_indices([i])
+                (self.icons.select_path if mode == "icons" else self.details.get_selection().select_path)(path)
+        if save:
+            self.set_setting("view", mode)
 
     # ---- selection
     def selected_paths(self):
@@ -1057,6 +1243,9 @@ class Explorer(Gtk.ApplicationWindow):
         rows = [self.filter[p] for p in paths]
         for row in rows:
             gfile = Gio.File.new_for_uri(row[C_URI])
+            if row[C_MOUNTABLE]:
+                self.open_mountable(gfile)
+                continue
             if row[C_DIR]:
                 if len(rows) == 1:
                     self.navigate(gfile)
@@ -1064,6 +1253,34 @@ class Explorer(Gtk.ApplicationWindow):
                     spawn([sys.argv[0], gfile.get_uri()])
                 continue
             self.open_file(gfile, row[C_NAME])
+
+    def open_mountable(self, gfile):
+        """A server, share or drive that isn't mounted yet: mount it (asking
+        for a password if it needs one), then go in."""
+        self.status.set_text("Connecting…")
+
+        def mounted(f, res):
+            try:
+                target = f.mount_mountable_finish(res)
+            except GLib.Error as err:
+                if err.matches(Gio.io_error_quark(), Gio.IOErrorEnum.ALREADY_MOUNTED):
+                    target = None
+                elif err.matches(Gio.io_error_quark(), Gio.IOErrorEnum.FAILED_HANDLED):
+                    self.update_status()             # cancelled in the password box
+                    return
+                else:
+                    self.update_status()
+                    error_box(self, "Couldn't connect", err.message)
+                    return
+            if target is None:
+                try:
+                    info = f.query_info("standard::target-uri", Gio.FileQueryInfoFlags.NONE, None)
+                    t = info.get_attribute_string("standard::target-uri")
+                    target = Gio.File.new_for_uri(t) if t else f
+                except GLib.Error:
+                    target = f
+            self.navigate(target)
+        gfile.mount_mountable(Gio.MountMountFlags.NONE, Gtk.MountOperation(parent=self), None, mounted)
 
     def open_file(self, gfile, name):
         path = local_path(gfile)
@@ -1286,13 +1503,464 @@ class Explorer(Gtk.ApplicationWindow):
 
     # ---- menus and keys
     @staticmethod
-    def menu_item(menu, label, cb, sensitive=True):
-        it = Gtk.MenuItem.new_with_mnemonic(label)
+    def menu_item(menu, label, cb, sensitive=True, accel=None, check=None, radio=False):
+        """A menu item. `accel` ("<Control>n") is only shown: on_key does the
+        work, so the keys also work with the menu bar hidden. `check`
+        True/False makes a tick box (`radio`: drawn as a dot)."""
+        if check is None:
+            it = Gtk.MenuItem.new_with_mnemonic(label)
+        else:
+            it = Gtk.CheckMenuItem.new_with_mnemonic(label)
+            it.set_draw_as_radio(radio)
+            it.set_active(check)
         it.set_sensitive(sensitive and cb is not None)
+        if accel:
+            key, mods = Gtk.accelerator_parse(accel)
+            child = it.get_child()
+            if isinstance(child, Gtk.AccelLabel):
+                child.set_accel(key, mods)
         if cb is not None:
             it.connect("activate", lambda _i: cb())
         menu.append(it)
         return it
+
+    def build_menubar(self):
+        """File, Edit, View, Go, Bookmarks, Tools, Help. Each menu is filled
+        as it opens, so what's greyed out matches the selection and folder."""
+        bar = self.menubar = Gtk.MenuBar()
+        self.menus = []
+        for label, fill in (("_File", self.fill_file), ("_Edit", self.fill_edit), ("_View", self.fill_view),
+                            ("_Go", self.fill_go), ("_Bookmarks", self.fill_bookmarks),
+                            ("_Tools", self.fill_tools), ("_Help", self.fill_help)):
+            top = Gtk.MenuItem.new_with_mnemonic(label)
+            menu = Gtk.Menu()
+            top.set_submenu(menu)
+            self.menus.append((menu, fill))
+            bar.append(top)
+        # Filled just before the bar opens (a click on it here, F10 and
+        # Alt+letter in on_key), never while a menu is showing.
+        bar.connect("button-press-event", lambda *_: self.refill_menus() and False)
+        return bar
+
+    def refill_menus(self):
+        if self.menubar.get_selected_item() is not None:
+            return False                      # already open
+        for menu, fill in self.menus:
+            for child in menu.get_children():
+                menu.remove(child)
+            fill(menu)
+            menu.show_all()
+        return False
+
+    def in_trash(self):
+        return self.current is not None and self.current.get_uri_scheme() == "trash"
+
+    def fill_file(self, menu):
+        rows = self.selected_rows() if self.current is not None else []
+        one = rows[0] if len(rows) == 1 else None
+        trash = self.in_trash()
+        writable = not trash and self.current is not None and local_path(self.current) is not None
+        self.menu_item(menu, "New _Window", lambda: spawn([sys.argv[0], self.current.get_uri()]),
+                       accel="<Control>n")
+        self.menu_item(menu, "New _Folder…", self.new_folder, writable, accel="<Control><Shift>n")
+        self.menu_item(menu, "New _Text Document…", self.new_document, writable)
+        menu.append(Gtk.SeparatorMenuItem())
+        self.menu_item(menu, "_Open", lambda: self.open_paths(self.selected_paths()), bool(rows), accel="Return")
+        self.menu_item(menu, "Open _With…", lambda: self.open_with(Gio.File.new_for_uri(one[C_URI])),
+                       one is not None and not one[C_DIR])
+        self.menu_item(menu, "Open in New Window", lambda: [spawn([sys.argv[0], r[C_URI]]) for r in rows],
+                       bool(rows) and all(r[C_DIR] for r in rows))
+        self.menu_item(menu, "Open Ter_minal Here", self.terminal_here, local_path(self.current) is not None
+                       if self.current is not None else False)
+        menu.append(Gtk.SeparatorMenuItem())
+        if trash:
+            self.menu_item(menu, "_Restore", self.restore, bool(rows))
+            self.menu_item(menu, "_Delete Permanently", self.delete_forever, bool(rows), accel="Delete")
+            self.menu_item(menu, "_Empty Recycle Bin", self.empty_trash)
+        else:
+            self.menu_item(menu, "Re_name…", self.rename, one is not None, accel="F2")
+            self.menu_item(menu, "Move to Recycle _Bin", self.trash, bool(rows), accel="Delete")
+            self.menu_item(menu, "_Delete Permanently…", self.delete_forever, bool(rows), accel="<Shift>Delete")
+        menu.append(Gtk.SeparatorMenuItem())
+        self.menu_item(menu, "P_roperties", self.properties, bool(rows), accel="<Alt>Return")
+        menu.append(Gtk.SeparatorMenuItem())
+        self.menu_item(menu, "_Close", self.close, accel="<Control>w")
+
+    def fill_edit(self, menu):
+        rows = self.selected_rows() if self.current is not None else []
+        trash = self.in_trash()
+        _action, uris = clipboard_get() if not trash else (None, [])
+        self.menu_item(menu, "Cu_t", lambda: self.copy(True), bool(rows) and not trash, accel="<Control>x")
+        self.menu_item(menu, "_Copy", lambda: self.copy(False), bool(rows) and not trash, accel="<Control>c")
+        self.menu_item(menu, "_Paste", self.paste, bool(uris), accel="<Control>v")
+        menu.append(Gtk.SeparatorMenuItem())
+        self.menu_item(menu, "Select _All", self.select_all, accel="<Control>a")
+        self.menu_item(menu, "Select _None", self.select_none, bool(rows), accel="<Control><Shift>a")
+        self.menu_item(menu, "_Invert Selection", self.invert_selection, accel="<Control>i")
+        menu.append(Gtk.SeparatorMenuItem())
+        self.menu_item(menu, "Copy _Location", self.copy_location, accel="<Control><Shift>c")
+        self.menu_item(menu, "_Find in This Folder", self.search.grab_focus, accel="<Control>f")
+
+    def fill_view(self, menu):
+        self.menu_item(menu, "_Icons", lambda: self.set_view("icons"), accel="<Control>1",
+                       check=self.view_mode == "icons", radio=True)
+        self.menu_item(menu, "_Details", lambda: self.set_view("details"), accel="<Control>2",
+                       check=self.view_mode == "details", radio=True)
+        menu.append(Gtk.SeparatorMenuItem())
+        sort = Gtk.MenuItem.new_with_mnemonic("_Sort By")
+        sub = Gtk.Menu()
+        sort.set_submenu(sub)
+        for key, label in SORTS:
+            self.menu_item(sub, label, lambda k=key: self.set_sort(key=k), check=self.settings["sort"] == key,
+                           radio=True)
+        sub.append(Gtk.SeparatorMenuItem())
+        self.menu_item(sub, "_Ascending", lambda: self.set_sort(descending=False),
+                       check=not self.flag("descending"), radio=True)
+        self.menu_item(sub, "D_escending", lambda: self.set_sort(descending=True),
+                       check=self.flag("descending"), radio=True)
+        sub.append(Gtk.SeparatorMenuItem())
+        self.menu_item(sub, "_Folders First", lambda: self.set_sort(folders_first=not self.flag("folders_first")),
+                       check=self.flag("folders_first"))
+        menu.append(sort)
+        menu.append(Gtk.SeparatorMenuItem())
+        self.menu_item(menu, "Show _Hidden Files", self.toggle_hidden, accel="<Control>h", check=self.show_hidden)
+        self.menu_item(menu, "_Toolbar", lambda: self.set_bar("toolbar", self.toolbar, not self.toolbar.get_visible()),
+                       check=self.toolbar.get_visible())
+        self.menu_item(menu, "Side_bar", self.toggle_sidebar, accel="F9", check=self.side_scroll.get_visible())
+        self.menu_item(menu, "Status B_ar", lambda: self.set_bar("statusbar", self.status,
+                                                                  not self.status.get_visible()),
+                       check=self.status.get_visible())
+        menu.append(Gtk.SeparatorMenuItem())
+        self.menu_item(menu, "_Refresh", self.refresh, accel="F5")
+
+    def fill_go(self, menu):
+        self.menu_item(menu, "_Back", self.go_back, bool(self.history), accel="<Alt>Left")
+        self.menu_item(menu, "_Forward", self.go_forward, bool(self.future), accel="<Alt>Right")
+        self.menu_item(menu, "_Up One Folder", self.go_up,
+                       self.current is not None and self.current.get_parent() is not None, accel="<Alt>Up")
+        menu.append(Gtk.SeparatorMenuItem())
+        self.menu_item(menu, "_Home Folder", lambda: self.navigate(HOME), accel="<Alt>Home")
+        for which, label in ((GLib.UserDirectory.DIRECTORY_DESKTOP, "_Desktop"),
+                             (GLib.UserDirectory.DIRECTORY_DOCUMENTS, "D_ocuments"),
+                             (GLib.UserDirectory.DIRECTORY_DOWNLOAD, "Do_wnloads"),
+                             (GLib.UserDirectory.DIRECTORY_PICTURES, "_Pictures"),
+                             (GLib.UserDirectory.DIRECTORY_MUSIC, "_Music"),
+                             (GLib.UserDirectory.DIRECTORY_VIDEOS, "_Videos")):
+            d = special_dir(which)
+            if d:
+                self.menu_item(menu, label, lambda d=d: self.navigate(d))
+        menu.append(Gtk.SeparatorMenuItem())
+        self.menu_item(menu, "_Computer", lambda: self.navigate("computer:///"))
+        self.menu_item(menu, "_Network", lambda: self.navigate("network:///"))
+        self.menu_item(menu, "_Recycle Bin", lambda: self.navigate("trash:///"))
+        menu.append(Gtk.SeparatorMenuItem())
+        self.menu_item(menu, "_Location…", self.focus_address, accel="<Control>l")
+
+    def fill_bookmarks(self, menu):
+        marks = read_bookmarks()
+        here = self.current.get_uri() if self.current is not None else None
+        marked = any(uri == here for uri, _l in marks)
+        self.menu_item(menu, "_Add Bookmark", self.add_bookmark, here is not None and not marked
+                       and not self.in_trash(), accel="<Control>d")
+        self.menu_item(menu, "_Edit Bookmarks…", self.edit_bookmarks, accel="<Control>b")
+        if marks:
+            menu.append(Gtk.SeparatorMenuItem())
+        for uri, label in marks:
+            it = self.menu_item(menu, label.replace("_", "__"), lambda u=uri: self.navigate(u))
+            it.set_tooltip_text(Gio.File.new_for_uri(uri).get_parse_name())
+
+    def fill_tools(self, menu):
+        conns = firox_mounts.load()
+        mounted = [c for c in conns if firox_mounts.is_mounted(c)]
+        self.menu_item(menu, "_Connect to Server…", self.add_connection)
+        if conns:
+            sub_item = Gtk.MenuItem.new_with_mnemonic("_Saved Connections")
+            sub = Gtk.Menu()
+            sub_item.set_submenu(sub)
+            for conn in conns:
+                on = conn in mounted
+                self.menu_item(sub, (conn.get("name") or conn["id"]).replace("_", "__"),
+                               lambda c=conn: self.open_connection(c), check=on)
+            menu.append(sub_item)
+        if conns:
+            sub_item = Gtk.MenuItem.new_with_mnemonic("_Test a Connection")
+            sub = Gtk.Menu()
+            sub_item.set_submenu(sub)
+            for conn in conns:
+                self.menu_item(sub, (conn.get("name") or conn["id"]).replace("_", "__"),
+                               lambda c=conn: self.test_connection(c))
+            menu.append(sub_item)
+        self.menu_item(menu, "_Disconnect All", self.disconnect_all, bool(mounted))
+        menu.append(Gtk.SeparatorMenuItem())
+        self.menu_item(menu, "Open _Terminal Here", self.terminal_here,
+                       self.current is not None and local_path(self.current) is not None)
+        self.menu_item(menu, "_Empty Recycle Bin…", self.empty_trash)
+        menu.append(Gtk.SeparatorMenuItem())
+        self.menu_item(menu, "_Options…", self.options)
+
+    def fill_help(self, menu):
+        self.menu_item(menu, "Firox Explorer _Help", self.show_help, accel="F1")
+        self.menu_item(menu, "_Keyboard Shortcuts", self.show_shortcuts, accel="<Control>question")
+        menu.append(Gtk.SeparatorMenuItem())
+        self.menu_item(menu, "_About Firox Explorer", self.show_about)
+
+    # ---- what the menus do
+    def focus_address(self):
+        if not self.toolbar.get_visible():
+            self.set_bar("toolbar", self.toolbar, True)
+        self.address.grab_focus()
+
+    def toggle_sidebar(self):
+        self.set_bar("sidebar", self.side_scroll, not self.side_scroll.get_visible())
+
+    def select_all(self):
+        (self.icons.select_all if self.view_mode == "icons" else self.details.get_selection().select_all)()
+
+    def select_none(self):
+        (self.icons.unselect_all if self.view_mode == "icons" else self.details.get_selection().unselect_all)()
+
+    def invert_selection(self):
+        chosen = {tuple(p.get_indices()) for p in self.selected_paths()}
+        self.select_none()
+        for i in range(len(self.filter)):
+            if (i,) not in chosen:
+                path = Gtk.TreePath.new_from_indices([i])
+                (self.icons.select_path if self.view_mode == "icons" else
+                 self.details.get_selection().select_path)(path)
+
+    def copy_location(self):
+        """The selected items' paths (or this folder's), as text."""
+        files = self.selected_files() or ([self.current] if self.current is not None else [])
+        copy_text("\n".join(f.get_path() or f.get_uri() for f in files))
+
+    def new_document(self):
+        dest = self.dest_path()
+        if dest is None:
+            return
+        name = ask_text(self, "New Text Document", "Name of the new document:", os.path.basename(
+            unique_path(dest, "New Text Document.txt")), select_stem=True)
+        if not name:
+            return
+        if "/" in name:
+            error_box(self, "Couldn't make the document", "A name can't contain “/”.")
+            return
+        try:
+            fd = os.open(os.path.join(dest, name), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            os.close(fd)
+        except OSError as err:
+            error_box(self, "Couldn't make the document", err.strerror or str(err))
+
+    def test_connection(self, conn):
+        """Run the step-by-step check in a terminal, so its report can be
+        read, copied and found later in the log folder."""
+        argv = [os.path.abspath(sys.argv[0]), "--test", conn["id"]]
+        if not spawn(["xfce4-terminal", "--hold", "--title", f"Testing {conn.get('name')}", "-x"] + argv):
+            error_box(self, "Couldn't open a terminal", "Run this in a terminal instead:\n" + " ".join(argv))
+
+    def show_log(self, conn):
+        try:
+            Gio.AppInfo.launch_default_for_uri(Gio.File.new_for_path(firox_mounts.log_path(conn)).get_uri(), None)
+        except GLib.Error as err:
+            error_box(self, "Couldn't open the log", err.message)
+
+    def disconnect_all(self):
+        for conn in firox_mounts.load():
+            if firox_mounts.is_mounted(conn):
+                self.disconnect(conn)
+
+    def add_bookmark(self):
+        marks = read_bookmarks()
+        uri = self.current.get_uri()
+        if any(u == uri for u, _l in marks):
+            return
+        marks.append((uri, bookmark_label(uri)))
+        try:
+            write_bookmarks(marks)
+        except OSError as err:
+            error_box(self, "Couldn't add the bookmark", str(err))
+        self.fill_sidebar()
+
+    def remove_bookmark(self, uri):
+        try:
+            write_bookmarks([m for m in read_bookmarks() if m[0] != uri])
+        except OSError as err:
+            error_box(self, "Couldn't remove the bookmark", str(err))
+        self.fill_sidebar()
+
+    def rename_bookmark(self, uri):
+        marks = read_bookmarks()
+        old = next((label for u, label in marks if u == uri), bookmark_label(uri))
+        new = ask_text(self, "Rename Bookmark", "Name:", old)
+        if not new or new == old:
+            return
+        try:
+            write_bookmarks([(u, new.strip() if u == uri else label) for u, label in marks])
+        except OSError as err:
+            error_box(self, "Couldn't rename the bookmark", str(err))
+        self.fill_sidebar()
+
+    def edit_bookmarks(self):
+        dlg = Gtk.Dialog(title="Edit Bookmarks", transient_for=self, modal=True)
+        esc_closes(dlg)
+        dlg.add_button("_Close", Gtk.ResponseType.CLOSE)
+        dlg.set_default_size(480, 340)
+        store = Gtk.ListStore(str, str, str)     # label, uri, where (shown)
+        for uri, label in read_bookmarks():
+            store.append([label, uri, Gio.File.new_for_uri(uri).get_parse_name()])
+        view = Gtk.TreeView(model=store)
+        name = Gtk.CellRendererText(editable=True)
+
+        def edited(_c, path, text):
+            if text.strip():
+                store[path][0] = text.strip()
+                save()
+        name.connect("edited", edited)
+        col = Gtk.TreeViewColumn("Name", name, text=0)
+        col.set_expand(True)
+        view.append_column(col)
+        where = Gtk.TreeViewColumn("Location", Gtk.CellRendererText(ellipsize=Pango.EllipsizeMode.MIDDLE),
+                                   text=2)
+        where.set_expand(True)
+        view.append_column(where)
+        sc = Gtk.ScrolledWindow(hexpand=True, vexpand=True)
+        sc.add(view)
+
+        def save():
+            try:
+                write_bookmarks([(r[1], r[0]) for r in store])
+            except OSError as err:
+                error_box(dlg, "Couldn't save the bookmarks", str(err))
+            self.fill_sidebar()
+
+        def selected():
+            _m, it = view.get_selection().get_selected()
+            return it
+
+        def remove():
+            it = selected()
+            if it is not None:
+                store.remove(it)
+                save()
+
+        def move(step):
+            it = selected()
+            if it is None:
+                return
+            other = store.iter_previous(it) if step < 0 else store.iter_next(it)
+            if other is not None:
+                store.swap(it, other)
+                save()
+
+        def rename():
+            it = selected()
+            if it is not None:
+                view.set_cursor(store.get_path(it), col, True)
+        buttons = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        for label, cb in (("_Rename", rename), ("Re_move", remove), ("Move _Up", lambda: move(-1)),
+                          ("Move _Down", lambda: move(1))):
+            b = Gtk.Button.new_with_mnemonic(label)
+            b.connect("clicked", lambda _b, cb=cb: cb())
+            buttons.pack_start(b, False, False, 0)
+        box = Gtk.Box(spacing=10)
+        box.set_border_width(10)
+        box.pack_start(sc, True, True, 0)
+        box.pack_start(buttons, False, False, 0)
+        hint = Gtk.Label(label="Bookmarks also appear in every program's Open and Save windows.", xalign=0)
+        hint.get_style_context().add_class("dim-label")
+        hint.set_margin_start(10)
+        dlg.get_content_area().pack_start(box, True, True, 0)
+        dlg.get_content_area().pack_start(hint, False, False, 0)
+        if len(store) == 0:
+            hint.set_text("No bookmarks yet. Open a folder and choose Bookmarks → Add Bookmark (Ctrl+D).")
+        dlg.show_all()
+        dlg.run()
+        dlg.destroy()
+
+    def options(self):
+        dlg = Gtk.Dialog(title="Firox Explorer Options", transient_for=self, modal=True)
+        esc_closes(dlg)
+        dlg.add_button("_Close", Gtk.ResponseType.CLOSE)
+        grid = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        grid.set_border_width(14)
+        view_row = Gtk.Box(spacing=8)
+        view_row.pack_start(Gtk.Label(label="Show folders as:"), False, False, 0)
+        view_combo = Gtk.ComboBoxText()
+        view_combo.append("icons", "Icons")
+        view_combo.append("details", "Details")
+        view_combo.set_active_id(self.view_mode)
+        view_combo.connect("changed", lambda c: self.set_view(c.get_active_id()))
+        view_row.pack_start(view_combo, False, False, 0)
+        grid.pack_start(view_row, False, False, 0)
+        checks = (("Show hidden files", self.show_hidden, lambda on: on != self.show_hidden and self.toggle_hidden()),
+                  ("List folders before files", self.flag("folders_first"),
+                   lambda on: self.set_sort(folders_first=on)),
+                  ("Show thumbnails of pictures", self.flag("thumbnails"),
+                   lambda on: (self.set_setting("thumbnails", on), self.refresh())))
+        for label, value, cb in checks:
+            b = Gtk.CheckButton(label=label, active=value)
+            b.connect("toggled", lambda b, cb=cb: cb(b.get_active()))
+            grid.pack_start(b, False, False, 0)
+        hint = Gtk.Label(label="These apply to every Firox Explorer window.", xalign=0)
+        hint.get_style_context().add_class("dim-label")
+        grid.pack_start(hint, False, False, 6)
+        dlg.get_content_area().pack_start(grid, True, True, 0)
+        dlg.show_all()
+        dlg.run()
+        dlg.destroy()
+
+    def show_help(self):
+        spawn(["firefox", "file:///usr/share/firox/help/index.html#explorer"])
+
+    def show_shortcuts(self):
+        keys = [("Navigation", [("Alt+Left / Backspace", "Back"), ("Alt+Right", "Forward"),
+                                ("Alt+Up", "Up one folder"), ("Alt+Home", "Home folder"),
+                                ("Ctrl+L", "Type a location"), ("Ctrl+F", "Find in this folder"),
+                                ("F5", "Refresh")]),
+                ("Files", [("Enter", "Open"), ("F2", "Rename"), ("Delete", "Move to the Recycle Bin"),
+                           ("Shift+Delete", "Delete permanently"), ("Ctrl+Shift+N", "New folder"),
+                           ("Alt+Enter", "Properties")]),
+                ("Editing", [("Ctrl+X / C / V", "Cut, copy, paste"), ("Ctrl+A", "Select all"),
+                             ("Ctrl+Shift+A", "Select none"), ("Ctrl+I", "Invert selection"),
+                             ("Ctrl+Shift+C", "Copy location")]),
+                ("Window", [("Ctrl+1 / Ctrl+2", "Icons / Details view"), ("Ctrl+H", "Show hidden files"),
+                            ("F9", "Sidebar"), ("Ctrl+D", "Bookmark this folder"), ("Ctrl+B", "Edit bookmarks"),
+                            ("Ctrl+N", "New window"), ("Ctrl+W", "Close window"), ("F10", "Menu bar"),
+                            ("F1", "Help")])]
+        dlg = Gtk.Dialog(title="Keyboard Shortcuts", transient_for=self, modal=True)
+        esc_closes(dlg)
+        dlg.add_button("_Close", Gtk.ResponseType.CLOSE)
+        cols = Gtk.Box(spacing=28)
+        cols.set_border_width(16)
+        for i in range(0, len(keys), 2):
+            col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+            for title, rows in keys[i:i + 2]:
+                head = Gtk.Label(xalign=0)
+                head.set_markup(f"<b>{title}</b>")
+                head.set_margin_top(6)
+                col.pack_start(head, False, False, 0)
+                grid = Gtk.Grid(column_spacing=16, row_spacing=2)
+                for r, (k, what) in enumerate(rows):
+                    kl = Gtk.Label(label=k, xalign=0)
+                    kl.get_style_context().add_class("dim-label")
+                    grid.attach(kl, 0, r, 1, 1)
+                    grid.attach(Gtk.Label(label=what, xalign=0), 1, r, 1, 1)
+                col.pack_start(grid, False, False, 0)
+            cols.pack_start(col, False, False, 0)
+        dlg.get_content_area().pack_start(cols, True, True, 0)
+        dlg.show_all()
+        dlg.run()
+        dlg.destroy()
+
+    def show_about(self):
+        dlg = Gtk.AboutDialog(transient_for=self, modal=True, program_name="Firox Explorer",
+                              logo_icon_name="system-file-manager", version="preview",
+                              comments="The Firox Linux file manager, with Connect to Server for Windows "
+                                       "shares, SFTP, FTP, WebDAV, Amazon S3 and Backblaze B2.",
+                              website="https://github.com/kurodenkou/firox", website_label="Firox Linux",
+                              license_type=Gtk.License.GPL_3_0)
+        esc_closes(dlg)
+        dlg.run()
+        dlg.destroy()
 
     def on_view_press(self, view, event):
         if event.type != Gdk.EventType.BUTTON_PRESS or event.button != 3:
@@ -1352,6 +2020,7 @@ class Explorer(Gtk.ApplicationWindow):
 
     def toggle_hidden(self):
         self.show_hidden = not self.show_hidden
+        self.set_setting("hidden", self.show_hidden)
         self.filter.refilter()
         self.update_status()
 
@@ -1362,6 +2031,9 @@ class Explorer(Gtk.ApplicationWindow):
         ctrl = Gdk.ModifierType.CONTROL_MASK
         alt = Gdk.ModifierType.MOD1_MASK
         typing = self.address.has_focus() or self.search.has_focus()
+        if (key == Gdk.KEY_F10 and not mods) or (mods == alt and Gdk.keyval_to_lower(key) in MNEMONICS):
+            self.refill_menus()
+            return False                      # GTK opens the menu
         if mods == alt and key == Gdk.KEY_Left or (key == Gdk.KEY_BackSpace and not typing and not mods):
             self.go_back()
         elif mods == alt and key == Gdk.KEY_Right:
@@ -1371,13 +2043,31 @@ class Explorer(Gtk.ApplicationWindow):
         elif key == Gdk.KEY_F5:
             self.refresh()
         elif mods == ctrl and key in (Gdk.KEY_l, Gdk.KEY_L):
-            self.address.grab_focus()
+            self.focus_address()
         elif mods == ctrl and key in (Gdk.KEY_f, Gdk.KEY_F):
             self.search.grab_focus()
         elif mods == ctrl and key in (Gdk.KEY_h, Gdk.KEY_H):
             self.toggle_hidden()
         elif mods == ctrl and key in (Gdk.KEY_n, Gdk.KEY_N):
             spawn([sys.argv[0], self.current.get_uri()])
+        elif mods == ctrl and key in (Gdk.KEY_w, Gdk.KEY_W, Gdk.KEY_q, Gdk.KEY_Q):
+            self.close()
+        elif mods == ctrl and key in (Gdk.KEY_1, Gdk.KEY_KP_1):
+            self.set_view("icons")
+        elif mods == ctrl and key in (Gdk.KEY_2, Gdk.KEY_KP_2):
+            self.set_view("details")
+        elif mods == ctrl and key in (Gdk.KEY_d, Gdk.KEY_D):
+            self.add_bookmark()
+        elif mods == ctrl and key in (Gdk.KEY_b, Gdk.KEY_B):
+            self.edit_bookmarks()
+        elif key == Gdk.KEY_F9 and not mods:
+            self.toggle_sidebar()
+        elif key == Gdk.KEY_F1 and not mods:
+            self.show_help()
+        elif key == Gdk.KEY_question and mods & ctrl:
+            self.show_shortcuts()
+        elif mods == alt and key == Gdk.KEY_Home:
+            self.navigate(HOME)
         elif mods == ctrl | Gdk.ModifierType.SHIFT_MASK and key in (Gdk.KEY_n, Gdk.KEY_N):
             self.new_folder()
         elif typing:
@@ -1393,7 +2083,13 @@ class Explorer(Gtk.ApplicationWindow):
         elif mods == ctrl and key in (Gdk.KEY_v, Gdk.KEY_V):
             self.paste()
         elif mods == ctrl and key in (Gdk.KEY_a, Gdk.KEY_A):
-            (self.icons.select_all if self.view_mode == "icons" else self.details.get_selection().select_all)()
+            self.select_all()
+        elif mods == ctrl | Gdk.ModifierType.SHIFT_MASK and key in (Gdk.KEY_a, Gdk.KEY_A):
+            self.select_none()
+        elif mods == ctrl and key in (Gdk.KEY_i, Gdk.KEY_I):
+            self.invert_selection()
+        elif mods == ctrl | Gdk.ModifierType.SHIFT_MASK and key in (Gdk.KEY_c, Gdk.KEY_C):
+            self.copy_location()
         elif mods == alt and key == Gdk.KEY_Return:
             self.properties()
         else:
@@ -1485,7 +2181,28 @@ def connect_saved():
     return 0
 
 
+def test_cli(name):
+    conn = firox_mounts.find(name)
+    if conn is None:
+        names = ", ".join(repr(c.get("name") or c["id"]) for c in firox_mounts.load()) or "none"
+        print(f"No saved connection called {name!r}. Saved connections: {names}", file=sys.stderr)
+        return 2
+
+    def ask(fields):
+        if not sys.stdin.isatty():
+            return None
+        import getpass
+        print("Nothing is remembered in the keyring for this connection.")
+        return {k: getpass.getpass(f"{label} (not shown, not saved): ") for k, label in fields}
+    path = firox_mounts.diagnose(conn, out=lambda t: print(t, flush=True), ask_secret=ask)
+    print(f"\nThis report is saved in {path}")
+    print("Secrets are replaced by ***, but read it through before you share it.")
+    return 0
+
+
 if __name__ == "__main__":
     if "--connect-saved" in sys.argv[1:]:
         sys.exit(connect_saved())
+    if len(sys.argv) >= 3 and sys.argv[1] == "--test":
+        sys.exit(test_cli(" ".join(sys.argv[2:])))
     sys.exit(App().run(sys.argv))

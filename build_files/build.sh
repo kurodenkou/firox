@@ -178,6 +178,14 @@ for zone in public home FedoraWorkstation; do
         --add-port=22100/tcp >/dev/null 2>&1 || true
 done
 
+# Network in the file manager: let the answers in when it looks for Windows
+# PCs and NAS boxes (WS-Discovery via wsdd, and old NetBIOS browsing). Client
+# side only: these accept replies from those ports, nothing listens.
+for zone in public home FedoraWorkstation; do
+    firewall-offline-cmd --zone="${zone}" --add-service=ws-discovery-client \
+        --add-service=samba-client >/dev/null 2>&1 || true
+done
+
 # Power profiles (tuned, with the power-profiles-daemon D-Bus API)
 systemctl enable tuned.service tuned-ppd.service
 
