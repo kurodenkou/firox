@@ -73,7 +73,6 @@ PACKAGES=(
     cage
 
     # --- Desktop icons + file manager ("My Computer") ---
-    pcmanfm-qt
     lxqt-qtplugin
     qt6-qtwayland
     qt6-qtsvg                    # SVG wallpapers on the desktop

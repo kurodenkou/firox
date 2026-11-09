@@ -19,7 +19,7 @@ Enter, Ctrl+A, Ctrl+C, Ctrl+X, Ctrl+V, Escape.
 
 Settings (Settings > Desktop Background) are read from the desktop settings
 file, see firox_wallpaper. Exits with status 3 if it can't run here (no
-layer-shell); the session then starts pcmanfm-qt's desktop instead.
+layer-shell); the session then carries on without a desktop.
 """
 
 import json
@@ -923,7 +923,7 @@ class Desktop:
                 except GLib.Error as err:
                     self.error(f"Couldn't start {item.name}", err.message)
             elif item.is_dir:
-                spawn(["pcmanfm-qt", item.path])           # the file manager (as firox-open)
+                spawn(["firox-explorer", item.path])       # the file manager (as firox-open)
             elif program_kind(item):
                 self.run_program(item)
             else:
@@ -937,7 +937,7 @@ class Desktop:
         kind = program_kind(item)
         executable = os.access(item.path, os.X_OK)
         if kind == "script":
-            # Like pcmanfm: a script might be meant to run or to read
+            # Like most file managers: a script might be meant to run or to read
             choice = self.ask(f"Run “{item.name}” or open it?",
                               "It's a script: a small program written as text.",
                               [("Cancel", 0), ("Open", 1), ("Run", 2)], default=1)

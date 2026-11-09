@@ -1,0 +1,25 @@
+[Desktop Entry]
+Type=Application
+Name=Firox Explorer
+GenericName=File Manager
+Comment=Browse your files, drives and network places; connect to shares and cloud storage
+Exec=firox-explorer %U
+Icon=system-file-manager
+Terminal=false
+Categories=System;FileManager;Utility;Core;GTK;
+MimeType=inode/directory;
+Keywords=files;folders;explorer;file manager;network;smb;sftp;ftp;webdav;s3;b2;
+StartupNotify=true
+Actions=new-window;find;connect;
+
+[Desktop Action new-window]
+Name=New Window
+Exec=firox-explorer
+
+[Desktop Action find]
+Name=Find Files
+Exec=firox-explorer --find
+
+[Desktop Action connect]
+Name=Connect to Server
+Exec=firox-explorer --connect
