@@ -20,13 +20,13 @@ STATE="${XDG_STATE_HOME:-$HOME/.local/state}/firox"
 mkdir -p "$STATE"
 
 # Desktop: wallpaper on every monitor, icons (Computer, Recycle Bin, the
-# files in ~/Desktop) on the main display: firox-desktop. pcmanfm-qt's
-# desktop is the fallback if it can't run here (it exits with 3).
+# files in ~/Desktop) on the main display: firox-desktop. (It exits with 3
+# if the compositor can't show a desktop layer; that's noted in its log.)
 # (~/Desktop etc. must exist first)
 xdg-user-dirs-update
 (
     $KEEP firox-desktop 2>"$STATE/desktop.log"
-    [ $? -eq 3 ] && exec $KEEP pcmanfm-qt --desktop --profile=firox
+    [ $? -eq 3 ] && echo "firox-desktop: no layer-shell here, no desktop" >>"$STATE/desktop.log"
 ) >/dev/null 2>&1 &
 
 # Taskbar: firox-panel (its log: ~/.local/state/firox/panel.log). If you

@@ -1,0 +1,4 @@
+# Firox Linux default applications (your own choices, made in Settings >
+# Default Programs, go in ~/.config/mimeapps.list and win over these).
+[Default Applications]
+inode/directory=firox-explorer.desktop

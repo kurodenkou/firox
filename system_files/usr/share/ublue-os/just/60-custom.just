@@ -171,71 +171,23 @@ remove-sunshine:
     sudo firewall-cmd --reload >/dev/null
     echo "Sunshine removed."
 
-# Firox Explorer, the new Firox file manager, is an add-on while it's being
-# tested: this adds it to the Start menu ("Firox Explorer (preview)"). Your
-# default file manager stays the same unless you run
-# `ujust install-explorer default`, which makes it open folders too.
-# Add Firox Explorer (preview), with Connect to Server for shares and cloud storage
+# Firox Explorer is now Firox's file manager. This tidies up after the
+# preview (`ujust install-explorer` used to add it as an add-on): it removes
+# the old "Firox Explorer (preview)" Start menu entry and makes folders open
+# in Firox Explorer again if you had chosen otherwise.
+# Make Firox Explorer open folders again (and tidy up after the preview add-on)
 [group('Firox Linux')]
-install-explorer MODE="":
+install-explorer:
     #!/usr/bin/bash
     set -euo pipefail
     apps="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
-    mkdir -p "$apps"
-    cat > "$apps/firox-explorer.desktop" <<'DESKTOP'
-    [Desktop Entry]
-    Type=Application
-    Name=Firox Explorer (preview)
-    GenericName=File Manager
-    Comment=Browse your files, drives and network places; connect to shares and cloud storage
-    Exec=/usr/libexec/firox/firox-explorer %U
-    Icon=system-file-manager
-    Terminal=false
-    Categories=System;FileManager;Utility;Core;GTK;
-    MimeType=inode/directory;
-    Keywords=files;folders;explorer;network;smb;sftp;ftp;webdav;s3;b2;
-    StartupNotify=true
-    DESKTOP
-    sed -i 's/^    //' "$apps/firox-explorer.desktop"
-    update-desktop-database "$apps" 2>/dev/null || true
-    if [ "{{ MODE }}" = default ]; then
-        xdg-mime default firox-explorer.desktop inode/directory
-        echo "Firox Explorer now opens folders. Undo with: ujust install-explorer"
-    elif [ "$(xdg-mime query default inode/directory 2>/dev/null)" = firox-explorer.desktop ]; then
-        xdg-mime default pcmanfm-qt.desktop inode/directory
-        echo "Folders open in the usual file manager again."
+    if grep -qs 'Firox Explorer (preview)' "$apps/firox-explorer.desktop"; then
+        rm -f "$apps/firox-explorer.desktop"
+        update-desktop-database "$apps" 2>/dev/null || true
+        echo "Removed the old preview Start menu entry."
     fi
-    echo "Firox Explorer (preview) is in the Start menu under All Programs."
-    echo "Try Connect to Server in its sidebar for Windows shares, SFTP, FTP, WebDAV, S3 and B2."
-
-# Remove Firox Explorer (disconnects its network places; asks about saved ones)
-[group('Firox Linux')]
-remove-explorer:
-    #!/usr/bin/bash
-    set -euo pipefail
-    apps="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
-    cfg="${XDG_CONFIG_HOME:-$HOME/.config}"
-    if [ "$(xdg-mime query default inode/directory 2>/dev/null)" = firox-explorer.desktop ]; then
-        xdg-mime default pcmanfm-qt.desktop inode/directory
-    fi
-    rm -f "$apps/firox-explorer.desktop" "$cfg/autostart/firox-connections.desktop"
-    update-desktop-database "$apps" 2>/dev/null || true
-    # Disconnect S3/B2 storage it mounted
-    systemctl --user stop 'firox-mount-*' 2>/dev/null || true
-    if [ -f "$cfg/firox/connections.json" ]; then
-        read -rp "Also forget your saved connections and their passwords? [y/N] " ans
-        if [[ "${ans,,}" == y* ]]; then
-            python3 - <<'PY'
-    import sys
-    sys.path.insert(0, "/usr/lib/firox/python")
-    import firox_mounts
-    for c in firox_mounts.load():
-        firox_mounts.remove(c)
-    PY
-            rm -f "$cfg/firox/connections.json"
-        fi
-    fi
-    echo "Firox Explorer removed."
+    xdg-mime default firox-explorer.desktop inode/directory
+    echo "Firox Explorer opens folders. It's in the Start menu as Firox Explorer."
 
 # Throw away your desktop customisations and go back to the Firox Linux defaults
 [group('Firox Linux')]

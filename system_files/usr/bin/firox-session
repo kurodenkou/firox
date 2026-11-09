@@ -20,6 +20,14 @@ if [ -f "$CFG/pcmanfm-qt/firox/settings.conf" ]; then
     sed -i 's|/usr/share/backgrounds/firefoxos/|/usr/share/backgrounds/firox/|' "$CFG/pcmanfm-qt/firox/settings.conf"
 fi
 [ -L "$DATA/themes/FirefoxOS" ] && rm -f "$DATA/themes/FirefoxOS"
+# Firox Explorer replaced pcmanfm-qt: drop the preview add-on's Start menu
+# entry, and a folder default that still names the removed pcmanfm-qt
+if grep -qs 'Firox Explorer (preview)' "$DATA/applications/firox-explorer.desktop"; then
+    rm -f "$DATA/applications/firox-explorer.desktop"
+fi
+if grep -qs '^inode/directory=pcmanfm-qt.desktop' "$CFG/mimeapps.list"; then
+    sed -i 's/^inode\/directory=pcmanfm-qt.desktop.*/inode\/directory=firox-explorer.desktop/' "$CFG/mimeapps.list"
+fi
 # A personal rc.xml copied from the old defaults names the old window theme
 if [ -f "$CFG/labwc/rc.xml" ]; then
     sed -i 's|<name>FirefoxOS</name>|<name>Firox</name>|' "$CFG/labwc/rc.xml"

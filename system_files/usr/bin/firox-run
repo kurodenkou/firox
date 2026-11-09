@@ -62,7 +62,7 @@ ALIASES = {
     "control": [["firox-control-panel"]],
     "settings": [["firox-control-panel"]],
     "taskmgr": [["firox-taskmgr"]],
-    "explorer": [["pcmanfm-qt"]],
+    "explorer": [["firox-explorer"]],
     "msconfig": [["firox-startup"]],
     "snippingtool": [["firox-open", "screenshot-region"]],
     "winver": [["firox-control-panel", "system"]],

@@ -62,7 +62,7 @@ MFU_COUNT = 6
 
 # Apps shown in the "most frequently used" list until the user has history.
 DEFAULT_MFU = [
-    "pcmanfm-qt.desktop",
+    "firox-explorer.desktop",
     "org.xfce.mousepad.desktop",
     "galculator.desktop",
     "xfce4-terminal.desktop",
@@ -72,7 +72,6 @@ DEFAULT_MFU = [
 
 # Friendlier names for the stock apps in the menu's left column
 FRIENDLY_NAMES = {
-    "pcmanfm-qt.desktop": "File Manager",
     "org.xfce.mousepad.desktop": "Text Editor",
     "galculator.desktop": "Calculator",
     "xfce4-terminal.desktop": "Command Prompt",
@@ -98,7 +97,6 @@ HIDDEN = {
     "htop.desktop",                      # Task Manager is btop
     "vlc-openbd.desktop", "vlc-opencda.desktop", "vlc-opendvd.desktop", "vlc-openvcd.desktop",
     "firox-startmenu.desktop",
-    "pcmanfm-qt-desktop-pref.desktop",
     "org.xfce.mousepad-settings.desktop",
     "network.cycles.wdisplays.desktop",  # use firox-display, which saves the layout
 }

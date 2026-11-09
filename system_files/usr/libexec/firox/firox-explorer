@@ -1,10 +1,12 @@
 #!/usr/bin/python3
 """
-firox-explorer: Firox Explorer, the Firox file manager (an add-on preview:
-`ujust install-explorer` adds it to the Start menu; the default file manager
-stays pcmanfm-qt).
+firox-explorer: Firox Explorer, the Firox file manager (it opens folders
+everywhere: /etc/xdg/mimeapps.list; also /usr/bin/firox-explorer).
 
     firox-explorer [FOLDER|URI]     open a window there (default: Home)
+    firox-explorer --find [FOLDER]  open it ready to search FOLDER and all
+                                    its subfolders (Start > Search)
+    firox-explorer --connect        open it with Connect to Server
     firox-explorer --connect-saved  connect the connections marked "Connect
                                     when I log in", then exit (run at login)
     firox-explorer --test NAME      check a saved connection step by step and
@@ -12,7 +14,8 @@ stays pcmanfm-qt).
                                     ~/.local/state/firox/mounts/ID-test.log
 
 Browse your files, drives and network places; Icons or Details view; Back,
-Forward, Up, an address bar and filtering as you type in the search box.
+Forward, Up, an address bar and filtering as you type in the search box
+(with "Subfolders" on, it searches every folder inside too).
 Cut, Copy, Paste (shared with the desktop), Rename, New Folder, Move to
 Recycle Bin, Delete, Properties, Open With, drag and drop, and Restore /
 Empty in the Recycle Bin.
@@ -56,7 +59,9 @@ ATTRS = ",".join(["standard::name", "standard::display-name", "standard::icon", 
                   "trash::deletion-date", "standard::target-uri"])
 # model columns
 (C_NAME, C_PIX, C_URI, C_DIR, C_SIZE, C_MTIME, C_TYPE, C_SIZE_TEXT, C_DATE_TEXT,
- C_HIDDEN, C_SMALL, C_ORIG, C_MOUNTABLE) = range(13)
+ C_HIDDEN, C_SMALL, C_ORIG, C_MOUNTABLE, C_WHERE) = range(14)
+SEARCH_LIMIT = 5000                     # results from one subfolder search
+SEARCH_SKIP = {"/proc", "/sys", "/dev", "/run"}
 
 
 def spawn(argv, cwd=None):
@@ -515,6 +520,9 @@ class Explorer(Gtk.ApplicationWindow):
         self.loading = None
         self.monitor = None
         self.cut_uris = set()
+        self.searching = None           # the text of a subfolder search being shown
+        self.search_cancel = None
+        self.resetting_search = False
         self.view_mode = "details" if self.settings["view"] == "details" else "icons"
 
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
@@ -538,8 +546,12 @@ class Explorer(Gtk.ApplicationWindow):
         bar.pack_start(self.address, True, True, 4)
         self.search = Gtk.SearchEntry(placeholder_text="Search this folder")
         self.search.set_width_chars(20)
-        self.search.connect("search-changed", lambda *_: self.filter.refilter())
+        self.search.connect("search-changed", lambda *_: self.on_search_changed())
         bar.pack_start(self.search, False, False, 0)
+        self.deep = Gtk.ToggleButton(label="Subfolders")
+        self.deep.set_tooltip_text("Search the folders inside this one too")
+        self.deep.connect("toggled", lambda *_: self.on_search_changed())
+        bar.pack_start(self.deep, False, False, 0)
         self.view_btn = self.tool("view-list-details", "Details / Icons view", self.toggle_view)
         bar.pack_start(self.view_btn, False, False, 0)
         root.pack_start(bar, False, False, 0)
@@ -570,7 +582,7 @@ class Explorer(Gtk.ApplicationWindow):
 
         # main views on one model
         self.store = Gtk.ListStore(str, GdkPixbuf.Pixbuf, str, bool, GObjectInt64(), GObjectInt64(),
-                                   str, str, str, bool, GdkPixbuf.Pixbuf, str, bool)
+                                   str, str, str, bool, GdkPixbuf.Pixbuf, str, bool, str)
         self.store.set_default_sort_func(self.sort_func)
         self.store.set_sort_column_id(Gtk.TREE_SORTABLE_DEFAULT_SORT_COLUMN_ID, Gtk.SortType.ASCENDING)
         self.filter = self.store.filter_new()
@@ -600,6 +612,13 @@ class Explorer(Gtk.ApplicationWindow):
             c = Gtk.TreeViewColumn(title, Gtk.CellRendererText(), text=column)
             c.set_resizable(True)
             self.details.append_column(c)
+        # where a search result is (only shown for subfolder searches)
+        self.where_col = Gtk.TreeViewColumn("Location", Gtk.CellRendererText(
+            ellipsize=Pango.EllipsizeMode.START), text=C_WHERE)
+        self.where_col.set_resizable(True)
+        self.where_col.set_min_width(160)
+        self.where_col.set_visible(False)
+        self.details.append_column(self.where_col)
         self.details.connect("row-activated", lambda _v, path, _c: self.open_paths([path]))
         self.details.connect("button-press-event", self.on_view_press)
         self.details.get_selection().connect("changed", lambda *_: self.update_status())
@@ -1006,7 +1025,12 @@ class Explorer(Gtk.ApplicationWindow):
             text = os.path.expanduser(text)
         self.navigate(text if "://" in text else Gio.File.new_for_path(text))
 
-    def load(self):
+    def load(self, keep_search=False):
+        if self.search_cancel is not None:
+            self.search_cancel.cancel()
+            self.search_cancel = None
+        self.searching = None
+        self.where_col.set_visible(False)
         gfile = self.current
         path = local_path(gfile)
         self.address.set_text(path if path else urllib.parse.unquote(gfile.get_uri()))
@@ -1022,7 +1046,10 @@ class Explorer(Gtk.ApplicationWindow):
         self.fwd.set_sensitive(bool(self.future))
         self.up.set_sensitive(gfile.get_parent() is not None)
         self.store.clear()
-        self.search.set_text("")
+        if not keep_search:
+            self.resetting_search = True
+            self.search.set_text("")
+            self.resetting_search = False
         self.empty.hide()
         if self.monitor is not None:
             self.monitor.cancel()
@@ -1080,7 +1107,7 @@ class Explorer(Gtk.ApplicationWindow):
         self.empty.set_text(f"Can't open this folder: {err.message}")
         self.empty.show()
 
-    def add_row(self, folder, info):
+    def add_row(self, folder, info, where=""):
         name = info.get_display_name()
         ftype = info.get_file_type()
         child = folder.get_child(info.get_name())
@@ -1104,7 +1131,7 @@ class Explorer(Gtk.ApplicationWindow):
                            "Folder" if is_dir else (Gio.content_type_get_description(ct) or "File"),
                            "" if is_dir else human_size(size),
                            time.strftime("%d/%m/%Y %H:%M", time.localtime(mtime)) if mtime else "",
-                           hidden, ICONS.get(gicon, ICON_SIZE_SMALL), orig, mountable])
+                           hidden, ICONS.get(gicon, ICON_SIZE_SMALL), orig, mountable, where])
 
     def loaded(self):
         try:
@@ -1113,11 +1140,26 @@ class Explorer(Gtk.ApplicationWindow):
             self.monitor.connect("changed", self.on_changed)
         except GLib.Error:
             self.monitor = None
-        if len(self.filter) == 0:
-            self.empty.set_text("This folder is empty." if len(self.store) == 0 else
-                                "Only hidden files here (Ctrl+H shows them).")
-            self.empty.show()
+        self.update_empty()
         self.update_status()
+
+    def update_empty(self):
+        """The grey message over an empty view (not for subfolder searches,
+        which say so themselves)."""
+        if self.searching is not None:
+            return
+        q = self.search.get_text().strip()
+        if len(self.filter) > 0:
+            self.empty.hide()
+            return
+        if len(self.store) == 0:
+            self.empty.set_text("This folder is empty.")
+        elif q:
+            self.empty.set_text(f"Nothing called “{q}” in this folder. Click Subfolders to look inside "
+                                "the folders in it too.")
+        else:
+            self.empty.set_text("Only hidden files here (Ctrl+H shows them).")
+        self.empty.show()
 
     def on_changed(self, *_):
         if getattr(self, "reload_timer", None):
@@ -1190,13 +1232,127 @@ class Explorer(Gtk.ApplicationWindow):
     def visible_func(self, model, it, _data=None):
         if model[it][C_HIDDEN] and not self.show_hidden:
             return False
+        if self.searching is not None:
+            return True                       # subfolder results: all matches
         q = self.search.get_text().strip().casefold() if hasattr(self, "search") else ""
         return not q or q in (model[it][C_NAME] or "").casefold()
+
+    # ---- searching
+    def on_search_changed(self):
+        if self.resetting_search or self.current is None:
+            return
+        q = self.search.get_text().strip()
+        self.search.set_placeholder_text("Search here and in subfolders" if self.deep.get_active()
+                                         else "Search this folder")
+        if self.deep.get_active() and len(q) >= 2:
+            self.start_deep_search(q)
+        elif self.searching is not None:
+            self.load(keep_search=True)        # back to the folder, filtered as you type
+        else:
+            self.filter.refilter()
+            if self.loading is None or self.status.get_text() != "Loading…":
+                self.update_empty()
+            self.update_status()
+
+    def find_files(self):
+        """Search this folder and its subfolders (Start > Search, Ctrl+Shift+F)."""
+        if not self.toolbar.get_visible():
+            self.set_bar("toolbar", self.toolbar, True)
+        self.deep.set_active(True)
+        self.search.grab_focus()
+
+    def start_deep_search(self, query):
+        if self.search_cancel is not None:
+            self.search_cancel.cancel()
+        if self.loading is not None:
+            self.loading.cancel()
+        if self.monitor is not None:
+            self.monitor.cancel()
+            self.monitor = None
+        cancel = Gio.Cancellable()
+        self.search_cancel = cancel
+        self.searching = query
+        self.store.clear()
+        self.empty.hide()
+        self.where_col.set_visible(True)
+        root = self.current
+        root_path = local_path(root)
+        place = root_path or urllib.parse.unquote(root.get_uri())
+        self.set_title(f"Search results for “{query}” in {os.path.basename(place.rstrip('/')) or place}"
+                       " - Firox Explorer")
+        self.status.set_text("Searching…")
+        needle = query.casefold()
+        hidden_ok = self.show_hidden
+        found = {"n": 0}
+
+        def where_of(folder):
+            p = folder.get_path()
+            if p and root_path and (p == root_path or p.startswith(root_path.rstrip("/") + "/")):
+                rel = os.path.relpath(p, root_path)
+                return "" if rel == "." else rel
+            return p or urllib.parse.unquote(folder.get_uri())
+
+        def flush(batch, finished=False, capped=False):
+            if cancel.is_cancelled():
+                return False
+            for folder, info in batch:
+                self.add_row(folder, info, where_of(folder) or "(this folder)")
+            if finished:
+                self.search_cancel = None
+                if found["n"] == 0:
+                    self.empty.set_text(f"Nothing called “{query}” here or in the folders inside.")
+                    self.empty.show()
+                self.update_status()
+                if capped:
+                    self.status.set_text(self.status.get_text() + f"    —    stopped at {SEARCH_LIMIT} results")
+            else:
+                self.status.set_text(f"Searching…  {found['n']} found")
+            return False
+
+        def walk():
+            stack, batch = [root], []
+            while stack and not cancel.is_cancelled() and found["n"] < SEARCH_LIMIT:
+                folder = stack.pop()
+                try:
+                    enum = folder.enumerate_children(ATTRS, Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS, cancel)
+                except GLib.Error:
+                    continue
+                children = []
+                while True:
+                    try:
+                        info = enum.next_file(cancel)
+                    except GLib.Error:
+                        break
+                    if info is None:
+                        break
+                    name = info.get_name()
+                    if name.startswith(".") and not hidden_ok:
+                        continue
+                    if info.get_file_type() == Gio.FileType.DIRECTORY:
+                        child = folder.get_child(name)
+                        if child.get_path() not in SEARCH_SKIP:
+                            children.append(child)
+                    if needle in (info.get_display_name() or name).casefold():
+                        batch.append((folder, info))
+                        found["n"] += 1
+                        if len(batch) >= 50:
+                            GLib.idle_add(flush, batch)
+                            batch = []
+                        if found["n"] >= SEARCH_LIMIT:
+                            break
+                try:
+                    enum.close(None)
+                except GLib.Error:
+                    pass
+                stack.extend(reversed(children))        # depth-first, in name order
+            GLib.idle_add(flush, batch, True, found["n"] >= SEARCH_LIMIT)
+        threading.Thread(target=walk, daemon=True).start()
 
     def update_status(self):
         n = len(self.filter)
         sel = len(self.selected_paths())
-        text = f"{n} item{'s' if n != 1 else ''}"
+        text = f"{n} item{'s' if n != 1 else ''}" if self.searching is None else \
+            f"{n} result{'s' if n != 1 else ''} for “{self.searching}”"
         if sel:
             size = sum(self.filter[p][C_SIZE] for p in self.selected_paths() if not self.filter[p][C_DIR])
             text += f", {sel} selected" + (f" ({human_size(size)})" if size else "")
@@ -1600,6 +1756,7 @@ class Explorer(Gtk.ApplicationWindow):
         menu.append(Gtk.SeparatorMenuItem())
         self.menu_item(menu, "Copy _Location", self.copy_location, accel="<Control><Shift>c")
         self.menu_item(menu, "_Find in This Folder", self.search.grab_focus, accel="<Control>f")
+        self.menu_item(menu, "Find in _Subfolders Too", self.find_files, accel="<Control><Shift>f")
 
     def fill_view(self, menu):
         self.menu_item(menu, "_Icons", lambda: self.set_view("icons"), accel="<Control>1",
@@ -1672,6 +1829,8 @@ class Explorer(Gtk.ApplicationWindow):
     def fill_tools(self, menu):
         conns = firox_mounts.load()
         mounted = [c for c in conns if firox_mounts.is_mounted(c)]
+        self.menu_item(menu, "_Find Files…", self.find_files, accel="<Control><Shift>f")
+        menu.append(Gtk.SeparatorMenuItem())
         self.menu_item(menu, "_Connect to Server…", self.add_connection)
         if conns:
             sub_item = Gtk.MenuItem.new_with_mnemonic("_Saved Connections")
@@ -1915,6 +2074,7 @@ class Explorer(Gtk.ApplicationWindow):
         keys = [("Navigation", [("Alt+Left / Backspace", "Back"), ("Alt+Right", "Forward"),
                                 ("Alt+Up", "Up one folder"), ("Alt+Home", "Home folder"),
                                 ("Ctrl+L", "Type a location"), ("Ctrl+F", "Find in this folder"),
+                                ("Ctrl+Shift+F", "Find in subfolders too"),
                                 ("F5", "Refresh")]),
                 ("Files", [("Enter", "Open"), ("F2", "Rename"), ("Delete", "Move to the Recycle Bin"),
                            ("Shift+Delete", "Delete permanently"), ("Ctrl+Shift+N", "New folder"),
@@ -1953,7 +2113,7 @@ class Explorer(Gtk.ApplicationWindow):
 
     def show_about(self):
         dlg = Gtk.AboutDialog(transient_for=self, modal=True, program_name="Firox Explorer",
-                              logo_icon_name="system-file-manager", version="preview",
+                              logo_icon_name="system-file-manager",
                               comments="The Firox Linux file manager, with Connect to Server for Windows "
                                        "shares, SFTP, FTP, WebDAV, Amazon S3 and Backblaze B2.",
                               website="https://github.com/kurodenkou/firox", website_label="Firox Linux",
@@ -2022,6 +2182,7 @@ class Explorer(Gtk.ApplicationWindow):
         self.show_hidden = not self.show_hidden
         self.set_setting("hidden", self.show_hidden)
         self.filter.refilter()
+        self.update_empty()
         self.update_status()
 
     def on_key(self, _w, event):
@@ -2046,6 +2207,8 @@ class Explorer(Gtk.ApplicationWindow):
             self.focus_address()
         elif mods == ctrl and key in (Gdk.KEY_f, Gdk.KEY_F):
             self.search.grab_focus()
+        elif mods == ctrl | Gdk.ModifierType.SHIFT_MASK and key in (Gdk.KEY_f, Gdk.KEY_F):
+            self.find_files()
         elif mods == ctrl and key in (Gdk.KEY_h, Gdk.KEY_H):
             self.toggle_hidden()
         elif mods == ctrl and key in (Gdk.KEY_n, Gdk.KEY_N):
@@ -2147,10 +2310,18 @@ class App(Gtk.Application):
         if ICONS is None:
             ICONS = IconCache()
         args = cmdline.get_arguments()[1:]
+        find = bool(args) and args[0] == "--find"
+        connect = bool(args) and args[0] == "--connect"
+        if find or connect:
+            args = args[1:]
         target = args[0] if args else HOME
         if target.startswith("file://") or "://" not in target:
             target = os.path.abspath(os.path.expanduser(urllib.parse.unquote(target.replace("file://", ""))))
-        Explorer(self, target)
+        win = Explorer(self, target)
+        if find:
+            win.find_files()
+        if connect:
+            GLib.idle_add(lambda: win.add_connection() and False)
         return 0
 
 

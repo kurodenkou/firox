@@ -4,7 +4,7 @@
 set -u
 
 notify() { notify-send -a Firox -i "${3:-dialog-information}" "$1" "${2:-}" 2>/dev/null || true; }
-files() { exec pcmanfm-qt "$@"; }
+files() { exec firox-explorer "$@"; }
 dir() { local d; d="$(xdg-user-dir "$1" 2>/dev/null)"; [ -d "$d" ] || d="$HOME"; echo "$d"; }
 # A window of its own (--disable-server), titled, running the command
 terminal() { exec xfce4-terminal --disable-server -T "$1" -x "${@:2}"; }
@@ -29,7 +29,7 @@ case "$verb" in
     downloads)  files "$(dir DOWNLOAD)" ;;
     network)    files network:/// ;;
     trash)      files trash:/// ;;
-    search)     exec pcmanfm-qt --find-files "$HOME" ;;
+    search)     exec firox-explorer --find "$HOME" ;;
 
     # --- Run... ---------------------------------------------------------
     run)        exec firox-run ;;
