@@ -51,7 +51,9 @@ PACKAGES=(
     kanshi
     wdisplays                    # Display settings GUI
     swayidle
-    swaylock
+    swaylock                     # fallback lock screen
+    gtk-session-lock             # firox-lock (ext-session-lock for GTK)
+    python3-pam                  # firox-lock password check
     wlopm
     mako                         # notifications
     libnotify
@@ -79,6 +81,8 @@ PACKAGES=(
     gvfs
     gvfs-mtp
     gvfs-smb
+    gvfs-fuse                    # network places as folders for every program
+    rclone                       # Firox Explorer: S3 and Backblaze B2
     xdg-user-dirs
     xdg-utils
 

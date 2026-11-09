@@ -67,7 +67,10 @@ case "$verb" in
         ;;
 
     # --- session --------------------------------------------------------
-    lock)       mapfile -t cfg < <(themed -C swaylock/config swaylock.conf); exec swaylock -f "${cfg[@]}" ;;
+    lock)
+        # The Firox lock screen; swaylock if it can't lock here
+        firox-lock -f && exit 0
+        mapfile -t cfg < <(themed -C swaylock/config swaylock.conf); exec swaylock -f "${cfg[@]}" ;;
     logoff)     exec labwc --exit ;;
     suspend)    "$0" lock; exec systemctl suspend ;;
     shutdown)   exec systemctl poweroff ;;

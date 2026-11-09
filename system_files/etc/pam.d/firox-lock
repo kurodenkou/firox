@@ -1,0 +1,7 @@
+#
+# PAM configuration for the Firox lock screen (firox-lock): the same checks
+# as logging in (see /etc/pam.d/login). The account rules are needed too:
+# firox-lock checks the account (e.g. not expired) after the password.
+#
+auth     include login
+account  include login
