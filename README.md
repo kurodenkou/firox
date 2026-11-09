@@ -164,6 +164,8 @@ just build-iso ghcr.io/kurodenkou/firox latest
 
 The installer creates your user account. There's no separate setup wizard.
 
+The installer's own packages come from Fedora's repositories for the image's Fedora version, which `scripts/iso-repos.sh` works out (bootc-image-builder stopped using the image's repositories in October 2026, and its built-in list made every package "No match for argument"). To use a different mirror, set `ISO_FEDORA_MIRROR`; to choose the repositories yourself, set `ISO_REPOS="URL URL"`.
+
 ### NVIDIA graphics
 
 There's a second image, **`ghcr.io/kurodenkou/firox-nvidia-open`**, with NVIDIA's driver built in. It uses Universal Blue's prebuilt, signed open kernel modules, matched to the image's kernel at build time. It supports GTX 16-series / RTX 20-series and newer cards.
