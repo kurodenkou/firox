@@ -11,7 +11,9 @@ screen, on the desktop behind your windows.
     firox-gadgets off|on     turn the Sidebar off or on at login
 
 Gadgets: Clock, Calendar, CPU Meter, Weather (Open-Meteo: free, no account),
-Slide Show (your Pictures folder) and Notes. Hover over a gadget for its ×;
+Slide Show (your Pictures folder), Notes, Now Playing (any MPRIS music or
+video player), Network Meter, Feed Headlines (RSS/Atom), Timer, Picture
+Puzzle, Currency (ECB rates via frankfurter.app, no account) and Disk Space. Hover over a gadget for its ×;
 right-click for Options, Remove, Add Gadgets and Hide.
 
 Settings: ~/.config/firox/gadgets.conf (also Settings > Taskbar).
@@ -52,7 +54,9 @@ CONFIG = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~
 CONF = os.path.join(CONFIG, "gadgets.conf")
 NOTES = os.path.join(CONFIG, "gadget-notes.txt")
 DEFAULTS = {"ENABLED": "1", "GADGETS": "clock,calendar,cpu,weather",
-            "CITY": "", "LAT": "", "LON": "", "UNITS": "C", "PICTURES": ""}
+            "CITY": "", "LAT": "", "LON": "", "UNITS": "C", "PICTURES": "",
+            "FEED": "https://feeds.bbci.co.uk/news/world/rss.xml", "TIMER_MINUTES": "5",
+            "CURRENCY_FROM": "USD", "CURRENCY_TO": "EUR", "CURRENCY_AMOUNT": "1"}
 WIDTH = 170          # Sidebar gadget width
 SIDEBAR = WIDTH + 24
 
@@ -205,8 +209,14 @@ class Gadget(Gtk.EventBox):
             self.sidebar.gadget_menu(self, event)
             return True
         if event.button == 1:
+            if _w is self.area:
+                return bool(self.clicked_at(event.x, event.y))
             return bool(self.clicked())
         return False
+
+    def clicked_at(self, x, y):
+        """A left click at (x, y) on the gadget; by default, clicked()."""
+        return self.clicked()
 
     def clicked(self):
         return False
@@ -695,7 +705,839 @@ class Notes(Gadget):
         cr.fill()
 
 
-GADGETS = [Clock, Calendar, CpuMeter, Weather, SlideShow, Notes]
+# ------------------------------------------------------- more gadgets --
+
+def icon_pixbuf(name, size):
+    theme = Gtk.IconTheme.get_default()
+    try:
+        return theme.load_icon(name, size, Gtk.IconLookupFlags.FORCE_SIZE)
+    except GLib.Error:
+        return None
+
+
+def paint_icon(cr, name, x, y, size, alpha=1.0):
+    pb = icon_pixbuf(name, size)
+    if pb is not None:
+        Gdk.cairo_set_source_pixbuf(cr, pb, x, y)
+        cr.paint_with_alpha(alpha)
+
+
+def fit_text(cr, s, size, width, bold=False):
+    """s shortened with … to fit width at that font size."""
+    import cairo
+    cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL,
+                        cairo.FONT_WEIGHT_BOLD if bold else cairo.FONT_WEIGHT_NORMAL)
+    cr.set_font_size(size)
+    if cr.text_extents(s).x_advance <= width:
+        return s
+    while s and cr.text_extents(s + "…").x_advance > width:
+        s = s[:-1]
+    return s.rstrip() + "…"
+
+
+def wrap_lines(cr, s, size, width, lines, bold=False):
+    """Up to `lines` lines of s wrapped to width (the last one shortened)."""
+    import cairo
+    cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL,
+                        cairo.FONT_WEIGHT_BOLD if bold else cairo.FONT_WEIGHT_NORMAL)
+    cr.set_font_size(size)
+    words, out, cur = s.split(), [], ""
+    for word in words:
+        test = (cur + " " + word).strip()
+        if cr.text_extents(test).x_advance <= width or not cur:
+            cur = test
+        else:
+            out.append(cur)
+            cur = word
+            if len(out) == lines:
+                break
+    if cur and len(out) < lines:
+        out.append(cur)
+    if len(out) == lines and " ".join(out) != " ".join(words):
+        out[-1] = fit_text(cr, out[-1] + " …", size, width, bold)
+    return out
+
+
+def ask_value(title, label, value, hint=""):
+    """A small dialog with one text box; the text, or None if cancelled."""
+    dlg = Gtk.Dialog(title=title, modal=True)
+    dlg.add_button("Cancel", Gtk.ResponseType.CANCEL)
+    dlg.add_button("OK", Gtk.ResponseType.OK)
+    dlg.set_default_response(Gtk.ResponseType.OK)
+    box = dlg.get_content_area()
+    box.set_spacing(8)
+    box.set_border_width(14)
+    box.pack_start(Gtk.Label(label=label, xalign=0), False, False, 0)
+    entry = Gtk.Entry(text=value, activates_default=True)
+    entry.set_width_chars(40)
+    box.pack_start(entry, False, False, 0)
+    if hint:
+        note = Gtk.Label(xalign=0, wrap=True, max_width_chars=48)
+        note.set_markup(f"<small>{hint}</small>")
+        box.pack_start(note, False, False, 0)
+    dlg.show_all()
+    answer = entry.get_text().strip() if dlg.run() == Gtk.ResponseType.OK else None
+    dlg.destroy()
+    return answer
+
+
+class NowPlaying(Gadget):
+    """The song (or video) playing in any MPRIS player, with buttons."""
+    KEY, TITLE, ICON = "nowplaying", "Now Playing", "multimedia-audio-player"
+    DESCRIPTION = "What's playing in your music or video player, with play, pause, next and previous."
+    HEIGHT, INTERVAL = 118, 2
+
+    BUTTONS = {"prev": (34, 94), "play": (85, 94), "next": (136, 94)}
+
+    def __init__(self, sidebar):
+        self.player = None
+        self.status = "Stopped"
+        self.title = self.artist = ""
+        self.art_url = ""
+        self.art = None
+        self.art_cache = {}
+        try:
+            self.bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        except GLib.Error:
+            self.bus = None
+        super().__init__(sidebar)
+        self.tick()
+
+    def call(self, name, path, iface, method, args=None, reply=None):
+        return self.bus.call_sync(name, path, iface, method, args,
+                                  GLib.VariantType.new(reply) if reply else None,
+                                  Gio.DBusCallFlags.NONE, 1500, None)
+
+    def players(self):
+        try:
+            names = self.call("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
+                              "ListNames", reply="(as)").unpack()[0]
+        except (GLib.Error, AttributeError):
+            return []
+        return sorted(n for n in names if n.startswith("org.mpris.MediaPlayer2."))
+
+    def prop(self, name, key):
+        try:
+            return self.call(name, "/org/mpris/MediaPlayer2", "org.freedesktop.DBus.Properties", "Get",
+                             GLib.Variant("(ss)", ("org.mpris.MediaPlayer2.Player", key)),
+                             reply="(v)").unpack()[0]
+        except GLib.Error:
+            return None
+
+    def tick(self):
+        if self.bus is None:
+            return super().tick()
+        found = None
+        for name in self.players():
+            status = self.prop(name, "PlaybackStatus") or "Stopped"
+            if found is None or (status == "Playing" and found[1] != "Playing"):
+                found = (name, status)
+        if found is None:
+            self.player, self.status, self.title, self.artist, self.art = None, "Stopped", "", "", None
+            return super().tick()
+        self.player, self.status = found
+        meta = self.prop(self.player, "Metadata") or {}
+        self.title = str(meta.get("xesam:title") or "")
+        artist = meta.get("xesam:artist") or ""
+        self.artist = ", ".join(artist) if isinstance(artist, list) else str(artist)
+        if not self.title:
+            url = str(meta.get("xesam:url") or "")
+            self.title = urllib.parse.unquote(os.path.basename(url)) if url else "Playing"
+        art = str(meta.get("mpris:artUrl") or "")
+        if art != self.art_url:
+            self.art_url = art
+            self.load_art(art)
+        return super().tick()
+
+    def load_art(self, url):
+        self.art = self.art_cache.get(url)
+        if self.art is not None or not url:
+            return
+
+        def work():
+            pix = None
+            try:
+                if url.startswith("file://"):
+                    pix = GdkPixbuf.Pixbuf.new_from_file_at_scale(urllib.parse.unquote(url[7:]), 52, 52, True)
+                elif url.startswith(("http://", "https://")):
+                    req = urllib.request.Request(url, headers={"User-Agent": "firox-gadgets"})
+                    with urllib.request.urlopen(req, timeout=10) as resp:
+                        loader = GdkPixbuf.PixbufLoader()
+                        loader.write(resp.read())
+                        loader.close()
+                        pix = loader.get_pixbuf().scale_simple(52, 52, GdkPixbuf.InterpType.BILINEAR)
+            except Exception as e:  # noqa: BLE001
+                print(f"gadgets: cover art: {e}", file=sys.stderr)
+            GLib.idle_add(self.got_art, url, pix)
+        threading.Thread(target=work, daemon=True).start()
+
+    def got_art(self, url, pix):
+        self.art_cache[url] = pix
+        if url == self.art_url:
+            self.art = pix
+            self.area.queue_draw()
+        return False
+
+    def draw(self, cr, w, h):
+        glass(cr, 4, 4, w - 8, h - 8, top=(0.30, 0.22, 0.42), bottom=(0.10, 0.06, 0.16))
+        if self.player is None:
+            paint_icon(cr, "multimedia-audio-player", w / 2 - 20, 18, 40, 0.8)
+            text(cr, "Nothing playing", w / 2, 78, 11, center=True)
+            text(cr, "Start some music", w / 2, 94, 9, rgba=(0.8, 0.8, 0.9, 1), center=True)
+            return
+        if self.art is not None:
+            Gdk.cairo_set_source_pixbuf(cr, self.art, 12, 12)
+            cr.paint()
+        else:
+            paint_icon(cr, "audio-x-generic", 12, 12, 52)
+        x = 70
+        lines = wrap_lines(cr, self.title, 11, w - x - 10, 2, bold=True)
+        for i, line in enumerate(lines):
+            text(cr, line, x, 28 + 15 * i, 11, bold=True)
+        text(cr, fit_text(cr, self.artist, 10, w - x - 10), x, 28 + 15 * len(lines) + 2, 10,
+             rgba=(0.82, 0.82, 0.95, 1))
+        for key, (bx, by) in self.BUTTONS.items():
+            icon = {"prev": "media-skip-backward", "next": "media-skip-forward",
+                    "play": "media-playback-pause" if self.status == "Playing" else "media-playback-start"}[key]
+            r = 15 if key == "play" else 12
+            cr.new_path()
+            cr.arc(bx, by, r, 0, 2 * math.pi)
+            cr.set_source_rgba(1, 1, 1, 0.16 if key == "play" else 0.08)
+            cr.fill()
+            size = 20 if key == "play" else 16
+            paint_icon(cr, icon, bx - size / 2, by - size / 2, size)
+
+    def clicked_at(self, x, y):
+        if self.player is None:
+            return True
+        for key, (bx, by) in self.BUTTONS.items():
+            if (x - bx) ** 2 + (y - by) ** 2 <= 17 ** 2:
+                method = {"prev": "Previous", "next": "Next", "play": "PlayPause"}[key]
+                try:
+                    self.call(self.player, "/org/mpris/MediaPlayer2", "org.mpris.MediaPlayer2.Player", method)
+                except GLib.Error as err:
+                    print(f"gadgets: {method}: {err.message}", file=sys.stderr)
+                GLib.timeout_add(300, lambda: self.tick() and False)
+                return True
+        # Elsewhere: bring the player's window up
+        try:
+            self.call(self.player, "/org/mpris/MediaPlayer2", "org.mpris.MediaPlayer2", "Raise")
+        except GLib.Error:
+            pass
+        return True
+
+
+class NetworkMeter(Gadget):
+    KEY, TITLE, ICON = "network", "Network Meter", "network-transmit-receive"
+    DESCRIPTION = "How fast you're downloading and uploading right now."
+    HEIGHT, INTERVAL = 112, 1
+
+    def __init__(self, sidebar):
+        self.last = None
+        self.down = self.up = 0.0
+        self.history = [(0.0, 0.0)] * 60
+        super().__init__(sidebar)
+        self.tick()
+
+    @staticmethod
+    def counters():
+        rx = tx = 0
+        try:
+            with open("/proc/net/dev") as fh:
+                for line in fh.readlines()[2:]:
+                    name, data = line.split(":", 1)
+                    name = name.strip()
+                    if name == "lo" or name.startswith(("veth", "docker", "br-", "virbr", "waydroid")):
+                        continue
+                    f = data.split()
+                    rx += int(f[0])
+                    tx += int(f[8])
+        except (OSError, ValueError, IndexError):
+            pass
+        return rx, tx, time.monotonic()
+
+    def tick(self):
+        now = self.counters()
+        if self.last is not None and now[2] > self.last[2]:
+            dt = now[2] - self.last[2]
+            self.down = max(0, now[0] - self.last[0]) / dt
+            self.up = max(0, now[1] - self.last[1]) / dt
+            self.history = self.history[1:] + [(self.down, self.up)]
+        self.last = now
+        return super().tick()
+
+    @staticmethod
+    def speed(n):
+        for unit in ("B/s", "KB/s", "MB/s", "GB/s"):
+            if n < 1000 or unit == "GB/s":
+                return f"{n:.0f} {unit}" if unit == "B/s" else f"{n:.1f} {unit}"
+            n /= 1024
+
+    def draw(self, cr, w, h):
+        glass(cr, 4, 4, w - 8, h - 8, top=(0.16, 0.36, 0.34), bottom=(0.04, 0.12, 0.12))
+        def arrow(x, y, down, rgb):
+            cr.new_path()
+            if down:
+                cr.move_to(x, y - 9); cr.line_to(x + 10, y - 9); cr.line_to(x + 5, y)
+            else:
+                cr.move_to(x, y); cr.line_to(x + 10, y); cr.line_to(x + 5, y - 9)
+            cr.close_path()
+            cr.set_source_rgb(*rgb)
+            cr.fill()
+        arrow(14, 27, True, (0.45, 0.95, 0.55))
+        text(cr, self.speed(self.down), 30, 27, 12, bold=True)
+        arrow(14, 47, False, (0.45, 0.75, 1.0))
+        text(cr, self.speed(self.up), 30, 47, 12, bold=True)
+        # graph
+        gx, gy, gw, gh = 12, 58, w - 24, h - 70
+        cr.rectangle(gx, gy, gw, gh)
+        cr.set_source_rgba(0, 0, 0, 0.35)
+        cr.fill()
+        peak = max(max(d, u) for d, u in self.history) or 1
+        for idx, rgb in ((0, (0.45, 0.95, 0.55)), (1, (0.45, 0.75, 1.0))):
+            cr.new_path()
+            for i, sample in enumerate(self.history):
+                x = gx + gw * i / (len(self.history) - 1)
+                y = gy + gh - 2 - (gh - 4) * sample[idx] / peak
+                cr.line_to(x, y)
+            cr.set_source_rgb(*rgb)
+            cr.set_line_width(1.5)
+            cr.stroke()
+
+    def clicked(self):
+        spawn(["firox-network", "toggle"])
+        return True
+
+
+class Headlines(Gadget):
+    KEY, TITLE, ICON = "headlines", "Feed Headlines", "application-rss+xml"
+    DESCRIPTION = "Headlines from a news site or blog (any RSS or Atom feed). Click one to read it."
+    HEIGHT = 200
+    PER_PAGE = 4
+
+    def __init__(self, sidebar):
+        self.items = []          # [(title, link)]
+        self.feed_title = ""
+        self.error = ""
+        self.page = 0
+        self.rows = []           # [(y0, y1, link)] for clicks
+        super().__init__(sidebar)
+        self.fetch()
+        self.timer = GLib.timeout_add_seconds(15, self.next_page)
+        self.refresh_timer = GLib.timeout_add_seconds(1800, lambda: self.fetch() or True)
+        self.connect("destroy", lambda *_: GLib.source_remove(self.refresh_timer))
+
+    def next_page(self):
+        pages = max(1, -(-len(self.items) // self.PER_PAGE))
+        self.page = (self.page + 1) % pages
+        self.area.queue_draw()
+        return True
+
+    def fetch(self):
+        url = self.sidebar.conf.get("FEED") or ""
+        if not url:
+            return
+
+        def work():
+            items, title, err = [], "", ""
+            try:
+                import xml.etree.ElementTree as ET
+                req = urllib.request.Request(url, headers={"User-Agent": "firox-gadgets"})
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    root = ET.fromstring(resp.read())
+
+                def local(tag):
+                    return tag.rsplit("}", 1)[-1]
+                for el in root.iter():
+                    if local(el.tag) == "title" and not title:
+                        title = (el.text or "").strip()
+                    if local(el.tag) in ("item", "entry"):
+                        t, link = "", ""
+                        for c in el:
+                            if local(c.tag) == "title":
+                                t = " ".join((c.text or "").split())
+                            elif local(c.tag) == "link":
+                                link = (c.text or "").strip() or c.get("href", "")
+                        if t:
+                            items.append((t, link))
+            except Exception as e:  # noqa: BLE001 - offline, bad XML...
+                err = "Can't get the headlines right now"
+                print(f"gadgets: feed {url}: {e}", file=sys.stderr)
+            GLib.idle_add(self.got, items[:24], title, err)
+        threading.Thread(target=work, daemon=True).start()
+
+    def got(self, items, title, err):
+        if items or not self.items:
+            self.items, self.feed_title, self.error = items, title, err
+            self.page = 0
+        self.area.queue_draw()
+        return False
+
+    def draw(self, cr, w, h):
+        glass(cr, 4, 4, w - 8, h - 8, top=(0.80, 0.42, 0.12), bottom=(0.35, 0.14, 0.04))
+        text(cr, fit_text(cr, self.feed_title or "Feed Headlines", 10, w - 24, True), 12, 21, 10, bold=True,
+             rgba=(1, 0.95, 0.85, 1))
+        self.rows = []
+        if not self.items:
+            text(cr, self.error or "Loading…", w / 2, h / 2 + 4, 11, center=True)
+            return
+        start = self.page * self.PER_PAGE
+        y = 30
+        for title, link in self.items[start:start + self.PER_PAGE]:
+            lines = wrap_lines(cr, title, 10, w - 26, 3)
+            if y + 13 * len(lines) + 7 > h - 24:
+                break                       # no room above the page label
+            y0 = y
+            for line in lines:
+                y += 13
+                text(cr, line, 12, y, 10)
+            y += 7
+            self.rows.append((y0, y, link))
+            cr.set_source_rgba(1, 1, 1, 0.18)
+            cr.rectangle(12, y - 3, w - 24, 1)
+            cr.fill()
+        pages = max(1, -(-len(self.items) // self.PER_PAGE))
+        text(cr, f"{self.page + 1} of {pages}", w / 2, h - 12, 9, rgba=(1, 0.92, 0.8, 1), center=True)
+
+    def clicked_at(self, x, y):
+        for y0, y1, link in self.rows:
+            if y0 <= y <= y1 and link:
+                try:
+                    Gio.AppInfo.launch_default_for_uri(link, None)
+                except GLib.Error as err:
+                    print(f"gadgets: {err.message}", file=sys.stderr)
+                return True
+        if y > self.HEIGHT - 26:
+            self.next_page()
+        return True
+
+    def options(self):
+        conf = self.sidebar.conf
+        url = ask_value("Feed Headlines Options", "Feed address (RSS or Atom):", conf.get("FEED", ""),
+                        "News sites and blogs often have a feed: look for an RSS link, or try the site's "
+                        "address followed by /feed or /rss.")
+        if url is None:
+            return True
+        conf["FEED"] = url
+        save_conf(conf)
+        self.items, self.error = [], ""
+        self.area.queue_draw()
+        self.fetch()
+        return True
+
+
+class Timer(Gadget):
+    KEY, TITLE, ICON = "timer", "Timer", "alarm-clock"
+    DESCRIPTION = "Counts down and lets you know when the time is up. Click to start or pause."
+    HEIGHT = 128
+
+    def __init__(self, sidebar):
+        self.sidebar = sidebar
+        self.total = self.minutes() * 60
+        self.left = float(self.total)
+        self.running = False
+        self.last = 0.0
+        self.done = False
+        super().__init__(sidebar)
+
+    def minutes(self):
+        try:
+            return max(1, min(999, int(self.sidebar.conf.get("TIMER_MINUTES", "5"))))
+        except ValueError:
+            return 5
+
+    def tick(self):
+        if self.running:
+            now = time.monotonic()
+            self.left = max(0.0, self.left - (now - self.last))
+            self.last = now
+            if self.left <= 0:
+                self.running = False
+                self.done = True
+                self.ring()
+        self.area.queue_draw()
+        if not self.running:
+            self.timer = None           # this loop ends here
+        return self.running
+
+    def stop_loop(self):
+        if self.timer is not None:
+            GLib.source_remove(self.timer)
+            self.timer = None
+
+    def ring(self):
+        spawn(["notify-send", "-a", "Timer", "-i", "alarm-clock", "-u", "critical",
+               "Time's up", f"Your {self.minutes()}-minute timer has finished."])
+        sound = "/usr/share/sounds/freedesktop/stereo/alarm-clock-elapsed.oga"
+        if os.path.exists(sound):
+            spawn(["paplay", sound])
+
+    def start_pause(self):
+        if self.done or self.left <= 0:
+            self.reset()
+        self.running = not self.running
+        self.stop_loop()
+        if self.running:
+            self.last = time.monotonic()
+            self.timer = GLib.timeout_add(250, self.tick)
+        self.area.queue_draw()
+
+    def reset(self):
+        self.stop_loop()
+        self.running = False
+        self.done = False
+        self.total = self.minutes() * 60
+        self.left = float(self.total)
+        self.area.queue_draw()
+
+    def draw(self, cr, w, h):
+        import cairo
+        glass(cr, 4, 4, w - 8, h - 8, top=(0.70, 0.18, 0.16) if self.done else (0.28, 0.30, 0.36),
+              bottom=(0.30, 0.04, 0.04) if self.done else (0.07, 0.08, 0.11))
+        cx, cy, r = 46, h / 2, 32
+        cr.new_path()
+        cr.arc(cx, cy, r, 0, 2 * math.pi)
+        cr.set_source_rgba(1, 1, 1, 0.12)
+        cr.set_line_width(7)
+        cr.stroke()
+        frac = self.left / self.total if self.total else 0
+        if frac > 0:
+            cr.new_path()
+            cr.arc(cx, cy, r, -math.pi / 2, -math.pi / 2 + 2 * math.pi * frac)
+            cr.set_source_rgb(0.95, 0.62, 0.15) if self.running else cr.set_source_rgb(0.75, 0.78, 0.85)
+            cr.set_line_cap(cairo.LINE_CAP_ROUND)
+            cr.stroke()
+        icon = "media-playback-pause" if self.running else "media-playback-start"
+        paint_icon(cr, icon, cx - 10, cy - 10, 20)
+        secs = int(math.ceil(self.left))
+        hh, rest = divmod(secs, 3600)
+        mm, ss = divmod(rest, 60)
+        label = f"{hh}:{mm:02d}:{ss:02d}" if hh else f"{mm:02d}:{ss:02d}"
+        text(cr, label, 122, cy + 2, 22 if not hh else 16, bold=True, center=True)
+        state = "Time's up!" if self.done else ("Running" if self.running else
+                                                 ("Paused" if self.left < self.total else "Click to start"))
+        text(cr, state, 122, cy + 22, 9, rgba=(0.85, 0.88, 0.95, 1), center=True)
+        text(cr, "Reset", 122, h - 14, 9, rgba=(0.75, 0.8, 0.9, 1), center=True)
+
+    def clicked_at(self, x, y):
+        if x > 95 and y > self.HEIGHT - 26:
+            self.reset()
+        else:
+            self.start_pause()
+        return True
+
+    def options(self):
+        conf = self.sidebar.conf
+        val = ask_value("Timer Options", "Minutes to count down:", str(self.minutes()))
+        if val is None:
+            return True
+        try:
+            conf["TIMER_MINUTES"] = str(max(1, min(999, int(val))))
+        except ValueError:
+            return True
+        save_conf(conf)
+        self.reset()
+        return True
+
+
+class PicturePuzzle(Gadget):
+    KEY, TITLE, ICON = "puzzle", "Picture Puzzle", "applications-games"
+    DESCRIPTION = "Slide the tiles back into place to make the picture. Options… starts a new puzzle."
+    HEIGHT = 178
+    N = 4
+
+    def __init__(self, sidebar):
+        self.picture = None
+        self.moves = 0
+        self.tiles = list(range(self.N * self.N))   # position -> tile (last = the gap)
+        super().__init__(sidebar)
+        self.load_picture()
+        self.shuffle()
+
+    def pictures(self):
+        """Colourful pictures to make puzzles from: your Pictures folder,
+        then the Firox Classic and Glass wallpapers."""
+        out = []
+        folder = GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_PICTURES) or ""
+        try:
+            for name in sorted(os.listdir(folder)):
+                if name.lower().endswith((".jpg", ".jpeg", ".png", ".webp", ".svg")):
+                    out.append(os.path.join(folder, name))
+        except OSError:
+            pass
+        for path in ("/usr/share/backgrounds/firox/default.svg", "/usr/share/backgrounds/firox/glass.svg"):
+            if os.path.exists(path):
+                out.append(path)
+        return out
+
+    def load_picture(self):
+        size = WIDTH - 24
+        self.picture = None
+        choices = self.pictures()
+        random.shuffle(choices)
+        for path in choices:
+            try:
+                pix = GdkPixbuf.Pixbuf.new_from_file_at_scale(path, 600, 600, True)
+            except GLib.Error:
+                continue
+            side = min(pix.get_width(), pix.get_height())
+            pix = pix.new_subpixbuf((pix.get_width() - side) // 2, (pix.get_height() - side) // 2, side, side)
+            self.picture = pix.scale_simple(size, size, GdkPixbuf.InterpType.BILINEAR)
+            return
+
+    def shuffle(self):
+        n = self.N
+        self.tiles = list(range(n * n))
+        gap = n * n - 1
+        prev = None
+        for _ in range(200):          # random legal moves: always solvable
+            r, c = divmod(gap, n)
+            options = [p for p, ok in ((gap - n, r > 0), (gap + n, r < n - 1), (gap - 1, c > 0),
+                                       (gap + 1, c < n - 1)) if ok and p != prev]
+            p = random.choice(options)
+            self.tiles[gap], self.tiles[p] = self.tiles[p], self.tiles[gap]
+            prev, gap = gap, p
+        self.moves = 0
+        self.area.queue_draw()
+
+    def solved(self):
+        return self.tiles == list(range(self.N * self.N))
+
+    def draw(self, cr, w, h):
+        glass(cr, 4, 4, w - 8, h - 8)
+        n, size = self.N, WIDTH - 24
+        ox, oy, t = 12, 10, size / self.N
+        done = self.solved()
+        for pos, tile in enumerate(self.tiles):
+            if tile == n * n - 1 and not done:
+                continue
+            pr, pc = divmod(pos, n)
+            tr, tc = divmod(tile, n)
+            x, y = ox + pc * t, oy + pr * t
+            cr.save()
+            cr.rectangle(x + 0.5, y + 0.5, t - 1, t - 1)
+            cr.clip()
+            if self.picture is not None:
+                Gdk.cairo_set_source_pixbuf(cr, self.picture, x - tc * t, y - tr * t)
+                cr.paint()
+            else:
+                hue = tile / (n * n)
+                cr.set_source_rgb(0.25 + 0.5 * hue, 0.45, 0.85 - 0.5 * hue)
+                cr.paint()
+                text(cr, str(tile + 1), x + t / 2, y + t / 2 + 6, 16, bold=True, center=True)
+            cr.restore()
+            if not done:
+                cr.rectangle(x + 0.5, y + 0.5, t - 1, t - 1)
+                cr.set_source_rgba(1, 1, 1, 0.35)
+                cr.set_line_width(1)
+                cr.stroke()
+        label = f"Solved in {self.moves} moves!" if done and self.moves else f"Moves: {self.moves}"
+        text(cr, label, w / 2, h - 10, 10, center=True)
+
+    def clicked_at(self, x, y):
+        n, t = self.N, (WIDTH - 24) / self.N
+        c, r = int((x - 12) // t), int((y - 10) // t)
+        if not (0 <= c < n and 0 <= r < n) or self.solved():
+            return True
+        pos = r * n + c
+        gap = self.tiles.index(n * n - 1)
+        gr, gc = divmod(gap, n)
+        if (abs(gr - r) + abs(gc - c)) == 1:
+            self.tiles[gap], self.tiles[pos] = self.tiles[pos], self.tiles[gap]
+            self.moves += 1
+            self.area.queue_draw()
+        return True
+
+    def options(self):
+        self.load_picture()
+        self.shuffle()
+        return True
+
+
+# Exchange rates from the European Central Bank, via frankfurter.app (no account)
+FRANKFURTER = os.environ.get("FIROX_FRANKFURTER", "https://api.frankfurter.app").rstrip("/")
+
+
+class Currency(Gadget):
+    KEY, TITLE, ICON = "currency", "Currency", "accessories-calculator"
+    DESCRIPTION = "Convert between currencies with today's exchange rates (European Central Bank)."
+    HEIGHT = 108
+
+    def __init__(self, sidebar):
+        self.rate = None
+        self.date = ""
+        self.error = ""
+        super().__init__(sidebar)
+        self.fetch()
+        self.timer = GLib.timeout_add_seconds(6 * 3600, lambda: self.fetch() or True)
+
+    def pair(self):
+        conf = self.sidebar.conf
+        return conf.get("CURRENCY_FROM", "USD").upper(), conf.get("CURRENCY_TO", "EUR").upper()
+
+    def amount(self):
+        try:
+            return float(self.sidebar.conf.get("CURRENCY_AMOUNT", "1"))
+        except ValueError:
+            return 1.0
+
+    def fetch(self):
+        src, dst = self.pair()
+        if src == dst:
+            self.rate, self.date, self.error = 1.0, "", ""
+            self.area.queue_draw()
+            return
+
+        def work():
+            try:
+                data = fetch_json(f"{FRANKFURTER}/latest?" + urllib.parse.urlencode({"from": src, "to": dst}))
+                rate, date, err = float(data["rates"][dst]), data.get("date", ""), ""
+            except Exception as e:  # noqa: BLE001
+                rate, date, err = None, "", "Can't get rates right now"
+                print(f"gadgets: currency: {e}", file=sys.stderr)
+            GLib.idle_add(self.got, rate, date, err)
+        threading.Thread(target=work, daemon=True).start()
+
+    def got(self, rate, date, err):
+        if rate is not None or self.rate is None:
+            self.rate, self.date, self.error = rate, date, err
+        self.area.queue_draw()
+        return False
+
+    def draw(self, cr, w, h):
+        glass(cr, 4, 4, w - 8, h - 8, top=(0.20, 0.50, 0.28), bottom=(0.05, 0.18, 0.08))
+        src, dst = self.pair()
+        amt = self.amount()
+        text(cr, f"{amt:g} {src} =", w / 2, 30, 12, rgba=(0.88, 1, 0.9, 1), center=True)
+        if self.rate is None:
+            text(cr, self.error or "Loading…", w / 2, 62, 11, center=True)
+        else:
+            value = amt * self.rate
+            shown = f"{value:,.2f}" if value >= 0.01 else f"{value:.6f}"
+            text(cr, fit_text(cr, f"{shown} {dst}", 20, w - 20, True), w / 2, 64, 20, bold=True, center=True)
+        if self.date:
+            text(cr, f"Rate of {self.date}", w / 2, h - 14, 9, rgba=(0.8, 0.92, 0.82, 1), center=True)
+
+    def clicked(self):
+        return self.options()
+
+    def options(self):
+        conf = self.sidebar.conf
+        dlg = Gtk.Dialog(title="Currency Options", modal=True)
+        dlg.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        dlg.add_button("OK", Gtk.ResponseType.OK)
+        dlg.set_default_response(Gtk.ResponseType.OK)
+        box = dlg.get_content_area()
+        box.set_spacing(8)
+        box.set_border_width(14)
+        grid = Gtk.Grid(column_spacing=10, row_spacing=8)
+        amount = Gtk.Entry(text=conf.get("CURRENCY_AMOUNT", "1"), activates_default=True, width_chars=10)
+        src = Gtk.Entry(text=self.pair()[0], activates_default=True, width_chars=6, max_length=3)
+        dst = Gtk.Entry(text=self.pair()[1], activates_default=True, width_chars=6, max_length=3)
+        for i, (label, widget) in enumerate((("Amount:", amount), ("From:", src), ("To:", dst))):
+            grid.attach(Gtk.Label(label=label, xalign=0), 0, i, 1, 1)
+            grid.attach(widget, 1, i, 1, 1)
+        box.pack_start(grid, False, False, 0)
+        note = Gtk.Label(xalign=0, wrap=True, max_width_chars=44)
+        note.set_markup("<small>Three-letter codes such as USD, EUR, GBP, JPY, CAD, AUD, CHF, CNY, INR. "
+                        "Rates from the European Central Bank, updated on working days.</small>")
+        box.pack_start(note, False, False, 0)
+        dlg.show_all()
+        if dlg.run() == Gtk.ResponseType.OK:
+            try:
+                conf["CURRENCY_AMOUNT"] = f"{float(amount.get_text().replace(',', '.')):g}"
+            except ValueError:
+                pass
+            a, b = src.get_text().strip().upper(), dst.get_text().strip().upper()
+            if len(a) == 3 and a.isalpha():
+                conf["CURRENCY_FROM"] = a
+            if len(b) == 3 and b.isalpha():
+                conf["CURRENCY_TO"] = b
+            save_conf(conf)
+            self.rate, self.error = None, ""
+            self.fetch()
+        dlg.destroy()
+        return True
+
+
+class DiskSpace(Gadget):
+    KEY, TITLE, ICON = "disks", "Disk Space", "drive-harddisk"
+    DESCRIPTION = "How full your home drive and any plugged-in drives are."
+    INTERVAL = 30
+
+    def __init__(self, sidebar):
+        self.drives = []
+        self.refresh()
+        super().__init__(sidebar)
+        self.area.set_size_request(WIDTH, self.height())
+
+    def height(self):
+        return 34 + 34 * max(1, len(self.drives))
+
+    def refresh(self):
+        home = os.path.expanduser("~")
+        drives = [("Home", home)]
+        user = os.environ.get("USER", "")
+        for base in (f"/run/media/{user}", "/media"):
+            try:
+                for name in sorted(os.listdir(base)):
+                    path = os.path.join(base, name)
+                    if os.path.ismount(path):
+                        drives.append((name, path))
+            except OSError:
+                pass
+        out = []
+        for label, path in drives[:5]:
+            try:
+                st = os.statvfs(path)
+            except OSError:
+                continue
+            total = st.f_blocks * st.f_frsize
+            free = st.f_bavail * st.f_frsize
+            if total:
+                out.append((label, path, total, free))
+        self.drives = out
+
+    def tick(self):
+        before = len(self.drives)
+        self.refresh()
+        if len(self.drives) != before:
+            self.area.set_size_request(WIDTH, self.height())
+        return super().tick()
+
+    @staticmethod
+    def size(n):
+        for unit in ("B", "KB", "MB", "GB", "TB"):
+            if n < 1024 or unit == "TB":
+                return f"{n:.0f} {unit}" if unit in ("B", "KB") else f"{n:.1f} {unit}"
+            n /= 1024
+
+    def draw(self, cr, w, h):
+        h = self.height()
+        glass(cr, 4, 4, w - 8, h - 8)
+        text(cr, "Disk Space", 12, 22, 10, bold=True, rgba=(0.9, 0.93, 1, 1))
+        y = 30
+        for label, _path, total, free in self.drives:
+            used = 1 - free / total
+            text(cr, fit_text(cr, label, 10, 70), 12, y + 12, 10)
+            text(cr, f"{self.size(free)} free", w - 12 - 70, y + 12, 9, rgba=(0.8, 0.85, 0.95, 1))
+            bx, by, bw, bh = 12, y + 17, w - 24, 9
+            rounded(cr, bx, by, bw, bh, 3)
+            cr.set_source_rgba(0, 0, 0, 0.4)
+            cr.fill()
+            rgb = (0.85, 0.25, 0.2) if used > 0.9 else ((0.95, 0.65, 0.15) if used > 0.75 else (0.3, 0.6, 0.95))
+            rounded(cr, bx, by, max(6, bw * used), bh, 3)
+            cr.set_source_rgb(*rgb)
+            cr.fill()
+            y += 34
+
+    def clicked(self):
+        spawn(["firox-open", "computer"])
+        return True
+
+
+GADGETS = [Clock, Calendar, CpuMeter, Weather, SlideShow, Notes, NowPlaying, NetworkMeter,
+           Headlines, Timer, PicturePuzzle, Currency, DiskSpace]
 BY_KEY = {g.KEY: g for g in GADGETS}
 
 
