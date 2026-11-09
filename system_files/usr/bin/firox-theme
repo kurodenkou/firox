@@ -126,7 +126,7 @@ apply_running() {
     fi
     # Notifications
     if [ ! -e "$CONF/mako/config" ]; then
-        restart_detached mako mako -c "$(path_for "$t" mako.conf)"
+        restart_detached mako mako -c "$(firox-displays mako-conf "$(path_for "$t" mako.conf)")"
     fi
     # Start menu picks the new theme up next time it opens
     switch_wallpaper "$t"

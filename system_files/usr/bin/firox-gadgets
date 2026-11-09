@@ -40,6 +40,9 @@ try:
 except (ValueError, ImportError):
     GtkLayerShell = None
 
+sys.path.insert(0, "/usr/lib/firox/python")
+import firox_monitors  # noqa: E402
+
 try:
     import psutil  # noqa: E402
 except ImportError:
@@ -762,6 +765,14 @@ class Sidebar(Gtk.Window):
             for edge in (GtkLayerShell.Edge.TOP, GtkLayerShell.Edge.RIGHT, GtkLayerShell.Edge.BOTTOM):
                 GtkLayerShell.set_anchor(self, edge, True)
             GtkLayerShell.set_keyboard_mode(self, GtkLayerShell.KeyboardMode.ON_DEMAND)
+            # On the main display (Settings > Display), following it when it
+            # or the monitors change
+            self.place_timer = None
+            self.place()
+            screen.connect("monitors-changed", lambda _s: self.schedule_place())
+            self.main_mon = Gio.File.new_for_path(firox_monitors.CONF).monitor_file(
+                Gio.FileMonitorFlags.NONE, None)
+            self.main_mon.connect("changed", lambda *_: self.schedule_place())
         self.set_size_request(SIDEBAR, -1)
 
         outer = Gtk.EventBox()
@@ -786,6 +797,19 @@ class Sidebar(Gtk.Window):
         col.pack_start(scroll, True, True, 0)
         self.fill()
         self.show_all()
+
+    def place(self):
+        self.place_timer = None
+        mon = firox_monitors.main_gdk_monitor(Gdk.Display.get_default())
+        if mon is not None and mon != getattr(self, "placed_on", None):
+            self.placed_on = mon
+            GtkLayerShell.set_monitor(self, mon)
+        return False
+
+    def schedule_place(self):
+        if self.place_timer is not None:
+            GLib.source_remove(self.place_timer)
+        self.place_timer = GLib.timeout_add(400, self.place)
 
     def keys(self):
         return [k for k in self.conf.get("GADGETS", "").split(",") if k in BY_KEY]

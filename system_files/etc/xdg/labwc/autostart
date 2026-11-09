@@ -49,7 +49,8 @@ firox-notifications daemon >/dev/null 2>&1 &
 if [ -f "$CFG/mako/config" ]; then
     mako >/dev/null 2>&1 &
 else
-    mako -c "$(firox-theme path mako.conf)" >/dev/null 2>&1 &
+    # (the theme's settings, shown on the main display: firox-displays)
+    mako -c "$(firox-displays mako-conf "$(firox-theme path mako.conf)")" >/dev/null 2>&1 &
 fi
 
 # Network and Bluetooth: the taskbar's own icons and pop-ups (firox-network,

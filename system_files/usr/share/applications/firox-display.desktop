@@ -1,8 +1,8 @@
 [Desktop Entry]
 Type=Application
 Name=Display Settings
-Comment=Screen resolution, scaling and multiple monitors (saved for next login)
-Exec=firox-display
+Comment=Main display, screen resolution, scaling and multiple monitors
+Exec=firox-control-panel display
 Icon=preferences-desktop-display
 Categories=Settings;
-Keywords=resolution;monitor;screen;display;scale;refresh;
+Keywords=resolution;monitor;screen;display;scale;refresh;main;primary;extend;multiple;

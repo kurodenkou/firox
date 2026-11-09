@@ -33,9 +33,19 @@ gi.require_version("GdkPixbuf", "2.0")
 gi.require_version("Gdk", "3.0")
 from gi.repository import Gdk, GdkPixbuf, Gio, GLib, Gtk  # noqa: E402
 
+try:
+    gi.require_version("GtkLayerShell", "0.1")
+    from gi.repository import GtkLayerShell  # noqa: E402
+except (ValueError, ImportError):
+    GtkLayerShell = None
+
+sys.path.insert(0, "/usr/lib/firox/python")
+import firox_monitors  # noqa: E402
+
 # (icon, title, description, argv). Shown in alphabetical order of title.
 APPLETS = [
-    ("preferences-desktop-display", "Display", "Screen resolution, scaling and multiple monitors", ["firox-display"]),
+    ("preferences-desktop-display", "Display", "Main display, resolution, scaling and multiple monitors",
+     ["@display"]),
     ("preferences-desktop-screensaver", "Screen Saver", "Aquarium, Matrix, Bonsai and more when idle",
      ["@screensaver"]),
     ("org.kde.plasma.clipboard", "Clipboard", "Copy and paste history (Super+V)", ["@clipboard"]),
@@ -765,7 +775,7 @@ PANEL_CONF = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduse
 
 
 def read_panel_conf():
-    out = {"GROUP": "1", "AUTOHIDE": "0", "QUICKLAUNCH": "1", "SECONDS": "0"}
+    out = {"GROUP": "1", "AUTOHIDE": "0", "QUICKLAUNCH": "1", "SECONDS": "0", "ALL_DISPLAYS": "1"}
     try:
         with open(PANEL_CONF) as fh:
             for line in fh:
@@ -789,6 +799,10 @@ class TaskbarDialog(Gtk.Dialog):
          "The small icons next to the start button. Right-click a program in the Start menu "
          "or on the taskbar to pin it there; drag them to rearrange."),
         ("SECONDS", "Show seconds on the clock", None),
+        ("ALL_DISPLAYS", "Show the taskbar on all displays",
+         "With more than one monitor, the others get a taskbar with their own windows and the "
+         "clock. Untick it for one taskbar, on the main display (Settings \u2192 Display), "
+         "with every window."),
     ]
 
     def __init__(self, parent):
@@ -963,6 +977,233 @@ def can_hibernate():
     out = run_text(["busctl", "call", "org.freedesktop.login1", "/org/freedesktop/login1",
                     "org.freedesktop.login1.Manager", "CanHibernate"])
     return '"yes"' in out
+
+
+class DisplayDialog(Gtk.Dialog):
+    """XP-style Display Properties: the monitors as numbered screens, which
+    one is the main display, Identify, and the resolution/arrangement tool."""
+
+    def __init__(self, parent):
+        super().__init__(title="Display", transient_for=parent, modal=True)
+        self.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        self.add_button("Apply", Gtk.ResponseType.APPLY)
+        self.set_default_size(500, -1)
+        box = self.get_content_area()
+        box.set_spacing(10)
+        box.set_border_width(16)
+        header = Gtk.Box(spacing=12)
+        header.pack_start(Gtk.Image.new_from_icon_name("preferences-desktop-display", Gtk.IconSize.DIALOG),
+                          False, False, 0)
+        intro = Gtk.Label(xalign=0, wrap=True, max_width_chars=50,
+                          label="Click a monitor to choose it. The main display has the full "
+                                "taskbar with its icons and clock, the Sidebar and notifications; "
+                                "the others extend your desktop.")
+        header.pack_start(intro, True, True, 0)
+        box.pack_start(header, False, False, 0)
+
+        self.area = Gtk.DrawingArea()
+        self.area.set_size_request(-1, 190)
+        self.area.add_events(Gdk.EventMask.BUTTON_PRESS_MASK)
+        self.area.connect("draw", self.on_draw)
+        self.area.connect("button-press-event", self.on_click)
+        frame = Gtk.Frame()
+        frame.add(self.area)
+        box.pack_start(frame, False, False, 0)
+
+        row = Gtk.Box(spacing=8)
+        row.pack_start(Gtk.Label(label="Display:"), False, False, 0)
+        self.combo = Gtk.ComboBoxText()
+        self.combo.connect("changed", self.on_combo)
+        row.pack_start(self.combo, True, True, 0)
+        box.pack_start(row, False, False, 0)
+        self.details = Gtk.Label(xalign=0)
+        self.details.get_style_context().add_class("dim-label")
+        box.pack_start(self.details, False, False, 0)
+
+        self.main_check = Gtk.CheckButton(label="Make this my main display")
+        self.main_check.connect("toggled", self.on_main_toggled)
+        box.pack_start(self.main_check, False, False, 0)
+        self.note = Gtk.Label(xalign=0, wrap=True, max_width_chars=50)
+        self.note.set_margin_start(26)
+        self.note.get_style_context().add_class("dim-label")
+        box.pack_start(self.note, False, False, 0)
+
+        buttons = Gtk.Box(spacing=8)
+        ident = Gtk.Button(label="Identify")
+        ident.set_tooltip_text("Show each monitor's number on it for a few seconds")
+        ident.connect("clicked", lambda _b: self.identify())
+        ident.set_sensitive(GtkLayerShell is not None)
+        buttons.pack_start(ident, False, False, 0)
+        more = Gtk.Button(label="Resolution and arrangement\u2026")
+        more.set_tooltip_text("Resolution, refresh rate, scaling, rotation, turning monitors "
+                              "on and off, and where they sit next to each other")
+        more.connect("clicked", lambda _b: spawn(["firox-display"]))
+        buttons.pack_end(more, False, False, 0)
+        box.pack_start(buttons, False, False, 4)
+
+        self.selected = None
+        self.pending = None               # main display chosen here, not applied yet
+        self.updating = False
+        self.reload()
+        # Follow changes made meanwhile (resolution tool, plugging in)
+        self.sig = Gdk.Screen.get_default().connect("monitors-changed",
+                                                    lambda _s: GLib.timeout_add(500, self.reload))
+        self.connect("destroy", lambda _w: Gdk.Screen.get_default().disconnect(self.sig))
+        self.show_all()
+
+    def reload(self):
+        self.outs = firox_monitors.outputs()
+        self.main = firox_monitors.main_name(self.outs)
+        if self.pending is None or not any(o["name"] == self.pending and o["enabled"]
+                                           for o in self.outs):
+            self.pending = self.main
+        self.numbers = {o["name"]: n for n, o in firox_monitors.numbered(self.outs)}
+        on = [o for o in self.outs if o["enabled"]]
+        if self.selected not in self.numbers:
+            self.selected = self.pending
+        self.updating = True
+        self.combo.remove_all()
+        for o in sorted(on, key=lambda o: self.numbers[o["name"]]):
+            self.combo.append(o["name"], f"{self.numbers[o['name']]}. {o['description']}")
+        if self.selected:
+            self.combo.set_active_id(self.selected)
+        self.updating = False
+        self.update_controls()
+        self.area.queue_draw()
+        return False
+
+    def update_controls(self):
+        o = next((o for o in self.outs if o["name"] == self.selected), None)
+        many = sum(x["enabled"] for x in self.outs) > 1
+        self.updating = True
+        is_main = o is not None and o["name"] == self.pending
+        self.main_check.set_active(is_main)
+        # Like Windows: you choose a new main display rather than "un-main" one
+        self.main_check.set_sensitive(many and not is_main)
+        self.updating = False
+        if o is None:
+            self.details.set_text("No monitors found.")
+            self.note.set_text("")
+            return
+        self.details.set_text(f"{o['name']}, {o['mode'] or 'unknown resolution'}")
+        if not many:
+            self.note.set_text("This is your only monitor. Connect another one to extend your desktop.")
+        elif is_main:
+            self.note.set_text("To use another monitor as the main display, select it and tick this.")
+        else:
+            self.note.set_text("It extends your desktop, with its own taskbar showing the "
+                               "windows on it (Settings \u2192 Taskbar).")
+
+    # ---- the picture of the monitors
+    def layout(self):
+        """[(output, x, y, w, h)] in widget coordinates."""
+        on = [o for o in self.outs if o["enabled"] and o["width"] and o["height"]]
+        if not on:
+            return []
+        alloc = self.area.get_allocation()
+        x0 = min(o["x"] for o in on)
+        y0 = min(o["y"] for o in on)
+        x1 = max(o["x"] + o["width"] for o in on)
+        y1 = max(o["y"] + o["height"] for o in on)
+        pad = 18
+        k = min((alloc.width - 2 * pad) / max(1, x1 - x0), (alloc.height - 2 * pad) / max(1, y1 - y0))
+        ox = (alloc.width - (x1 - x0) * k) / 2
+        oy = (alloc.height - (y1 - y0) * k) / 2
+        return [(o, ox + (o["x"] - x0) * k, oy + (o["y"] - y0) * k, o["width"] * k, o["height"] * k)
+                for o in on]
+
+    def on_draw(self, widget, cr):
+        ctx = widget.get_style_context()
+        fg = ctx.get_color(Gtk.StateFlags.NORMAL)
+        for o, x, y, w, h in self.layout():
+            sel = o["name"] == self.selected
+            cr.rectangle(x + 2, y + 2, w - 4, h - 4)
+            if sel:
+                cr.set_source_rgb(0.19, 0.42, 0.86)
+            else:
+                cr.set_source_rgb(0.42, 0.55, 0.75)
+            cr.fill_preserve()
+            cr.set_line_width(3 if sel else 1.5)
+            cr.set_source_rgb(0.08, 0.12, 0.25)
+            cr.stroke()
+            # The main display's taskbar along the bottom
+            if o["name"] == self.pending:
+                cr.rectangle(x + 3, y + h - 3 - max(4, h * 0.07), w - 6, max(4, h * 0.07))
+                cr.set_source_rgba(0.1, 0.1, 0.12, 0.85)
+                cr.fill()
+            num = str(self.numbers.get(o["name"], "?"))
+            cr.set_source_rgb(1, 1, 1)
+            cr.select_font_face("Sans", 0, 1)
+            cr.set_font_size(max(14, min(w, h) * 0.38))
+            ext = cr.text_extents(num)
+            cr.move_to(x + (w - ext.width) / 2 - ext.x_bearing, y + (h - ext.height) / 2 - ext.y_bearing)
+            cr.show_text(num)
+        if not self.layout():
+            cr.set_source_rgba(fg.red, fg.green, fg.blue, 0.6)
+            cr.move_to(16, 30)
+            cr.show_text("No monitors found")
+        return False
+
+    def on_click(self, _w, event):
+        for o, x, y, w, h in self.layout():
+            if x <= event.x <= x + w and y <= event.y <= y + h:
+                self.selected = o["name"]
+                self.updating = True
+                self.combo.set_active_id(o["name"])
+                self.updating = False
+                self.update_controls()
+                self.area.queue_draw()
+                break
+        return True
+
+    def on_combo(self, combo):
+        if self.updating:
+            return
+        self.selected = combo.get_active_id()
+        self.update_controls()
+        self.area.queue_draw()
+
+    def on_main_toggled(self, check):
+        if self.updating or not check.get_active() or not self.selected:
+            return
+        self.pending = self.selected
+        self.update_controls()
+        self.area.queue_draw()
+
+    # ---- Identify: a big number on each monitor
+    def identify(self):
+        display = Gdk.Display.get_default()
+        wins = []
+        for o in self.outs:
+            mon = firox_monitors.gdk_monitor_for(display, o) if o["enabled"] else None
+            if mon is None:
+                continue
+            win = Gtk.Window()
+            win.set_decorated(False)
+            GtkLayerShell.init_for_window(win)
+            GtkLayerShell.set_namespace(win, "firox-identify")
+            GtkLayerShell.set_layer(win, GtkLayerShell.Layer.OVERLAY)
+            GtkLayerShell.set_monitor(win, mon)
+            GtkLayerShell.set_anchor(win, GtkLayerShell.Edge.TOP, True)
+            GtkLayerShell.set_anchor(win, GtkLayerShell.Edge.LEFT, True)
+            GtkLayerShell.set_margin(win, GtkLayerShell.Edge.TOP, 40)
+            GtkLayerShell.set_margin(win, GtkLayerShell.Edge.LEFT, 40)
+            lab = Gtk.Label()
+            main = "  (main)" if o["name"] == self.main else ""
+            lab.set_markup(f"<span size='72000' weight='bold'>{self.numbers.get(o['name'], '?')}</span>"
+                           f"<span size='16000'>{GLib.markup_escape_text(main)}</span>")
+            lab.set_margin_start(28)
+            lab.set_margin_end(28)
+            lab.set_margin_top(8)
+            lab.set_margin_bottom(8)
+            win.add(lab)
+            win.show_all()
+            wins.append(win)
+        GLib.timeout_add(3000, lambda: [w.destroy() for w in wins] and False)
+
+    def apply(self):
+        if self.pending and self.pending != self.main:
+            subprocess.run(["firox-displays", "main", self.pending], check=False)
 
 
 class PowerDialog(Gtk.Dialog):
@@ -1328,6 +1569,11 @@ class ControlPanel(Gtk.ApplicationWindow):
             if dlg.run() == Gtk.ResponseType.APPLY:
                 dlg.apply()
             dlg.destroy()
+        elif argv == ["@display"]:
+            dlg = DisplayDialog(self)
+            if dlg.run() == Gtk.ResponseType.APPLY:
+                dlg.apply()
+            dlg.destroy()
         elif argv == ["@power"]:
             dlg = PowerDialog(self)
             if dlg.run() == Gtk.ResponseType.APPLY:
@@ -1365,7 +1611,7 @@ class App(Gtk.Application):
                   "screensaver": ["@screensaver"], "clipboard": ["@clipboard"],
                   "mouse": ["@mouse"], "keyboard": ["@keyboard"],
                   "taskbar": ["@taskbar"], "defaults": ["@defaults"],
-                  "display": ["firox-display"], "startup": ["firox-startup"]}
+                  "display": ["@display"], "startup": ["firox-startup"]}
         if page in direct and self.win is None:
             # Open just the applet, without the panel window
             if direct[page][0].startswith("@"):
@@ -1374,7 +1620,7 @@ class App(Gtk.Application):
                        "appearance": AppearanceDialog, "accounts": AccountsDialog,
                        "power": PowerDialog, "screensaver": ScreenSaverDialog,
                        "clipboard": ClipboardDialog, "taskbar": TaskbarDialog,
-                       "defaults": DefaultsDialog,
+                       "defaults": DefaultsDialog, "display": DisplayDialog,
                        "mouse": MouseDialog, "keyboard": KeyboardDialog}[page]
                 dlg = cls(None)
                 if dlg.run() == Gtk.ResponseType.APPLY:
