@@ -81,6 +81,8 @@ PACKAGES=(
     gvfs
     gvfs-mtp
     gvfs-smb
+    gvfs-fuse                    # network places as folders for every program
+    rclone                       # Firox Explorer: S3 and Backblaze B2
     xdg-user-dirs
     xdg-utils
 
