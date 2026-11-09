@@ -7,6 +7,9 @@ stays pcmanfm-qt).
     firox-explorer [FOLDER|URI]     open a window there (default: Home)
     firox-explorer --connect-saved  connect the connections marked "Connect
                                     when I log in", then exit (run at login)
+    firox-explorer --test NAME      check a saved connection step by step and
+                                    write a report (secrets blanked) to
+                                    ~/.local/state/firox/mounts/ID-test.log
 
 Browse your files, drives and network places; Icons or Details view; Back,
 Forward, Up, an address bar and filtering as you type in the search box.
@@ -53,15 +56,17 @@ ATTRS = ",".join(["standard::name", "standard::display-name", "standard::icon", 
                   "trash::deletion-date", "standard::target-uri"])
 # model columns
 (C_NAME, C_PIX, C_URI, C_DIR, C_SIZE, C_MTIME, C_TYPE, C_SIZE_TEXT, C_DATE_TEXT,
- C_HIDDEN, C_SMALL, C_ORIG) = range(12)
+ C_HIDDEN, C_SMALL, C_ORIG, C_MOUNTABLE) = range(13)
 
 
 def spawn(argv, cwd=None):
     try:
         subprocess.Popen(argv, cwd=cwd, start_new_session=True, stdin=subprocess.DEVNULL,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
     except OSError as err:
         print(f"firox-explorer: {argv[0]}: {err}", file=sys.stderr)
+        return False
 
 
 def human_size(n):
@@ -565,7 +570,7 @@ class Explorer(Gtk.ApplicationWindow):
 
         # main views on one model
         self.store = Gtk.ListStore(str, GdkPixbuf.Pixbuf, str, bool, GObjectInt64(), GObjectInt64(),
-                                   str, str, str, bool, GdkPixbuf.Pixbuf, str)
+                                   str, str, str, bool, GdkPixbuf.Pixbuf, str, bool)
         self.store.set_default_sort_func(self.sort_func)
         self.store.set_sort_column_id(Gtk.TREE_SORTABLE_DEFAULT_SORT_COLUMN_ID, Gtk.SortType.ASCENDING)
         self.filter = self.store.filter_new()
@@ -757,6 +762,10 @@ class Explorer(Gtk.ApplicationWindow):
                                (lambda: self.disconnect(payload)) if on else (lambda: self.open_connection(payload)))
                 menu.append(Gtk.SeparatorMenuItem())
                 self.menu_item(menu, "_Edit…", lambda: self.edit_connection(payload))
+                self.menu_item(menu, "_Test Connection…", lambda: self.test_connection(payload))
+                self.menu_item(menu, "Show _Log", lambda: self.show_log(payload),
+                               os.path.exists(firox_mounts.log_path(payload)))
+                menu.append(Gtk.SeparatorMenuItem())
                 self.menu_item(menu, "Re_move", lambda: self.remove_connection(payload))
             elif kind in ("volume", "mount"):
                 mount = payload.get_mount() if kind == "volume" else payload
@@ -1059,8 +1068,12 @@ class Explorer(Gtk.ApplicationWindow):
                     gf.mount_enclosing_volume_finish(res)
                     self.load()
                 except GLib.Error as e:
+                    if e.matches(Gio.io_error_quark(), Gio.IOErrorEnum.ALREADY_MOUNTED):
+                        self.load()
+                        return
                     self.status.set_text("")
-                    error_box(self, "Couldn't open the location", e.message)
+                    if not e.matches(Gio.io_error_quark(), Gio.IOErrorEnum.FAILED_HANDLED):
+                        error_box(self, "Couldn't open the location", e.message)
             f.mount_enclosing_volume(Gio.MountMountFlags.NONE, op, None, mounted)
             return
         self.status.set_text("")
@@ -1069,22 +1082,29 @@ class Explorer(Gtk.ApplicationWindow):
 
     def add_row(self, folder, info):
         name = info.get_display_name()
-        is_dir = info.get_file_type() == Gio.FileType.DIRECTORY
+        ftype = info.get_file_type()
         child = folder.get_child(info.get_name())
         target = info.get_attribute_string("standard::target-uri")
         uri = target or child.get_uri()
+        # In Network and Computer, servers, shares and drives are shortcuts
+        # or mountables: open them like folders (mounting first if needed)
+        is_dir = ftype == Gio.FileType.DIRECTORY or (
+            ftype in (Gio.FileType.SHORTCUT, Gio.FileType.MOUNTABLE) and (
+                target is not None or ftype == Gio.FileType.MOUNTABLE))
+        mountable = ftype == Gio.FileType.MOUNTABLE and target is None
         mtime = info.get_attribute_uint64("time::modified")
-        size = info.get_size()
+        size = info.get_size() if info.has_attribute("standard::size") else 0
         ct = info.get_content_type() or ""
         thumb = info.get_attribute_byte_string("thumbnail::path") if self.flag("thumbnails") else None
         gicon = info.get_icon()
-        hidden = info.get_is_hidden() or info.get_is_backup() or info.get_name().startswith(".")
+        hidden = (info.has_attribute("standard::is-hidden") and info.get_is_hidden()) or (
+            info.has_attribute("standard::is-backup") and info.get_is_backup()) or info.get_name().startswith(".")
         orig = info.get_attribute_byte_string("trash::orig-path") or ""
         self.store.append([name, ICONS.get(gicon, ICON_SIZE_BIG, thumb), uri, is_dir, size, mtime,
                            "Folder" if is_dir else (Gio.content_type_get_description(ct) or "File"),
                            "" if is_dir else human_size(size),
                            time.strftime("%d/%m/%Y %H:%M", time.localtime(mtime)) if mtime else "",
-                           hidden, ICONS.get(gicon, ICON_SIZE_SMALL), orig])
+                           hidden, ICONS.get(gicon, ICON_SIZE_SMALL), orig, mountable])
 
     def loaded(self):
         try:
@@ -1223,6 +1243,9 @@ class Explorer(Gtk.ApplicationWindow):
         rows = [self.filter[p] for p in paths]
         for row in rows:
             gfile = Gio.File.new_for_uri(row[C_URI])
+            if row[C_MOUNTABLE]:
+                self.open_mountable(gfile)
+                continue
             if row[C_DIR]:
                 if len(rows) == 1:
                     self.navigate(gfile)
@@ -1230,6 +1253,34 @@ class Explorer(Gtk.ApplicationWindow):
                     spawn([sys.argv[0], gfile.get_uri()])
                 continue
             self.open_file(gfile, row[C_NAME])
+
+    def open_mountable(self, gfile):
+        """A server, share or drive that isn't mounted yet: mount it (asking
+        for a password if it needs one), then go in."""
+        self.status.set_text("Connecting…")
+
+        def mounted(f, res):
+            try:
+                target = f.mount_mountable_finish(res)
+            except GLib.Error as err:
+                if err.matches(Gio.io_error_quark(), Gio.IOErrorEnum.ALREADY_MOUNTED):
+                    target = None
+                elif err.matches(Gio.io_error_quark(), Gio.IOErrorEnum.FAILED_HANDLED):
+                    self.update_status()             # cancelled in the password box
+                    return
+                else:
+                    self.update_status()
+                    error_box(self, "Couldn't connect", err.message)
+                    return
+            if target is None:
+                try:
+                    info = f.query_info("standard::target-uri", Gio.FileQueryInfoFlags.NONE, None)
+                    t = info.get_attribute_string("standard::target-uri")
+                    target = Gio.File.new_for_uri(t) if t else f
+                except GLib.Error:
+                    target = f
+            self.navigate(target)
+        gfile.mount_mountable(Gio.MountMountFlags.NONE, Gtk.MountOperation(parent=self), None, mounted)
 
     def open_file(self, gfile, name):
         path = local_path(gfile)
@@ -1508,7 +1559,7 @@ class Explorer(Gtk.ApplicationWindow):
         rows = self.selected_rows() if self.current is not None else []
         one = rows[0] if len(rows) == 1 else None
         trash = self.in_trash()
-        writable = not trash and self.current is not None and self.dest_path() is not None
+        writable = not trash and self.current is not None and local_path(self.current) is not None
         self.menu_item(menu, "New _Window", lambda: spawn([sys.argv[0], self.current.get_uri()]),
                        accel="<Control>n")
         self.menu_item(menu, "New _Folder…", self.new_folder, writable, accel="<Control><Shift>n")
@@ -1631,6 +1682,14 @@ class Explorer(Gtk.ApplicationWindow):
                 self.menu_item(sub, (conn.get("name") or conn["id"]).replace("_", "__"),
                                lambda c=conn: self.open_connection(c), check=on)
             menu.append(sub_item)
+        if conns:
+            sub_item = Gtk.MenuItem.new_with_mnemonic("_Test a Connection")
+            sub = Gtk.Menu()
+            sub_item.set_submenu(sub)
+            for conn in conns:
+                self.menu_item(sub, (conn.get("name") or conn["id"]).replace("_", "__"),
+                               lambda c=conn: self.test_connection(c))
+            menu.append(sub_item)
         self.menu_item(menu, "_Disconnect All", self.disconnect_all, bool(mounted))
         menu.append(Gtk.SeparatorMenuItem())
         self.menu_item(menu, "Open _Terminal Here", self.terminal_here,
@@ -1690,6 +1749,19 @@ class Explorer(Gtk.ApplicationWindow):
             os.close(fd)
         except OSError as err:
             error_box(self, "Couldn't make the document", err.strerror or str(err))
+
+    def test_connection(self, conn):
+        """Run the step-by-step check in a terminal, so its report can be
+        read, copied and found later in the log folder."""
+        argv = [os.path.abspath(sys.argv[0]), "--test", conn["id"]]
+        if not spawn(["xfce4-terminal", "--hold", "--title", f"Testing {conn.get('name')}", "-x"] + argv):
+            error_box(self, "Couldn't open a terminal", "Run this in a terminal instead:\n" + " ".join(argv))
+
+    def show_log(self, conn):
+        try:
+            Gio.AppInfo.launch_default_for_uri(Gio.File.new_for_path(firox_mounts.log_path(conn)).get_uri(), None)
+        except GLib.Error as err:
+            error_box(self, "Couldn't open the log", err.message)
 
     def disconnect_all(self):
         for conn in firox_mounts.load():
@@ -2109,7 +2181,28 @@ def connect_saved():
     return 0
 
 
+def test_cli(name):
+    conn = firox_mounts.find(name)
+    if conn is None:
+        names = ", ".join(repr(c.get("name") or c["id"]) for c in firox_mounts.load()) or "none"
+        print(f"No saved connection called {name!r}. Saved connections: {names}", file=sys.stderr)
+        return 2
+
+    def ask(fields):
+        if not sys.stdin.isatty():
+            return None
+        import getpass
+        print("Nothing is remembered in the keyring for this connection.")
+        return {k: getpass.getpass(f"{label} (not shown, not saved): ") for k, label in fields}
+    path = firox_mounts.diagnose(conn, out=lambda t: print(t, flush=True), ask_secret=ask)
+    print(f"\nThis report is saved in {path}")
+    print("Secrets are replaced by ***, but read it through before you share it.")
+    return 0
+
+
 if __name__ == "__main__":
     if "--connect-saved" in sys.argv[1:]:
         sys.exit(connect_saved())
+    if len(sys.argv) >= 3 and sys.argv[1] == "--test":
+        sys.exit(test_cli(" ".join(sys.argv[2:])))
     sys.exit(App().run(sys.argv))

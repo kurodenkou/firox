@@ -15,6 +15,10 @@ Security:
   /run/user/UID), never on a command line;
 - mounts are yours alone (FUSE without allow_other), under
   /run/user/UID/firox-mounts (S3/B2) and /run/user/UID/gvfs (the rest).
+
+Logs: each S3/B2 mount writes ~/.local/state/firox/mounts/ID.log (rclone,
+INFO level: no keys). diagnose() (firox-explorer --test NAME) checks a
+connection step by step and writes ID-test.log, with any secret blanked.
 """
 
 import json
@@ -22,6 +26,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 import urllib.parse
 
@@ -38,6 +43,8 @@ except (ValueError, ImportError):
 
 CONFIG = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "firox")
 STORE = os.path.join(CONFIG, "connections.json")
+LOGDIR = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
+                      "firox", "mounts")
 RUNTIME = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
 MOUNTS = os.path.join(RUNTIME, "firox-mounts")
 
@@ -209,6 +216,25 @@ def rclone_env(conn, secret):
     return env
 
 
+def log_path(conn, suffix=""):
+    os.makedirs(LOGDIR, mode=0o700, exist_ok=True)
+    return os.path.join(LOGDIR, re.sub(r"[^a-zA-Z0-9_.-]", "-", conn["id"]) + suffix + ".log")
+
+
+def log_problem(path, fallback):
+    """The useful end of an rclone log: its error lines (or the last
+    lines), plus where the whole log is."""
+    try:
+        with open(path, errors="replace") as fh:
+            lines = [ln.rstrip() for ln in fh if ln.strip()]
+    except OSError:
+        lines = []
+    errors = [ln for ln in lines if re.search(r"\b(ERROR|CRITICAL|Fatal|NOTICE: .*fail)", ln)]
+    shown = (errors or lines)[-6:]
+    text = "\n".join(re.sub(r"^\d{4}/\d\d/\d\d \d\d:\d\d:\d\d ", "", ln) for ln in shown) or fallback
+    return f"{text}\n\nThe whole log: {path}\n(right-click the connection > Test Connection for more)"
+
+
 def rclone_target(conn):
     bucket = conn.get("bucket", "").strip().strip("/")
     path = conn.get("path", "").strip().strip("/")
@@ -241,9 +267,14 @@ def mount_rclone(conn, secret, done):
     os.chmod(MOUNTS, 0o700)
     os.makedirs(point, exist_ok=True)
     unit = rclone_unit(conn)
+    log = log_path(conn)
+    try:
+        os.remove(log)                    # rclone appends; one log per connect
+    except OSError:
+        pass
     rclone_args = ["rclone", "mount", rclone_target(conn), point,
                    "--vfs-cache-mode", "writes", "--dir-cache-time", "30s", "--umask", "077",
-                   "--volname", conn.get("name") or "Cloud"]
+                   "--log-file", log, "--log-level", "INFO"]
     if not systemd_user():
         # No systemd user manager: run it ourselves (still only in the
         # environment, never on the command line)
@@ -267,18 +298,44 @@ def mount_rclone(conn, secret, done):
 
     def check():
         if os.path.ismount(point):
-            done(None)
+            verify_mount(conn, point, log, done)
             return False
         active = subprocess.run(["systemctl", "--user", "is-active", unit], capture_output=True,
                                 text=True).stdout.strip()
         if active in ("failed", "inactive") or time.monotonic() - started > 20:
-            log = subprocess.run(["journalctl", "--user", "-u", unit, "-n", "8", "--no-pager", "-o", "cat"],
-                                 capture_output=True, text=True).stdout.strip()
+            journal = subprocess.run(["journalctl", "--user", "-u", unit, "-n", "8", "--no-pager", "-o", "cat"],
+                                     capture_output=True, text=True).stdout.strip()
             subprocess.run(["systemctl", "--user", "stop", unit], capture_output=True)
-            done(log.splitlines()[-1] if log else "rclone stopped before the storage was mounted")
+            if journal and not os.path.exists(log):     # rclone didn't get as far as its log
+                with open(log, "w") as fh:
+                    fh.write(journal + "\n")
+            done(log_problem(log, "rclone stopped before the storage was mounted"
+                             if active != "activating" else "timed out after 20 seconds"))
             return False
         return True
     GLib.timeout_add(250, check)
+
+
+def verify_mount(conn, point, log, done):
+    """rclone mounts S3 before it has tried the keys: list the folder once
+    (in a thread, it can take a while) and give up with rclone's error if
+    that fails, rather than leaving a folder that only says I/O error."""
+    def work():
+        try:
+            os.listdir(point)
+            err = None
+        except OSError as e:
+            err = e
+        GLib.idle_add(finish, err)
+
+    def finish(err):
+        if err is None:
+            done(None)
+        else:
+            unmount(conn)
+            done(log_problem(log, f"The storage was mounted but couldn't be read ({err.strerror})."))
+        return False
+    threading.Thread(target=work, daemon=True).start()
 
 
 def systemd_user():
@@ -290,12 +347,11 @@ def systemd_user():
 
 
 def mount_rclone_direct(conn, secret, argv, point, done):
-    log = os.path.join(MOUNTS, f".{conn['id']}.log")
+    log = log_path(conn)
     try:
-        out = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        proc = subprocess.Popen(argv, start_new_session=True, stdin=subprocess.DEVNULL, stdout=out,
-                                stderr=out, env={**os.environ, **rclone_env(conn, secret)})
-        os.close(out)
+        proc = subprocess.Popen(argv, start_new_session=True, stdin=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                env={**os.environ, **rclone_env(conn, secret)})
     except OSError as err:
         done(str(err))
         return
@@ -303,17 +359,12 @@ def mount_rclone_direct(conn, secret, argv, point, done):
 
     def check():
         if os.path.ismount(point):
-            done(None)
+            verify_mount(conn, point, log, done)
             return False
         if proc.poll() is not None or time.monotonic() - started > 20:
             if proc.poll() is None:
                 proc.terminate()
-            try:
-                with open(log) as fh:
-                    lines = [ln for ln in fh.read().splitlines() if ln.strip()]
-            except OSError:
-                lines = []
-            done(lines[-1] if lines else "rclone stopped before the storage was mounted")
+            done(log_problem(log, "rclone stopped before the storage was mounted"))
             return False
         return True
     GLib.timeout_add(250, check)
@@ -423,3 +474,190 @@ def unmount(conn, done=None):
             if done:
                 done(err.message)
     m.unmount_with_operation(Gio.MountUnmountFlags.NONE, None, None, finished)
+
+
+# ------------------------------------------------------------ diagnosis --
+
+def find(name_or_id):
+    for conn in load():
+        if name_or_id in (conn["id"], conn.get("name")):
+            return conn
+    low = name_or_id.casefold()
+    for conn in load():
+        if (conn.get("name") or "").casefold() == low:
+            return conn
+    return None
+
+
+def diagnose(conn, out=print, ask_secret=None):
+    """Check a connection step by step, printing a report through out()
+    (secret values replaced by ***). Writes ID-test.log too; returns its
+    path. ask_secret(fields) -> dict, when nothing is remembered."""
+    path = log_path(conn, "-test")
+    report = []
+    secrets = []
+
+    def say(text=""):
+        for value in secrets:
+            if value and len(value) >= 4:
+                text = text.replace(value, "***")
+        report.append(text)
+        out(text)
+
+    def run(argv, env=None, timeout=60):
+        say("$ " + " ".join(argv))
+        try:
+            r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout,
+                               env={**os.environ, **(env or {})})
+            body = (r.stdout + r.stderr).rstrip()
+            code = r.returncode
+        except subprocess.TimeoutExpired as err:
+            body = ((err.stdout or b"").decode(errors="replace") + (err.stderr or b"").decode(errors="replace"))
+            body = body.rstrip() + f"\n(stopped after {timeout} s)"
+            code = -1
+        except OSError as err:
+            body, code = str(err), -1
+        for ln in body.splitlines()[-80:]:
+            say("    " + ln)
+        say(f"    -> exit code {code}")
+        return code
+
+    kind = conn["kind"]
+    say(f"Firox Explorer connection test, {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    say(f"Connection: {conn.get('name')} (id {conn['id']}), type {KINDS[kind][0]}")
+    shown = {k: v for k, v in conn.items() if k not in ("id", "name") and v not in ("", None)}
+    if shown.get("user") and kind in ("s3", "b2"):
+        u = shown["user"]
+        shown["user"] = u[:4] + "…" + u[-2:] if len(u) > 8 else u
+    say("Settings: " + json.dumps(shown))
+    say()
+    say("1. Secret")
+    say(f"    keyring (libsecret): {'available' if keyring_available() else 'NOT available'}")
+    secret = lookup_secret(conn) or {}
+    needed = [k for k, _l in secret_fields(kind)]
+    if all(secret.get(k) for k in needed):
+        say("    remembered in the keyring: yes")
+    else:
+        say("    remembered in the keyring: no")
+        if ask_secret is not None:
+            secret = ask_secret(secret_fields(kind)) or {}
+    secrets.extend(str(v) for v in secret.values() if v)
+    say()
+    if KINDS[kind][2] == "rclone":
+        say("2. Tools")
+        run(["rclone", "version"], timeout=20)
+        for tool in ("fusermount3", "fusermount", "systemd-run"):
+            say(f"    {tool}: {shutil.which(tool) or 'not found'}")
+        say(f"    /dev/fuse: {'present' if os.path.exists('/dev/fuse') else 'MISSING'}"
+            f"{', usable' if os.access('/dev/fuse', os.R_OK | os.W_OK) else ', not usable by you'}")
+        say(f"    systemd user manager: {'yes' if systemd_user() else 'no'}")
+        say()
+        env = rclone_env(conn, secret)
+        def shown_value(k, v):
+            if k.endswith(("_KEY", "_SECRET_ACCESS_KEY")):
+                return "***"
+            if k.endswith(("_ACCOUNT", "_ACCESS_KEY_ID")) and len(v) > 8:
+                return v[:4] + "…" + v[-2:]
+            return v
+        say("3. Settings rclone gets (keys hidden): " + ", ".join(f"{k}={shown_value(k, v)}" for k, v in env.items()))
+        say()
+        say("4. Listing the bucket (no mount), verbose")
+        code = run(["rclone", "lsf", rclone_target(conn), "--max-depth", "1", "-vv",
+                    "--retries", "1", "--low-level-retries", "2", "--contimeout", "15s", "--timeout", "30s"],
+                   env=env, timeout=90)
+        if code != 0 and kind == "b2":
+            say("    Listing failed. Can the key see the account's buckets at all?")
+            run(["rclone", "lsd", "firox:", "-vv", "--retries", "1", "--low-level-retries", "2"],
+                env=env, timeout=60)
+        say()
+        say("5. Trying a mount for 10 seconds, verbose")
+        if shutil.which("rclone") is None:
+            say("    skipped: rclone isn't installed (update Firox Linux to get it)")
+        elif is_mounted(conn):
+            say(f"    already mounted at {mountpoint(conn)}: skipped")
+        else:
+            os.makedirs(MOUNTS, mode=0o700, exist_ok=True)
+            point = os.path.join(MOUNTS, ".test-" + conn["id"])
+            os.makedirs(point, exist_ok=True)
+            mlog = log_path(conn, "-test-mount")
+            try:
+                os.remove(mlog)
+            except OSError:
+                pass
+            say(f"$ rclone mount {rclone_target(conn)} {point} -vv")
+            proc = subprocess.Popen(["rclone", "mount", rclone_target(conn), point, "--vfs-cache-mode", "writes",
+                                     "--umask", "077", "-vv", "--log-file", mlog],
+                                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                    env={**os.environ, **env})
+            ok = False
+            for _ in range(40):
+                time.sleep(0.25)
+                if os.path.ismount(point):
+                    ok = True
+                    break
+                if proc.poll() is not None:
+                    break
+            if ok:
+                try:
+                    names = sorted(os.listdir(point))[:10]
+                    say(f"    MOUNTED. First items: {names}")
+                except OSError as err:
+                    say(f"    mounted, but listing failed: {err}")
+                subprocess.run(["fusermount3", "-u", point], capture_output=True)
+            else:
+                say("    did NOT mount" + (f" (rclone exited with {proc.returncode})" if proc.poll() is not None
+                                         else " within 10 seconds"))
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+            try:
+                with open(mlog, errors="replace") as fh:
+                    for ln in fh.read().splitlines()[-60:]:
+                        say("    " + ln)
+            except OSError:
+                pass
+            try:
+                os.rmdir(point)
+            except OSError:
+                pass
+        say()
+        say("6. The last real connect (Firox Explorer's own log)")
+        try:
+            with open(log_path(conn), errors="replace") as fh:
+                for ln in fh.read().splitlines()[-30:]:
+                    say("    " + ln)
+        except OSError:
+            say("    (none yet)")
+        run(["journalctl", "--user", "-u", rclone_unit(conn), "-n", "20", "--no-pager", "-o", "short"], timeout=20)
+    else:
+        say("2. Address")
+        say(f"    {uri(conn)}")
+        say(f"    mounted now: {'yes' if is_mounted(conn) else 'no'}")
+        run(["gio", "mount", "-l"], timeout=20)
+        say()
+        say("3. Can this computer find the server?")
+        host = conn.get("host", "")
+        run(["getent", "hosts", host], timeout=15)
+        port = int(conn.get("port") or KINDS[kind][3] or 0)
+        if port:
+            import socket
+            try:
+                with socket.create_connection((host, port), timeout=8):
+                    say(f"    port {port}: open")
+            except OSError as err:
+                say(f"    port {port}: can't connect ({err})")
+        say()
+        say("4. gvfs messages from the last 10 minutes")
+        run(["journalctl", "--user", "--since", "-10min", "--no-pager", "-o", "short", "-t", "gvfsd",
+             "-t", "gvfsd-smb", "-t", "gvfsd-sftp", "-t", "gvfsd-ftp", "-t", "gvfsd-dav", "-t", "gvfsd-smb-browse"],
+            timeout=20)
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            fh.write("\n".join(report) + "\n")
+    except OSError:
+        pass
+    return path
