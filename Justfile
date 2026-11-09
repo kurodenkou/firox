@@ -331,6 +331,12 @@ _build-bib $target_image $tag $type $config: (_rootful_load_image target_image t
     args="--type ${type} "
     args+="--use-librepo=True "
     args+="--rootfs=btrfs"
+    if [[ "${type}" == iso ]]; then
+        # bootc-image-builder >= v89 no longer uses the image's repositories
+        # for the installer's packages; give it Fedora's (scripts/iso-repos.sh)
+        repo_args="$(sudo --preserve-env=ISO_REPOS,ISO_FEDORA_MIRROR bash scripts/iso-repos.sh "${target_image}:${tag}")"
+        args+=" ${repo_args//$'\n'/ }"
+    fi
 
     BUILDTMP=$(mktemp -p "${PWD}" -d -t _build-bib.XXXXXXXXXX)
 
