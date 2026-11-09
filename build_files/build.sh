@@ -143,6 +143,19 @@ dnf5 install -y --setopt=install_weak_deps=False "${PACKAGES[@]}"
 # from rebuilding the image.
 sed -i 's/^enabled=1/enabled=0/' /etc/yum.repos.d/firefoxpwa.repo
 
+# Fedora 45 moved its repo files from /etc/yum.repos.d to
+# /usr/share/dnf5/repos.d. bootc-image-builder (`just build-iso`) reads the
+# installer's repositories from the image's /etc/yum.repos.d only, so with
+# none there every package was "No match for argument". Link them back:
+# dnf5 treats a same-named file in /etc as an override of the /usr/share
+# one, so nothing is listed twice, and relative links follow Fedora's
+# updates to the originals.
+for f in /usr/share/dnf5/repos.d/*.repo; do
+    [ -e "$f" ] || continue
+    name="$(basename "$f")"
+    [ -e "/etc/yum.repos.d/$name" ] || ln -s "../../usr/share/dnf5/repos.d/$name" "/etc/yum.repos.d/$name"
+done
+
 ### ---------------------------------------------------------------------------
 ### 3. Our files (desktop config, start menu, themes, ...)
 ### ---------------------------------------------------------------------------

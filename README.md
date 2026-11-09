@@ -164,7 +164,7 @@ just build-iso ghcr.io/kurodenkou/firox latest
 
 The installer creates your user account. There's no separate setup wizard.
 
-The installer's own packages come from Fedora's repositories for the image's Fedora version, which `scripts/iso-repos.sh` works out (bootc-image-builder stopped using the image's repositories in October 2026, and its built-in list made every package "No match for argument"). To use a different mirror, set `ISO_FEDORA_MIRROR`; to choose the repositories yourself, set `ISO_REPOS="URL URL"`.
+On Fedora 45 and later the image links Fedora's repository files from `/usr/share/dnf5/repos.d` into `/etc/yum.repos.d`, because bootc-image-builder only looks there for the installer's packages (without them `just build-iso` fails with "No match for argument" for every package). Rebuild the image (`just build`) before building an ISO.
 
 ### NVIDIA graphics
 

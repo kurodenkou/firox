@@ -259,17 +259,6 @@ if [ "$BUILD_ISO" = 1 ]; then
                 as_root podman image scp "$(id -un)@localhost::$img:$TAG" "root@localhost::" ||
                     { fail "$img: ISO (copying the image to root)"; continue; }
             fi
-            # The installer's packages come from Fedora's repositories for
-            # the image's version (bootc-image-builder >= v89 no longer uses
-            # the image's own; see scripts/iso-repos.sh)
-            # (not through run/as_root: it only reads, and run echoes)
-            sudo_=(); [ "$(id -u)" = 0 ] || sudo_=(sudo -n)
-            mapfile -t repo_args < <("${sudo_[@]}" env ISO_REPOS="${ISO_REPOS:-}" \
-                ISO_FEDORA_MIRROR="${ISO_FEDORA_MIRROR:-}" bash "$REPO_DIR/scripts/iso-repos.sh" "$ref")
-            if [ "${#repo_args[@]}" = 0 ]; then
-                fail "$img: ISO (couldn't work out the Fedora repositories)"
-                continue
-            fi
             out="$(mktemp -d -p "$REPO_DIR" _iso.XXXXXX)"
             # Like `just build-iso`, but without -it, so it runs from cron
             if as_root podman run --rm --privileged --pull=newer --net=host \
@@ -277,7 +266,7 @@ if [ "$BUILD_ISO" = 1 ]; then
                     -v "$REPO_DIR/disk_config/iso.toml:/config.toml:ro" \
                     -v "$out:/output" \
                     -v /var/lib/containers/storage:/var/lib/containers/storage \
-                    "$BIB_IMAGE" --type iso --use-librepo=True --rootfs=btrfs "${repo_args[@]}" "$ref"; then
+                    "$BIB_IMAGE" --type iso --use-librepo=True --rootfs=btrfs "$ref"; then
                 iso="$ISO_DIR/$img-$(date +%Y%m%d)-$COMMIT.iso"
                 if [ "$DRY" = 1 ] || as_root mv -f "$out/bootiso/install.iso" "$iso"; then
                     as_root chown "$(id -u):$(id -g)" "$iso" 2>/dev/null
