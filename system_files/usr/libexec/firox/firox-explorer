@@ -13,6 +13,11 @@ everywhere: /etc/xdg/mimeapps.list; also /usr/bin/firox-explorer).
                                     write a report (secrets blanked) to
                                     ~/.local/state/firox/mounts/ID-test.log
 
+Tabs (Ctrl+T, Ctrl+W, Ctrl+Tab, Alt+1..9; middle-click a folder or a
+sidebar place to open it in a new tab; drop files on a tab to put them in
+its folder): each tab has its own folder, history, views and search (class
+Tab; Explorer's per-tab attributes forward to the current tab).
+
 Browse your files, drives and network places; Icons or Details view; Back,
 Forward, Up, an address bar and filtering as you type in the search box
 (with "Subfolders" on, it searches every folder inside too).
@@ -32,6 +37,7 @@ session only, with passwords in your login keyring (see firox_mounts).
 """
 
 import configparser
+import contextlib
 import os
 import subprocess
 import sys
@@ -508,20 +514,41 @@ class ConnectDialog(Gtk.Dialog):
 
 # ------------------------------------------------------------------ window --
 
+class Tab:
+    """One tab: a folder, its history, its views and its search."""
+
+    def __init__(self):
+        self.current = None
+        self.history, self.future = [], []
+        self.loading = None             # Cancellable of the folder being read
+        self.monitor = None
+        self.reload_timer = None
+        self.busy = False               # still reading the folder
+        self.searching = None           # the text of a subfolder search being shown
+        self.search_cancel = None
+        self.search_text = ""
+        self.deep_on = False
+        self.title = ""
+        self.label = None
+        self.page = None
+
+
+# What Explorer's methods see as self.X is the current tab's X
+TAB_ATTRS = ("current", "history", "future", "loading", "monitor", "reload_timer", "busy", "searching",
+             "search_cancel", "store", "filter", "icons", "details", "where_col", "stack", "empty")
+
+
 class Explorer(Gtk.ApplicationWindow):
     def __init__(self, app, location):
         super().__init__(application=app, title="Firox Explorer")
         self.set_default_size(980, 620)
         self.set_icon_name("system-file-manager")
-        self.history, self.future = [], []
-        self.current = None
+        self.page_tabs = {}             # notebook page -> Tab
+        self.tab = None                 # the tab being worked on (see in_tab)
+        self.active = None              # the tab on show
         self.settings = read_settings()
         self.show_hidden = self.flag("hidden")
-        self.loading = None
-        self.monitor = None
         self.cut_uris = set()
-        self.searching = None           # the text of a subfolder search being shown
-        self.search_cancel = None
         self.resetting_search = False
         self.view_mode = "details" if self.settings["view"] == "details" else "icons"
 
@@ -580,65 +607,11 @@ class Explorer(Gtk.ApplicationWindow):
         sscroll.add(self.side)
         paned.pack1(sscroll, False, False)
 
-        # main views on one model
-        self.store = Gtk.ListStore(str, GdkPixbuf.Pixbuf, str, bool, GObjectInt64(), GObjectInt64(),
-                                   str, str, str, bool, GdkPixbuf.Pixbuf, str, bool, str)
-        self.store.set_default_sort_func(self.sort_func)
-        self.store.set_sort_column_id(Gtk.TREE_SORTABLE_DEFAULT_SORT_COLUMN_ID, Gtk.SortType.ASCENDING)
-        self.filter = self.store.filter_new()
-        self.filter.set_visible_func(self.visible_func)
-        self.icons = Gtk.IconView(model=self.filter)
-        self.icons.set_pixbuf_column(C_PIX)
-        self.icons.set_text_column(C_NAME)
-        self.icons.set_item_width(96)
-        self.icons.set_selection_mode(Gtk.SelectionMode.MULTIPLE)
-        self.icons.connect("item-activated", lambda _v, path: self.open_paths([path]))
-        self.icons.connect("button-press-event", self.on_view_press)
-        self.icons.connect("selection-changed", lambda *_: self.update_status())
-        self.details = Gtk.TreeView(model=self.filter)
-        self.details.get_selection().set_mode(Gtk.SelectionMode.MULTIPLE)
-        self.details.set_rubber_banding(True)
-        name_col = Gtk.TreeViewColumn("Name")
-        pix = Gtk.CellRendererPixbuf()
-        name_col.pack_start(pix, False)
-        name_col.add_attribute(pix, "pixbuf", C_SMALL)
-        txt = Gtk.CellRendererText(ellipsize=Pango.EllipsizeMode.END)
-        name_col.pack_start(txt, True)
-        name_col.add_attribute(txt, "text", C_NAME)
-        name_col.set_expand(True)
-        name_col.set_resizable(True)
-        self.details.append_column(name_col)
-        for title, column in (("Size", C_SIZE_TEXT), ("Type", C_TYPE), ("Date modified", C_DATE_TEXT)):
-            c = Gtk.TreeViewColumn(title, Gtk.CellRendererText(), text=column)
-            c.set_resizable(True)
-            self.details.append_column(c)
-        # where a search result is (only shown for subfolder searches)
-        self.where_col = Gtk.TreeViewColumn("Location", Gtk.CellRendererText(
-            ellipsize=Pango.EllipsizeMode.START), text=C_WHERE)
-        self.where_col.set_resizable(True)
-        self.where_col.set_min_width(160)
-        self.where_col.set_visible(False)
-        self.details.append_column(self.where_col)
-        self.details.connect("row-activated", lambda _v, path, _c: self.open_paths([path]))
-        self.details.connect("button-press-event", self.on_view_press)
-        self.details.get_selection().connect("changed", lambda *_: self.update_status())
-        for view in (self.icons, self.details):
-            self.setup_dnd(view)
-        self.stack = Gtk.Stack()
-        for name, view in (("icons", self.icons), ("details", self.details)):
-            sc = Gtk.ScrolledWindow()
-            sc.add(view)
-            self.stack.add_named(sc, name)
-        self.empty = Gtk.Label(label="")
-        self.empty.get_style_context().add_class("dim-label")
-        overlay = Gtk.Overlay()
-        overlay.add(self.stack)
-        self.empty.set_halign(Gtk.Align.CENTER)
-        self.empty.set_valign(Gtk.Align.CENTER)
-        self.empty.set_no_show_all(True)
-        overlay.add_overlay(self.empty)
-        overlay.set_overlay_pass_through(self.empty, True)
-        paned.pack2(overlay, True, False)
+        # the folder views, one set per tab
+        self.notebook = Gtk.Notebook(scrollable=True, show_border=False)
+        self.notebook.set_show_tabs(False)
+        self.notebook.connect("switch-page", self.on_switch_page)
+        paned.pack2(self.notebook, True, False)
         paned.set_position(210)
 
         self.status = Gtk.Label(xalign=0)
@@ -661,10 +634,200 @@ class Explorer(Gtk.ApplicationWindow):
         self.toolbar.set_visible(self.flag("toolbar"))
         self.side_scroll.set_visible(self.flag("sidebar"))
         self.status.set_visible(self.flag("statusbar"))
+        self.new_tab(location)
         self.set_view(self.view_mode, save=False)
-        self.navigate(location, remember=False)
         self.fill_sidebar()
         self.refill_menus()
+
+    # ---- tabs
+    def build_tab(self):
+        """A tab's views: Icons and Details on one model, and the grey
+        message shown over them when there's nothing to show."""
+        tab = Tab()
+        tab.store = Gtk.ListStore(str, GdkPixbuf.Pixbuf, str, bool, GObjectInt64(), GObjectInt64(),
+                                   str, str, str, bool, GdkPixbuf.Pixbuf, str, bool, str)
+        tab.store.set_default_sort_func(self.sort_func)
+        tab.store.set_sort_column_id(Gtk.TREE_SORTABLE_DEFAULT_SORT_COLUMN_ID, Gtk.SortType.ASCENDING)
+        tab.filter = tab.store.filter_new()
+        tab.filter.set_visible_func(self.visible_func, tab)
+        tab.icons = Gtk.IconView(model=tab.filter)
+        tab.icons.set_pixbuf_column(C_PIX)
+        tab.icons.set_text_column(C_NAME)
+        tab.icons.set_item_width(96)
+        tab.icons.set_selection_mode(Gtk.SelectionMode.MULTIPLE)
+        tab.icons.connect("item-activated", lambda _v, path: self.open_paths([path]))
+        tab.icons.connect("button-press-event", self.on_view_press)
+        tab.icons.connect("selection-changed", lambda *_: self.update_status())
+        tab.details = Gtk.TreeView(model=tab.filter)
+        tab.details.get_selection().set_mode(Gtk.SelectionMode.MULTIPLE)
+        tab.details.set_rubber_banding(True)
+        name_col = Gtk.TreeViewColumn("Name")
+        pix = Gtk.CellRendererPixbuf()
+        name_col.pack_start(pix, False)
+        name_col.add_attribute(pix, "pixbuf", C_SMALL)
+        txt = Gtk.CellRendererText(ellipsize=Pango.EllipsizeMode.END)
+        name_col.pack_start(txt, True)
+        name_col.add_attribute(txt, "text", C_NAME)
+        name_col.set_expand(True)
+        name_col.set_resizable(True)
+        tab.details.append_column(name_col)
+        for title, column in (("Size", C_SIZE_TEXT), ("Type", C_TYPE), ("Date modified", C_DATE_TEXT)):
+            c = Gtk.TreeViewColumn(title, Gtk.CellRendererText(), text=column)
+            c.set_resizable(True)
+            tab.details.append_column(c)
+        # where a search result is (only shown for subfolder searches)
+        tab.where_col = Gtk.TreeViewColumn("Location", Gtk.CellRendererText(
+            ellipsize=Pango.EllipsizeMode.START), text=C_WHERE)
+        tab.where_col.set_resizable(True)
+        tab.where_col.set_min_width(160)
+        tab.where_col.set_visible(False)
+        tab.details.append_column(tab.where_col)
+        tab.details.connect("row-activated", lambda _v, path, _c: self.open_paths([path]))
+        tab.details.connect("button-press-event", self.on_view_press)
+        tab.details.get_selection().connect("changed", lambda *_: self.update_status())
+        for view in (tab.icons, tab.details):
+            self.setup_dnd(view)
+        tab.stack = Gtk.Stack()
+        for name, view in (("icons", tab.icons), ("details", tab.details)):
+            sc = Gtk.ScrolledWindow()
+            sc.add(view)
+            tab.stack.add_named(sc, name)
+        tab.empty = Gtk.Label(label="")
+        tab.empty.get_style_context().add_class("dim-label")
+        overlay = tab.page = Gtk.Overlay()
+        overlay.add(tab.stack)
+        tab.empty.set_halign(Gtk.Align.CENTER)
+        tab.empty.set_valign(Gtk.Align.CENTER)
+        tab.empty.set_no_show_all(True)
+        overlay.add_overlay(tab.empty)
+        overlay.set_overlay_pass_through(tab.empty, True)
+        return tab
+
+    def ui(self):
+        """True when the tab being worked on is the one on show: only then
+        do the address bar, title and status bar follow it."""
+        return self.tab is self.active
+
+    @contextlib.contextmanager
+    def in_tab(self, tab):
+        """Work on `tab` (for callbacks that finish after you switched tabs)."""
+        prev = self.tab
+        self.tab = tab
+        try:
+            yield
+        finally:
+            self.tab = prev if prev in self.page_tabs.values() else self.active
+
+    def tabs(self):
+        return [self.page_tabs[self.notebook.get_nth_page(i)] for i in range(self.notebook.get_n_pages())]
+
+    def all_views(self):
+        return [v for t in self.page_tabs.values() for v in (t.icons, t.details)]
+
+    def new_tab(self, location=None, switch=True):
+        tab = self.build_tab()
+        tab.label = Gtk.Label(label="…", ellipsize=Pango.EllipsizeMode.END, max_width_chars=24, width_chars=12)
+        close = Gtk.Button.new_from_icon_name("window-close-symbolic", Gtk.IconSize.MENU)
+        close.set_relief(Gtk.ReliefStyle.NONE)
+        close.set_focus_on_click(False)
+        close.set_tooltip_text("Close tab (Ctrl+W)")
+        close.connect("clicked", lambda *_: self.close_tab(tab))
+        box = Gtk.Box(spacing=4)
+        box.pack_start(Gtk.Image.new_from_icon_name("folder", Gtk.IconSize.MENU), False, False, 0)
+        box.pack_start(tab.label, True, True, 0)
+        box.pack_start(close, False, False, 0)
+        handle = Gtk.EventBox(visible_window=False)
+        handle.add(box)
+        # middle-click closes; files dropped on a tab go into its folder
+        handle.connect("button-press-event", lambda _w, ev: ev.button == 2 and (self.close_tab(tab) or True))
+        handle.drag_dest_set(Gtk.DestDefaults.ALL, [Gtk.TargetEntry.new("text/uri-list", 0, 0)],
+                             Gdk.DragAction.COPY | Gdk.DragAction.MOVE)
+        handle.connect("drag-data-received", lambda _w, ctx, _x, _y, data, _i, t: self.drop_on_tab(tab, ctx, data, t))
+        handle.show_all()
+        tab.page.show_all()
+        self.page_tabs[tab.page] = tab
+        n = self.notebook.append_page(tab.page, handle)
+        self.notebook.set_tab_reorderable(tab.page, True)
+        self.notebook.set_show_tabs(self.notebook.get_n_pages() > 1)
+        tab.stack.set_visible_child_name(self.view_mode)
+        start = location or (self.active.current if self.active is not None and self.active.current else HOME)
+        with self.in_tab(tab):
+            self.navigate(start, remember=False)
+        if switch:
+            self.notebook.set_current_page(n)
+        return tab
+
+    def close_tab(self, tab=None):
+        tab = tab or self.active
+        if tab is None:
+            return
+        if self.notebook.get_n_pages() <= 1:
+            self.close()
+            return
+        for c in (tab.loading, tab.search_cancel):
+            if c is not None:
+                c.cancel()
+        if tab.monitor is not None:
+            tab.monitor.cancel()
+        if tab.reload_timer:
+            GLib.source_remove(tab.reload_timer)
+            tab.reload_timer = None
+        self.notebook.remove_page(self.notebook.page_num(tab.page))
+        del self.page_tabs[tab.page]
+        self.notebook.set_show_tabs(self.notebook.get_n_pages() > 1)
+
+    def switch_tab(self, step=None, index=None):
+        n = self.notebook.get_n_pages()
+        if index is None:
+            index = (self.notebook.get_current_page() + step) % n
+        if 0 <= index < n:
+            self.notebook.set_current_page(index)
+
+    def on_switch_page(self, _nb, page, _n):
+        tab = self.page_tabs.get(page)
+        if tab is None:
+            return
+        self.tab = self.active = tab
+        self.side.get_selection().unselect_all()       # the sidebar showed the last tab's place
+        self.sync_ui()
+
+    def sync_ui(self):
+        """Make the window (address bar, title, buttons, search box, status
+        bar) show the tab on show."""
+        tab = self.active
+        if tab is None or tab.current is None:
+            return
+        path = local_path(tab.current)
+        self.address.set_text(path if path else urllib.parse.unquote(tab.current.get_uri()))
+        self.set_title(f"{tab.title} - Firox Explorer")
+        self.back.set_sensitive(bool(tab.history))
+        self.fwd.set_sensitive(bool(tab.future))
+        self.up.set_sensitive(tab.current.get_parent() is not None)
+        tab.stack.set_visible_child_name(self.view_mode)
+        self.resetting_search = True
+        self.search.set_text(tab.search_text)
+        self.deep.set_active(tab.deep_on)
+        self.resetting_search = False
+        self.search.set_placeholder_text("Search here and in subfolders" if tab.deep_on else "Search this folder")
+        if tab.busy:
+            self.status.set_text("Loading…")
+        elif tab.search_cancel is not None:
+            self.status.set_text("Searching…")
+        else:
+            self.update_status()
+
+    def drop_on_tab(self, tab, ctx, data, time_):
+        uris = [u for u in (data.get_uris() or []) if u]
+        if not uris or tab.current is None:
+            Gtk.drag_finish(ctx, False, False, time_)
+            return
+        src = Gtk.drag_get_source_widget(ctx)
+        if src in (tab.icons, tab.details):
+            Gtk.drag_finish(ctx, False, False, time_)
+            return                          # its own folder
+        move = ctx.get_selected_action() == Gdk.DragAction.MOVE or src in self.all_views()
+        self.transfer(uris, tab.current, move=move)
+        Gtk.drag_finish(ctx, True, False, time_)
 
     # ---- small helpers
     @staticmethod
@@ -767,6 +930,9 @@ class Explorer(Gtk.ApplicationWindow):
             return False
         it = self.side_store.get_iter(hit[0])
         kind, payload = self.side_store[it][3], self.side_store[it][2]
+        if event.type == Gdk.EventType.BUTTON_PRESS and event.button == 2 and kind in ("place", "bookmark"):
+            self.new_tab(payload, switch=False)
+            return True
         if event.type == Gdk.EventType.BUTTON_PRESS and event.button == 1 and kind in (
                 "volume", "mount", "conn", "add"):
             view.get_selection().select_path(hit[0])
@@ -796,6 +962,7 @@ class Explorer(Gtk.ApplicationWindow):
                     self.menu_item(menu, "_Mount", lambda: self.open_volume(payload))
             elif kind == "bookmark":
                 self.menu_item(menu, "_Open", lambda: self.navigate(payload))
+                self.menu_item(menu, "Open in New _Tab", lambda: self.new_tab(payload))
                 self.menu_item(menu, "Open in New _Window", lambda: spawn([sys.argv[0], payload]))
                 menu.append(Gtk.SeparatorMenuItem())
                 self.menu_item(menu, "Re_name…", lambda: self.rename_bookmark(payload))
@@ -1032,8 +1199,8 @@ class Explorer(Gtk.ApplicationWindow):
         self.searching = None
         self.where_col.set_visible(False)
         gfile = self.current
+        tab = self.tab
         path = local_path(gfile)
-        self.address.set_text(path if path else urllib.parse.unquote(gfile.get_uri()))
         try:
             info = gfile.query_info("standard::display-name", Gio.FileQueryInfoFlags.NONE, None)
             title = info.get_display_name()
@@ -1041,15 +1208,15 @@ class Explorer(Gtk.ApplicationWindow):
             title = gfile.get_basename() or gfile.get_uri()
         if gfile.get_uri() == "trash:///":
             title = "Recycle Bin"
-        self.set_title(f"{title} - Firox Explorer")
-        self.back.set_sensitive(bool(self.history))
-        self.fwd.set_sensitive(bool(self.future))
-        self.up.set_sensitive(gfile.get_parent() is not None)
-        self.store.clear()
+        tab.title = title
+        tab.label.set_text(title)
+        tab.label.get_parent().get_parent().set_tooltip_text(path or urllib.parse.unquote(gfile.get_uri()))
         if not keep_search:
-            self.resetting_search = True
-            self.search.set_text("")
-            self.resetting_search = False
+            tab.search_text = ""
+        tab.busy = True
+        if self.ui():
+            self.sync_ui()
+        self.store.clear()
         self.empty.hide()
         if self.monitor is not None:
             self.monitor.cancel()
@@ -1058,14 +1225,14 @@ class Explorer(Gtk.ApplicationWindow):
         if self.loading is not None:
             self.loading.cancel()
         self.loading = cancel
-        self.status.set_text("Loading…")
 
         def got_enum(f, res):
             try:
                 enum = f.enumerate_children_finish(res)
             except GLib.Error as err:
                 if not err.matches(Gio.io_error_quark(), Gio.IOErrorEnum.CANCELLED):
-                    self.failed(f, err)
+                    with self.in_tab(tab):
+                        self.failed(f, err)
                 return
             enum.next_files_async(200, GLib.PRIORITY_DEFAULT, cancel, got_batch)
 
@@ -1076,34 +1243,43 @@ class Explorer(Gtk.ApplicationWindow):
                 return
             if cancel.is_cancelled():
                 return
-            for info in infos:
-                self.add_row(gfile, info)
+            with self.in_tab(tab):
+                for info in infos:
+                    self.add_row(gfile, info)
+                if not infos:
+                    self.loaded()
             if infos:
                 enum.next_files_async(200, GLib.PRIORITY_DEFAULT, cancel, got_batch)
             else:
                 enum.close_async(GLib.PRIORITY_DEFAULT, None, None, None)
-                self.loaded()
         gfile.enumerate_children_async(ATTRS, Gio.FileQueryInfoFlags.NONE, GLib.PRIORITY_DEFAULT, cancel, got_enum)
 
     def failed(self, f, err):
         if err.matches(Gio.io_error_quark(), Gio.IOErrorEnum.NOT_MOUNTED):
             # e.g. smb://server/share typed in the address bar: mount it
             op = Gtk.MountOperation(parent=self)
+            tab = self.tab
 
             def mounted(gf, res):
                 try:
                     gf.mount_enclosing_volume_finish(res)
-                    self.load()
+                    with self.in_tab(tab):
+                        self.load()
                 except GLib.Error as e:
                     if e.matches(Gio.io_error_quark(), Gio.IOErrorEnum.ALREADY_MOUNTED):
-                        self.load()
+                        with self.in_tab(tab):
+                            self.load()
                         return
-                    self.status.set_text("")
+                    tab.busy = False
+                    if tab is self.active:
+                        self.status.set_text("")
                     if not e.matches(Gio.io_error_quark(), Gio.IOErrorEnum.FAILED_HANDLED):
                         error_box(self, "Couldn't open the location", e.message)
             f.mount_enclosing_volume(Gio.MountMountFlags.NONE, op, None, mounted)
             return
-        self.status.set_text("")
+        self.busy = False
+        if self.ui():
+            self.status.set_text("")
         self.empty.set_text(f"Can't open this folder: {err.message}")
         self.empty.show()
 
@@ -1134,10 +1310,11 @@ class Explorer(Gtk.ApplicationWindow):
                            hidden, ICONS.get(gicon, ICON_SIZE_SMALL), orig, mountable, where])
 
     def loaded(self):
+        self.busy = False
         try:
             self.monitor = self.current.monitor_directory(Gio.FileMonitorFlags.WATCH_MOVES, None)
             self.reload_timer = None
-            self.monitor.connect("changed", self.on_changed)
+            self.monitor.connect("changed", self.on_changed, self.tab)
         except GLib.Error:
             self.monitor = None
         self.update_empty()
@@ -1148,7 +1325,7 @@ class Explorer(Gtk.ApplicationWindow):
         which say so themselves)."""
         if self.searching is not None:
             return
-        q = self.search.get_text().strip()
+        q = self.tab.search_text.strip()
         if len(self.filter) > 0:
             self.empty.hide()
             return
@@ -1161,30 +1338,41 @@ class Explorer(Gtk.ApplicationWindow):
             self.empty.set_text("Only hidden files here (Ctrl+H shows them).")
         self.empty.show()
 
-    def on_changed(self, *_):
-        if getattr(self, "reload_timer", None):
-            GLib.source_remove(self.reload_timer)
+    def on_changed(self, *args):
+        tab = args[-1]
+        if tab not in self.page_tabs.values():
+            return
+        if tab.reload_timer:
+            GLib.source_remove(tab.reload_timer)
 
         def again():
-            self.reload_timer = None
-            selected = {self.filter[p][C_URI] for p in self.selected_paths()}
-            self.load_keep(selected)
+            tab.reload_timer = None
+            if tab not in self.page_tabs.values():
+                return False
+            with self.in_tab(tab):
+                selected = {self.filter[p][C_URI] for p in self.selected_paths()}
+                self.load_keep(selected)
             return False
-        self.reload_timer = GLib.timeout_add(300, again)
+        tab.reload_timer = GLib.timeout_add(300, again)
 
     def load_keep(self, selected):
+        """Reload this folder (it changed), keeping the selection, the
+        history and what's typed in the search box."""
+        tab = self.tab
         hist, fut = list(self.history), list(self.future)
-        self.load()
+        self.load(keep_search=True)
         self.history, self.future = hist, fut
 
         def reselect():
-            if self.loading is not None and not self.loading.is_cancelled() and self.status.get_text() == "Loading…":
+            if tab not in self.page_tabs.values():
+                return False
+            if tab.busy:
                 return True
-            for i, row in enumerate(self.filter):
+            for i, row in enumerate(tab.filter):
                 if row[C_URI] in selected:
                     path = Gtk.TreePath.new_from_indices([i])
-                    (self.icons.select_path if self.view_mode == "icons" else
-                     self.details.get_selection().select_path)(path)
+                    (tab.icons.select_path if self.view_mode == "icons" else
+                     tab.details.get_selection().select_path)(path)
             return False
         GLib.timeout_add(100, reselect)
 
@@ -1214,7 +1402,8 @@ class Explorer(Gtk.ApplicationWindow):
         write_settings(self.settings)
 
     def resort(self):
-        self.store.set_default_sort_func(self.sort_func)     # sorts again
+        for tab in self.page_tabs.values():
+            tab.store.set_default_sort_func(self.sort_func)  # sorts again
 
     def set_sort(self, key=None, descending=None, folders_first=None):
         if key is not None:
@@ -1229,19 +1418,21 @@ class Explorer(Gtk.ApplicationWindow):
         widget.set_visible(on)
         self.set_setting(key, on)
 
-    def visible_func(self, model, it, _data=None):
+    def visible_func(self, model, it, tab):
         if model[it][C_HIDDEN] and not self.show_hidden:
             return False
-        if self.searching is not None:
+        if tab.searching is not None:
             return True                       # subfolder results: all matches
-        q = self.search.get_text().strip().casefold() if hasattr(self, "search") else ""
+        q = tab.search_text.strip().casefold()
         return not q or q in (model[it][C_NAME] or "").casefold()
 
     # ---- searching
     def on_search_changed(self):
         if self.resetting_search or self.current is None:
             return
-        q = self.search.get_text().strip()
+        self.tab.search_text = self.search.get_text()
+        self.tab.deep_on = self.deep.get_active()
+        q = self.tab.search_text.strip()
         self.search.set_placeholder_text("Search here and in subfolders" if self.deep.get_active()
                                          else "Search this folder")
         if self.deep.get_active() and len(q) >= 2:
@@ -1250,7 +1441,7 @@ class Explorer(Gtk.ApplicationWindow):
             self.load(keep_search=True)        # back to the folder, filtered as you type
         else:
             self.filter.refilter()
-            if self.loading is None or self.status.get_text() != "Loading…":
+            if not self.busy:
                 self.update_empty()
             self.update_status()
 
@@ -1270,6 +1461,7 @@ class Explorer(Gtk.ApplicationWindow):
             self.monitor.cancel()
             self.monitor = None
         cancel = Gio.Cancellable()
+        tab = self.tab
         self.search_cancel = cancel
         self.searching = query
         self.store.clear()
@@ -1278,9 +1470,12 @@ class Explorer(Gtk.ApplicationWindow):
         root = self.current
         root_path = local_path(root)
         place = root_path or urllib.parse.unquote(root.get_uri())
-        self.set_title(f"Search results for “{query}” in {os.path.basename(place.rstrip('/')) or place}"
-                       " - Firox Explorer")
-        self.status.set_text("Searching…")
+        tab.title = f"Search: {query}"
+        tab.label.set_text(tab.title)
+        if self.ui():
+            self.set_title(f"Search results for “{query}” in {os.path.basename(place.rstrip('/')) or place}"
+                           " - Firox Explorer")
+            self.status.set_text("Searching…")
         needle = query.casefold()
         hidden_ok = self.show_hidden
         found = {"n": 0}
@@ -1293,8 +1488,13 @@ class Explorer(Gtk.ApplicationWindow):
             return p or urllib.parse.unquote(folder.get_uri())
 
         def flush(batch, finished=False, capped=False):
-            if cancel.is_cancelled():
+            if cancel.is_cancelled() or tab not in self.page_tabs.values():
                 return False
+            with self.in_tab(tab):
+                flush_here(batch, finished, capped)
+            return False
+
+        def flush_here(batch, finished, capped):
             for folder, info in batch:
                 self.add_row(folder, info, where_of(folder) or "(this folder)")
             if finished:
@@ -1303,11 +1503,10 @@ class Explorer(Gtk.ApplicationWindow):
                     self.empty.set_text(f"Nothing called “{query}” here or in the folders inside.")
                     self.empty.show()
                 self.update_status()
-                if capped:
+                if capped and self.ui():
                     self.status.set_text(self.status.get_text() + f"    —    stopped at {SEARCH_LIMIT} results")
-            else:
+            elif self.ui():
                 self.status.set_text(f"Searching…  {found['n']} found")
-            return False
 
         def walk():
             stack, batch = [root], []
@@ -1349,6 +1548,8 @@ class Explorer(Gtk.ApplicationWindow):
         threading.Thread(target=walk, daemon=True).start()
 
     def update_status(self):
+        if not self.ui() or self.tab is None:
+            return
         n = len(self.filter)
         sel = len(self.selected_paths())
         text = f"{n} item{'s' if n != 1 else ''}" if self.searching is None else \
@@ -1406,7 +1607,7 @@ class Explorer(Gtk.ApplicationWindow):
                 if len(rows) == 1:
                     self.navigate(gfile)
                 else:
-                    spawn([sys.argv[0], gfile.get_uri()])
+                    self.new_tab(gfile.get_uri(), switch=False)     # several folders: a tab each
                 continue
             self.open_file(gfile, row[C_NAME])
 
@@ -1716,6 +1917,7 @@ class Explorer(Gtk.ApplicationWindow):
         one = rows[0] if len(rows) == 1 else None
         trash = self.in_trash()
         writable = not trash and self.current is not None and local_path(self.current) is not None
+        self.menu_item(menu, "New _Tab", lambda: self.new_tab(), accel="<Control>t")
         self.menu_item(menu, "New _Window", lambda: spawn([sys.argv[0], self.current.get_uri()]),
                        accel="<Control>n")
         self.menu_item(menu, "New _Folder…", self.new_folder, writable, accel="<Control><Shift>n")
@@ -1724,6 +1926,8 @@ class Explorer(Gtk.ApplicationWindow):
         self.menu_item(menu, "_Open", lambda: self.open_paths(self.selected_paths()), bool(rows), accel="Return")
         self.menu_item(menu, "Open _With…", lambda: self.open_with(Gio.File.new_for_uri(one[C_URI])),
                        one is not None and not one[C_DIR])
+        self.menu_item(menu, "Open in New Tab", lambda: [self.new_tab(r[C_URI]) for r in rows],
+                       bool(rows) and all(r[C_DIR] for r in rows))
         self.menu_item(menu, "Open in New Window", lambda: [spawn([sys.argv[0], r[C_URI]]) for r in rows],
                        bool(rows) and all(r[C_DIR] for r in rows))
         self.menu_item(menu, "Open Ter_minal Here", self.terminal_here, local_path(self.current) is not None
@@ -1740,7 +1944,8 @@ class Explorer(Gtk.ApplicationWindow):
         menu.append(Gtk.SeparatorMenuItem())
         self.menu_item(menu, "P_roperties", self.properties, bool(rows), accel="<Alt>Return")
         menu.append(Gtk.SeparatorMenuItem())
-        self.menu_item(menu, "_Close", self.close, accel="<Control>w")
+        self.menu_item(menu, "_Close Tab", self.close_tab, accel="<Control>w")
+        self.menu_item(menu, "Close Window", self.close, accel="<Control><Shift>w")
 
     def fill_edit(self, menu):
         rows = self.selected_rows() if self.current is not None else []
@@ -2084,7 +2289,9 @@ class Explorer(Gtk.ApplicationWindow):
                              ("Ctrl+Shift+C", "Copy location")]),
                 ("Window", [("Ctrl+1 / Ctrl+2", "Icons / Details view"), ("Ctrl+H", "Show hidden files"),
                             ("F9", "Sidebar"), ("Ctrl+D", "Bookmark this folder"), ("Ctrl+B", "Edit bookmarks"),
-                            ("Ctrl+N", "New window"), ("Ctrl+W", "Close window"), ("F10", "Menu bar"),
+                            ("Ctrl+T", "New tab"), ("Ctrl+W", "Close tab"),
+                            ("Ctrl+Tab / Ctrl+Shift+Tab", "Next / previous tab"), ("Alt+1…9", "Go to tab"),
+                            ("Ctrl+N", "New window"), ("Ctrl+Shift+W", "Close window"), ("F10", "Menu bar"),
                             ("F1", "Help")])]
         dlg = Gtk.Dialog(title="Keyboard Shortcuts", transient_for=self, modal=True)
         esc_closes(dlg)
@@ -2123,6 +2330,16 @@ class Explorer(Gtk.ApplicationWindow):
         dlg.destroy()
 
     def on_view_press(self, view, event):
+        if event.type == Gdk.EventType.BUTTON_PRESS and event.button == 2:
+            if view is self.icons:
+                path = self.icons.get_path_at_pos(int(event.x), int(event.y))
+            else:
+                hit = self.details.get_path_at_pos(int(event.x), int(event.y))
+                path = hit[0] if hit else None
+            if path is not None and self.filter[path][C_DIR]:
+                self.new_tab(self.filter[path][C_URI], switch=False)
+                return True
+            return False
         if event.type != Gdk.EventType.BUTTON_PRESS or event.button != 3:
             return False
         if view is self.icons:
@@ -2146,6 +2363,9 @@ class Explorer(Gtk.ApplicationWindow):
         if rows:
             one = rows[0] if len(rows) == 1 else None
             self.menu_item(menu, "_Open", lambda: self.open_paths(self.selected_paths()))
+            if all(r[C_DIR] for r in rows):
+                self.menu_item(menu, "Open in New _Tab", lambda: [self.new_tab(r[C_URI], switch=False)
+                                                                  for r in rows])
             if one is not None and not one[C_DIR]:
                 self.menu_item(menu, "Open _With…", lambda: self.open_with(Gio.File.new_for_uri(one[C_URI])))
             menu.append(Gtk.SeparatorMenuItem())
@@ -2181,7 +2401,8 @@ class Explorer(Gtk.ApplicationWindow):
     def toggle_hidden(self):
         self.show_hidden = not self.show_hidden
         self.set_setting("hidden", self.show_hidden)
-        self.filter.refilter()
+        for tab in self.page_tabs.values():
+            tab.filter.refilter()
         self.update_empty()
         self.update_status()
 
@@ -2213,8 +2434,20 @@ class Explorer(Gtk.ApplicationWindow):
             self.toggle_hidden()
         elif mods == ctrl and key in (Gdk.KEY_n, Gdk.KEY_N):
             spawn([sys.argv[0], self.current.get_uri()])
-        elif mods == ctrl and key in (Gdk.KEY_w, Gdk.KEY_W, Gdk.KEY_q, Gdk.KEY_Q):
+        elif mods == ctrl and key in (Gdk.KEY_t, Gdk.KEY_T):
+            self.new_tab()
+        elif mods == ctrl and key in (Gdk.KEY_w, Gdk.KEY_W):
+            self.close_tab()
+        elif (mods == ctrl | Gdk.ModifierType.SHIFT_MASK and key in (Gdk.KEY_w, Gdk.KEY_W)) or (
+                mods == ctrl and key in (Gdk.KEY_q, Gdk.KEY_Q)):
             self.close()
+        elif (mods == ctrl and key == Gdk.KEY_Tab) or (mods == ctrl and key == Gdk.KEY_Page_Down):
+            self.switch_tab(1)
+        elif (mods == ctrl | Gdk.ModifierType.SHIFT_MASK and key in (Gdk.KEY_ISO_Left_Tab, Gdk.KEY_Tab)) or (
+                mods == ctrl and key == Gdk.KEY_Page_Up):
+            self.switch_tab(-1)
+        elif mods == alt and Gdk.KEY_1 <= key <= Gdk.KEY_9:
+            self.switch_tab(index=key - Gdk.KEY_1)
         elif mods == ctrl and key in (Gdk.KEY_1, Gdk.KEY_KP_1):
             self.set_view("icons")
         elif mods == ctrl and key in (Gdk.KEY_2, Gdk.KEY_KP_2):
@@ -2263,12 +2496,8 @@ class Explorer(Gtk.ApplicationWindow):
     def setup_dnd(self, view):
         targets = [Gtk.TargetEntry.new("text/uri-list", 0, 0)]
         actions = Gdk.DragAction.COPY | Gdk.DragAction.MOVE | Gdk.DragAction.LINK
-        if view is self.icons:
-            view.enable_model_drag_source(Gdk.ModifierType.BUTTON1_MASK, targets, actions)
-            view.enable_model_drag_dest(targets, actions)
-        else:
-            view.enable_model_drag_source(Gdk.ModifierType.BUTTON1_MASK, targets, actions)
-            view.enable_model_drag_dest(targets, actions)
+        view.enable_model_drag_source(Gdk.ModifierType.BUTTON1_MASK, targets, actions)
+        view.enable_model_drag_dest(targets, actions)
         view.connect("drag-data-get", self.on_drag_get)
         view.connect("drag-data-received", self.on_drop)
 
@@ -2286,13 +2515,18 @@ class Explorer(Gtk.ApplicationWindow):
             path = hit[0] if hit else None
         if path is not None and self.filter[path][C_DIR] and self.filter[path][C_URI] not in uris:
             target = Gio.File.new_for_uri(self.filter[path][C_URI])
-        internal = Gtk.drag_get_source_widget(ctx) in (self.icons, self.details)
-        if internal and target is None:
+        src = Gtk.drag_get_source_widget(ctx)
+        if src in (self.icons, self.details) and target is None:
             Gtk.drag_finish(ctx, False, False, time_)
             return                          # dropped back in the same folder
-        move = ctx.get_selected_action() == Gdk.DragAction.MOVE or internal
+        move = ctx.get_selected_action() == Gdk.DragAction.MOVE or src in self.all_views()
         self.transfer(uris, target, move=move)
         Gtk.drag_finish(ctx, True, False, time_)
+
+
+for _name in TAB_ATTRS:
+    setattr(Explorer, _name, property(lambda self, n=_name: getattr(self.tab, n),
+                                      lambda self, v, n=_name: setattr(self.tab, n, v)))
 
 
 def GObjectInt64():

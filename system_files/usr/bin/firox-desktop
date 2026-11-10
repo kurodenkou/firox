@@ -298,6 +298,12 @@ class DesktopView(Gtk.DrawingArea):
     def item_at(self, x, y):
         if not self.icons:
             return None
+        top = self.expanded_item()
+        if top is not None:
+            (_ir, (lx, ly, lw, _lh)) = self.item_rects(top)
+            _ink, logical = self.label_layout(top, full=True).get_pixel_extents()
+            if lx <= x <= lx + lw and ly <= y <= ly + logical.height + 2:
+                return top
         for item in self.app.items:
             if item.cell is None:
                 continue
@@ -325,6 +331,8 @@ class DesktopView(Gtk.DrawingArea):
             return False
         fg = firox_wallpaper.rgba(self.app.settings.get("FgColor"), "#ffffff")
         shadow = firox_wallpaper.rgba(self.app.settings.get("ShadowColor"), "#000000")
+        expanded = self.expanded_item()
+        later = None
         for item in self.app.items:
             if item.cell is None:
                 continue
@@ -345,23 +353,13 @@ class DesktopView(Gtk.DrawingArea):
                 cr.paint_with_alpha(0.5 if dim else 1.0)
             if item.id == self.app.renaming:
                 continue                    # the rename box is showing the name
-            layout = self.label_layout(item, full=selected and len(self.app.selected) == 1)
-            _ink, logical = layout.get_pixel_extents()
-            tx = self.cell_rect(item.cell)[0] + 5        # the layout centres each line
-            if selected:
-                cr.set_source_rgba(0.19, 0.42, 0.86, 0.95)
-                self.rounded(cr, lx, ly, lw, logical.height + 2, 3)
-                cr.fill()
-                cr.set_source_rgb(1, 1, 1)
-                cr.move_to(tx, ly + 1)
-                PangoCairo.show_layout(cr, layout)
-            else:
-                cr.set_source_rgba(shadow.red, shadow.green, shadow.blue, 0.85)
-                cr.move_to(tx + 1, ly + 2)
-                PangoCairo.show_layout(cr, layout)
-                cr.set_source_rgba(fg.red, fg.green, fg.blue, 0.5 if dim else 1.0)
-                cr.move_to(tx, ly + 1)
-                PangoCairo.show_layout(cr, layout)
+            if item is expanded:
+                later = (item, lx, ly, lw, dim)          # its whole name goes over the icons below
+                continue
+            self.draw_label(cr, item, lx, ly, lw, selected, dim, fg, shadow)
+        if later is not None:
+            item, lx, ly, lw, dim = later
+            self.draw_label(cr, item, lx, ly, lw, True, dim, fg, shadow, full=True)
         if self.band:
             x0, y0, x1, y1 = self.band
             cr.rectangle(min(x0, x1) + 0.5, min(y0, y1) + 0.5, abs(x1 - x0), abs(y1 - y0))
@@ -371,6 +369,37 @@ class DesktopView(Gtk.DrawingArea):
             cr.set_line_width(1)
             cr.stroke()
         return False
+
+    def expanded_item(self):
+        """The one selected icon, whose whole name is shown (not cut short)."""
+        if len(self.app.selected) != 1:
+            return None
+        for item in self.app.items:
+            if item.id in self.app.selected and item.cell is not None and item.id != self.app.renaming:
+                return item
+        return None
+
+    def draw_label(self, cr, item, lx, ly, lw, selected, dim, fg, shadow, full=False):
+        layout = self.label_layout(item, full=full)
+        _ink, logical = layout.get_pixel_extents()
+        tx = self.cell_rect(item.cell)[0] + 5        # the layout centres each line
+        if selected:
+            if full:
+                lw = max(lw, min(CELL_W - 4, logical.width + 8))
+                lx = self.cell_rect(item.cell)[0] + (CELL_W - lw) / 2
+            cr.set_source_rgba(0.19, 0.42, 0.86, 0.95)
+            self.rounded(cr, lx, ly, lw, logical.height + 2, 3)
+            cr.fill()
+            cr.set_source_rgb(1, 1, 1)
+            cr.move_to(tx, ly + 1)
+            PangoCairo.show_layout(cr, layout)
+        else:
+            cr.set_source_rgba(shadow.red, shadow.green, shadow.blue, 0.85)
+            cr.move_to(tx + 1, ly + 2)
+            PangoCairo.show_layout(cr, layout)
+            cr.set_source_rgba(fg.red, fg.green, fg.blue, 0.5 if dim else 1.0)
+            cr.move_to(tx, ly + 1)
+            PangoCairo.show_layout(cr, layout)
 
     @staticmethod
     def rounded(cr, x, y, w, h, r):
