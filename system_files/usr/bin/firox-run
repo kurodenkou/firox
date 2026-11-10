@@ -67,6 +67,8 @@ ALIASES = {
     "msconfig": [["firox-startup"]],
     "snippingtool": [["firox-open", "screenshot-region"]],
     "winver": [["firox-control-panel", "system"]],
+    "msinfo32": [["firox-sysinfo"]],
+    "dxdiag": [["firox-sysinfo", "graphics"]],
     "iexplore": "browser",
     "msedge": "browser",
     "chrome": "browser",

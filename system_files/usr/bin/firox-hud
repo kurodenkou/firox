@@ -1,0 +1,665 @@
+#!/usr/bin/python3
+"""
+firox-hud: Firox Gaming HUD. Frame rate, frame times, GPU and CPU load,
+temperatures and more over your games, in a Firox style.
+
+    firox-hud                  the settings window
+    firox-hud run CMD [ARGS]   run a game with the HUD (Steam launch
+                               options: firox-hud run %command%)
+    firox-hud try              open a spinning cube with the HUD on it
+    firox-hud apply            write the HUD settings again (after an update)
+
+The HUD itself is MangoHud: it runs inside the game's Vulkan or OpenGL, so
+it measures real frame times. Firox Gaming HUD gives it a look (three
+styles: Minimal, Bar and Panel; position, size, opacity, colours that
+change with the numbers) and turns it on:
+- for Flatpak game launchers (Steam, Lutris, Heroic, Bottles, Faugus,
+  Prism Launcher): `flatpak override --user --env=MANGOHUD=1
+  --filesystem=xdg-config/MangoHud:ro APP`, plus the MangoHud extension
+  (org.freedesktop.Platform.VulkanLayer.MangoHud) for the launcher's
+  runtime version;
+- for anything else: `firox-hud run …` (MangoHud's own `mangohud` wrapper,
+  which also covers OpenGL games).
+
+Its settings are in ~/.config/firox/hud.conf; the MangoHud configuration it
+writes is ~/.config/MangoHud/MangoHud.conf (a MangoHud.conf of your own is
+kept as MangoHud.conf.before-firox the first time). In a game, Right
+Shift+F12 shows or hides the HUD and Left Shift+F1 turns the frame-rate
+limit on and off.
+"""
+
+import configparser
+import os
+import shutil
+import subprocess
+import sys
+import threading
+
+CFG = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+SETTINGS = os.path.join(CFG, "firox", "hud.conf")
+MANGO_DIR = os.path.join(CFG, "MangoHud")
+MANGO_CONF = os.path.join(MANGO_DIR, "MangoHud.conf")
+MANGO_FONT = os.path.join(MANGO_DIR, "firox-hud.ttf")
+MARK = "# Firox Gaming HUD"
+FONTS = ["/usr/share/fonts/google-noto/NotoSans-Medium.ttf", "/usr/share/fonts/google-noto/NotoSans-Regular.ttf",
+         "/usr/share/fonts/open-sans/OpenSans-Semibold.ttf", "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf"]
+
+STYLES = [("minimal", "Minimal", "Just the frame rate and frame time, in a small pill"),
+          ("bar", "Bar", "One line across the screen: frame rate, GPU, CPU and memory"),
+          ("panel", "Panel", "Everything, with a frame-time graph")]
+POSITIONS = [("top-left", "Top left"), ("top-center", "Top centre"), ("top-right", "Top right"),
+             ("bottom-left", "Bottom left"), ("bottom-center", "Bottom centre"), ("bottom-right", "Bottom right")]
+SIZES = [("small", "Small", 15), ("medium", "Medium", 19), ("large", "Large", 25)]
+# what can be shown (Bar and Panel): key, label, MangoHud options
+SHOW = [("frametime_graph", "Frame-time graph", ["frame_timing"]),
+        ("gpu", "GPU load", ["gpu_stats"]),
+        ("cpu", "CPU load", ["cpu_stats"]),
+        ("temps", "Temperatures", ["gpu_temp", "cpu_temp"]),
+        ("clocks", "Clock speeds and power", ["gpu_core_clock", "gpu_power", "cpu_mhz", "cpu_power"]),
+        ("memory", "Memory (video and system)", ["vram", "ram"]),
+        ("battery", "Battery", ["battery"]),
+        ("time", "Time of day", ["time"]),
+        ("info", "Game details (engine, Wine/Proton, driver, resolution)",
+         ["engine_version", "wine", "vulkan_driver", "resolution", "gamemode"])]
+DEFAULTS = {"style": "bar", "position": "top-left", "size": "medium", "opacity": "0.55", "fps_limit": "0",
+            "frametime_graph": "true", "gpu": "true", "cpu": "true", "temps": "true", "clocks": "false",
+            "memory": "true", "battery": "false", "time": "false", "info": "false"}
+LAUNCHERS = [("com.valvesoftware.Steam", "Steam"), ("net.lutris.Lutris", "Lutris"),
+             ("com.heroicgameslauncher.hgl", "Heroic Games Launcher"), ("com.usebottles.bottles", "Bottles"),
+             ("io.github.Faugus.faugus-launcher", "Faugus Launcher"),
+             ("org.prismlauncher.PrismLauncher", "Prism Launcher (Minecraft)")]
+EXTENSION = "org.freedesktop.Platform.VulkanLayer.MangoHud"
+# colours: a calm dark glass panel; numbers turn amber, then red, when it matters
+COLOURS = {"background_color": "0F1218", "text_color": "E7EAF0", "gpu_color": "6CB4FF", "cpu_color": "7EE0A1",
+           "vram_color": "C49BFF", "ram_color": "FFB86C", "engine_color": "E7EAF0", "frametime_color": "6CB4FF",
+           "battery_color": "FFD166", "wine_color": "FF8FA3", "io_color": "8FD3FF", "media_player_color": "E7EAF0",
+           "horizontal_separator_color": "4A505C"}
+
+
+# ------------------------------------------------------------- settings --
+
+def read_settings():
+    p = configparser.ConfigParser(interpolation=None)
+    try:
+        p.read(SETTINGS)
+    except configparser.Error:
+        pass
+    out = dict(DEFAULTS)
+    if p.has_section("HUD"):
+        out.update({k: v for k, v in p["HUD"].items() if k in DEFAULTS})
+    return out
+
+
+def write_settings(s):
+    os.makedirs(os.path.dirname(SETTINGS), exist_ok=True)
+    p = configparser.ConfigParser(interpolation=None)
+    p["HUD"] = s
+    with open(SETTINGS + ".tmp", "w") as fh:
+        p.write(fh)
+    os.replace(SETTINGS + ".tmp", SETTINGS)
+
+
+def on(s, key):
+    return s.get(key) == "true"
+
+
+def size_px(s):
+    return next((px for k, _l, px in SIZES if k == s.get("size")), 19)
+
+
+def mangohud_conf(s):
+    """MangoHud.conf text for these settings."""
+    style = s.get("style", "bar")
+    font = MANGO_FONT if os.path.exists(MANGO_FONT) else None
+    try:
+        alpha = max(0.0, min(1.0, float(s.get("opacity", "0.55"))))
+    except ValueError:
+        alpha = 0.55
+    lines = [f"{MARK}: written by firox-hud. Change it in Start > All Programs > Firox Gaming HUD;",
+             "# edits made here are replaced the next time the settings change.",
+             "", "legacy_layout=0",
+             f"position={s.get('position', 'top-left')}", "offset_x=14", "offset_y=14",
+             f"font_size={size_px(s)}", f"font_size_text={size_px(s)}",
+             "round_corners=12", f"background_alpha={alpha:.2f}", "alpha=1.0",
+             "toggle_hud=Shift_R+F12", "toggle_fps_limit=Shift_L+F1", "no_small_font"]
+    if font:
+        lines.append(f"font_file={font}")
+    lines += [f"{k}={v}" for k, v in COLOURS.items()]
+    # the numbers change colour where it matters
+    lines += ["fps_color_change", "fps_value=30,60", "fps_color=FF6B6B,FFD166,7EE787",
+              "gpu_load_change", "gpu_load_value=70,90", "gpu_load_color=7EE787,FFD166,FF6B6B",
+              "cpu_load_change", "cpu_load_value=70,90", "cpu_load_color=7EE787,FFD166,FF6B6B"]
+    try:
+        limit = int(s.get("fps_limit", "0"))
+    except ValueError:
+        limit = 0
+    if limit > 0:
+        lines += [f"fps_limit={limit},0", "fps_limit_method=late"]
+    lines.append("")
+    if style == "minimal":
+        lines += ["horizontal", "horizontal_stretch=0", "hud_compact", "fps", "frametime", "frame_timing=0"]
+    else:
+        if style == "bar":
+            lines += ["horizontal", "horizontal_stretch=0", "hud_compact", "table_columns=14"]
+        else:
+            lines += ["table_columns=3", "frame_timing_detailed=0"]
+        lines += ["fps", "frametime"]
+        if limit > 0:
+            lines.append("show_fps_limit")
+        for key, _label, opts in SHOW:
+            if key == "frametime_graph":
+                lines.append("frame_timing=1" if on(s, key) and style == "panel" else "frame_timing=0")
+                continue
+            if on(s, key):
+                lines += opts
+        if style == "panel" and on(s, "info"):
+            lines.append("gpu_name")
+    return "\n".join(lines) + "\n"
+
+
+def apply(s=None):
+    """Write MangoHud.conf (and the font) from the settings. A MangoHud.conf
+    that Firox didn't write is kept as MangoHud.conf.before-firox."""
+    s = s or read_settings()
+    os.makedirs(MANGO_DIR, exist_ok=True)
+    if os.path.exists(MANGO_CONF):
+        try:
+            with open(MANGO_CONF) as fh:
+                first = fh.readline()
+        except OSError:
+            first = ""
+        if not first.startswith(MARK) and not os.path.exists(MANGO_CONF + ".before-firox"):
+            shutil.copy2(MANGO_CONF, MANGO_CONF + ".before-firox")
+    if not os.path.exists(MANGO_FONT):
+        for f in FONTS:
+            if os.path.exists(f):
+                try:
+                    shutil.copyfile(f, MANGO_FONT)
+                except OSError:
+                    pass
+                break
+    with open(MANGO_CONF + ".tmp", "w") as fh:
+        fh.write(mangohud_conf(s))
+    os.replace(MANGO_CONF + ".tmp", MANGO_CONF)
+
+
+# -------------------------------------------------------------- flatpak --
+
+def run(argv, timeout=30):
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, (r.stdout + r.stderr).strip()
+    except (OSError, subprocess.SubprocessError) as err:
+        return 1, str(err)
+
+
+def installed_launchers():
+    if shutil.which("flatpak") is None:
+        return []
+    _rc, out = run(["flatpak", "list", "--app", "--columns=application"])
+    apps = set(out.split())
+    return [(a, name) for a, name in LAUNCHERS if a in apps]
+
+
+def launcher_on(app):
+    _rc, out = run(["flatpak", "override", "--user", "--show", app])
+    return "MANGOHUD=1" in out
+
+
+def extension_branch(app):
+    """The MangoHud extension branch that fits the launcher's runtime."""
+    _rc, runtime = run(["flatpak", "info", "--show-runtime", app])
+    runtime = runtime.strip().splitlines()[-1] if runtime.strip() else ""
+    branch = runtime.split("/")[-1] if runtime.count("/") == 2 else ""
+    rc, meta = run(["flatpak", "info", "--show-metadata", runtime]) if runtime else (1, "")
+    if rc == 0:
+        section = False
+        for line in meta.splitlines():
+            if line.startswith("["):
+                section = line.strip() == "[Extension org.freedesktop.Platform.VulkanLayer]"
+            elif section and line.startswith(("version=", "versions=")):
+                return line.split("=", 1)[1].split(";")[0].strip() or branch
+    return branch
+
+
+def enable_launcher(app, progress=print):
+    """Install the MangoHud extension for the app's runtime (if needed) and
+    turn the HUD on for it. Returns an error text or None."""
+    branch = extension_branch(app)
+    if branch:
+        rc, _out = run(["flatpak", "info", f"{EXTENSION}//{branch}"])
+        if rc != 0:
+            progress(f"Downloading MangoHud for Flatpak ({branch})…")
+            rc, out = run(["flatpak", "install", "--user", "--noninteractive", "-y", "flathub",
+                           f"{EXTENSION}//{branch}"], timeout=600)
+            if rc != 0:
+                return f"Couldn't install {EXTENSION}//{branch}:\n{out[-400:]}"
+    rc, out = run(["flatpak", "override", "--user", "--env=MANGOHUD=1", "--filesystem=xdg-config/MangoHud:ro", app])
+    return None if rc == 0 else out
+
+
+def disable_launcher(app):
+    rc, out = run(["flatpak", "override", "--user", "--unset-env=MANGOHUD", app])
+    return None if rc == 0 else out
+
+
+# ------------------------------------------------------------------ cli --
+
+def cmd_run(argv):
+    if not argv:
+        print("usage: firox-hud run COMMAND [ARGS...]", file=sys.stderr)
+        return 2
+    if not os.path.exists(MANGO_CONF):
+        apply()
+    env = dict(os.environ, MANGOHUD="1", MANGOHUD_CONFIGFILE=MANGO_CONF)
+    if shutil.which("mangohud"):
+        os.execvpe("mangohud", ["mangohud"] + argv, env)
+    print("firox-hud: MangoHud isn't installed; starting the game without the HUD", file=sys.stderr)
+    os.execvpe(argv[0], argv, env)
+
+
+def cmd_try():
+    """A spinning cube with the HUD. vkcube is a Vulkan program, so MangoHud's
+    Vulkan layer is enough (no OpenGL preload, which vkcube doesn't need)."""
+    if not os.path.exists(MANGO_CONF):
+        apply()
+    env = dict(os.environ, MANGOHUD="1", MANGOHUD_CONFIGFILE=MANGO_CONF)
+    for cube in (["vkcube", "--wsi", "wayland"], ["vkcube"]):
+        if shutil.which(cube[0]):
+            os.execvpe(cube[0], cube, env)
+    if shutil.which("glxgears"):
+        return cmd_run(["glxgears"])
+    print("firox-hud: no test program (vkcube) is installed", file=sys.stderr)
+    return 1
+
+
+# ------------------------------------------------------------------ gui --
+
+def gui():
+    import gi
+    gi.require_version("Gtk", "3.0")
+    gi.require_version("Gdk", "3.0")
+    gi.require_version("PangoCairo", "1.0")
+    from gi.repository import Gdk, GLib, Gtk, Pango, PangoCairo
+
+    def hexrgb(h):
+        return int(h[0:2], 16) / 255, int(h[2:4], 16) / 255, int(h[4:6], 16) / 255
+
+    class Preview(Gtk.DrawingArea):
+        """What the HUD will look like (example numbers) over a game-ish
+        background."""
+
+        def __init__(self, settings):
+            super().__init__()
+            self.s = settings
+            self.set_size_request(520, 300)
+            self.connect("draw", self.draw)
+
+        def draw(self, _w, cr):
+            w, h = self.get_allocated_width(), self.get_allocated_height()
+            # a dusky landscape for the game
+            import cairo
+            sky = cairo.LinearGradient(0, 0, 0, h)
+            sky.add_color_stop_rgb(0, 0.16, 0.22, 0.42)
+            sky.add_color_stop_rgb(0.62, 0.86, 0.52, 0.42)
+            sky.add_color_stop_rgb(1, 0.12, 0.10, 0.16)
+            cr.set_source(sky)
+            cr.paint()
+            cr.set_source_rgb(0.98, 0.84, 0.55)
+            cr.arc(w * 0.72, h * 0.58, h * 0.11, 0, 6.2832)
+            cr.fill()
+            for i, (shade, base) in enumerate(((0.20, 0.70), (0.13, 0.80), (0.07, 0.90))):
+                cr.set_source_rgb(shade, shade * 0.9, shade * 1.3)
+                cr.move_to(0, h)
+                for x in range(0, w + 40, 40):
+                    cr.line_to(x, h * base - (((x * (i + 3)) % 97) / 97) * h * 0.12)
+                cr.line_to(w, h)
+                cr.close_path()
+                cr.fill()
+            self.draw_hud(cr, w, h)
+            return False
+
+        def draw_hud(self, cr, w, h):
+            s = self.s
+            style = s.get("style")
+            scale = size_px(s) / 19 * 0.62
+            pc = PangoCairo.create_context(cr)
+            font = Pango.FontDescription.from_string(f"Noto Sans Medium {11 * scale:.1f}")
+            small = Pango.FontDescription.from_string(f"Noto Sans {9 * scale:.1f}")
+
+            def text(t, desc, colour, kind):
+                lay = Pango.Layout.new(pc)
+                lay.set_font_description(desc)
+                lay.set_text(t, -1)
+                return lay, colour, kind
+            # (label, [(value, unit, colour)])
+            rows = [("FPS", [("143", "", "7EE787"), ("6.9", "ms", COLOURS["frametime_color"])])]
+            if style != "minimal":
+                if on(s, "gpu"):
+                    vals = [("62", "%", "7EE787")]
+                    if on(s, "temps"):
+                        vals.append(("64", "°C", "E7EAF0"))
+                    if on(s, "clocks"):
+                        vals += [("2410", "MHz", "E7EAF0"), ("168", "W", "E7EAF0")]
+                    rows.append(("GPU", vals))
+                if on(s, "cpu"):
+                    vals = [("31", "%", "7EE787")]
+                    if on(s, "temps"):
+                        vals.append(("58", "°C", "E7EAF0"))
+                    if on(s, "clocks"):
+                        vals += [("4650", "MHz", "E7EAF0"), ("72", "W", "E7EAF0")]
+                    rows.append(("CPU", vals))
+                if on(s, "memory"):
+                    rows.append(("VRAM", [("5.2", "GiB", COLOURS["vram_color"])]))
+                    rows.append(("RAM", [("9.8", "GiB", COLOURS["ram_color"])]))
+                if on(s, "battery"):
+                    rows.append(("BATT", [("76", "%", COLOURS["battery_color"])]))
+                if on(s, "time"):
+                    rows.append(("", [("21:47", "", "E7EAF0")]))
+            label_colour = {"FPS": "E7EAF0", "GPU": COLOURS["gpu_color"], "CPU": COLOURS["cpu_color"],
+                            "VRAM": COLOURS["vram_color"], "RAM": COLOURS["ram_color"],
+                            "BATT": COLOURS["battery_color"], "": "E7EAF0"}
+            pad, gap = 10 * scale + 4, 12 * scale + 4
+            pieces = []                     # rows of [(layout, colour, x_offset)]
+            for label, vals in rows:
+                row = []
+                if label:
+                    row.append(text(label, font, label_colour[label], "label"))
+                for v, unit, col in vals:
+                    row.append(text(v, font, col, "value"))
+                    if unit:
+                        row.append(text(unit, small, "AEB4BF", "unit"))
+                pieces.append(row)
+
+            def width(lay):
+                return lay.get_pixel_extents()[1].width
+
+            def spacing(row, i):
+                """Room after piece i: little before a unit, more between items."""
+                if i + 1 >= len(row):
+                    return 0
+                return gap * 0.2 if row[i + 1][2] == "unit" else gap * 0.55
+
+            def row_width(row):
+                return sum(width(p[0]) + spacing(row, i) for i, p in enumerate(row))
+            line_h = max(p[0].get_pixel_extents()[1].height for row in pieces for p in row)
+            if style in ("minimal", "bar"):
+                total = sum(row_width(r) for r in pieces) + gap * 0.9 * (len(pieces) - 1)
+                bw, bh = total + pad * 2, line_h + pad * 1.4
+            else:
+                label_w = max([width(r[0][0]) for r in pieces if r and r[0][2] == "label"] or [0])
+                bw = max(row_width(r) - (width(r[0][0]) if r and r[0][2] == "label" else 0) for r in pieces) \
+                    + label_w + gap * 0.9 + pad * 2
+                bh = (line_h + 4) * len(pieces) + pad * 2
+                graph = on(s, "frametime_graph")
+                if graph:
+                    bh += line_h * 2.2
+            pos = s.get("position", "top-left")
+            m = 12
+            x = m if pos.endswith("left") else (w - bw - m if pos.endswith("right") else (w - bw) / 2)
+            y = m if pos.startswith("top") else h - bh - m
+            try:
+                alpha = float(s.get("opacity", "0.55"))
+            except ValueError:
+                alpha = 0.55
+            r = 12 * scale
+            cr.new_sub_path()
+            cr.arc(x + bw - r, y + r, r, -1.5708, 0)
+            cr.arc(x + bw - r, y + bh - r, r, 0, 1.5708)
+            cr.arc(x + r, y + bh - r, r, 1.5708, 3.1416)
+            cr.arc(x + r, y + r, r, 3.1416, 4.7124)
+            cr.close_path()
+            cr.set_source_rgba(*hexrgb(COLOURS["background_color"]), alpha)
+            cr.fill()
+            cx, cy = x + pad, y + pad * 0.7
+            for row in pieces:
+                rx = cx
+                if style == "panel" and row and row[0][2] == "label":
+                    label_w = max(width(r[0][0]) for r in pieces if r and r[0][2] == "label")
+                else:
+                    label_w = None
+                for i, (lay, col, kind) in enumerate(row):
+                    ext = lay.get_pixel_extents()[1]
+                    cr.set_source_rgb(*hexrgb(col))
+                    cr.move_to(rx, cy + (line_h - ext.height))
+                    PangoCairo.show_layout(cr, lay)
+                    step = ext.width + spacing(row, i)
+                    if kind == "label" and label_w is not None:
+                        step = label_w + gap * 0.9          # the panel's values line up
+                    rx += step
+                if style in ("minimal", "bar"):
+                    cx = rx + gap * 0.9
+                else:
+                    cy += line_h + 4
+            if style == "panel" and on(s, "frametime_graph"):
+                gy, gh = cy + 4, line_h * 1.8
+                cr.set_source_rgb(*hexrgb(COLOURS["frametime_color"]))
+                cr.set_line_width(1.4)
+                gw = bw - pad * 2
+                for i in range(60):
+                    v = 0.5 + 0.18 * ((i * 37) % 11) / 11 + (0.35 if i in (23, 41) else 0)
+                    px, py = cx + gw * i / 59, gy + gh - gh * min(1, v * 0.75)
+                    (cr.move_to if i == 0 else cr.line_to)(px, py)
+                cr.stroke()
+
+    class Window(Gtk.Window):
+        def __init__(self):
+            super().__init__(title="Firox Gaming HUD")
+            self.set_icon_name("applications-games")
+            self.set_default_size(880, 640)
+            self.s = read_settings()
+            outer = Gtk.Box(spacing=18)
+            outer.set_border_width(18)
+            self.add(outer)
+            left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+            outer.pack_start(left, False, False, 0)
+            title = Gtk.Label(xalign=0)
+            title.set_markup("<span size='x-large' weight='bold'>Firox Gaming HUD</span>")
+            left.pack_start(title, False, False, 0)
+            sub = Gtk.Label(xalign=0, wrap=True, max_width_chars=60)
+            sub.set_text("Frame rate, frame time, GPU and CPU over your games. "
+                         "Right Shift+F12 shows or hides it in a game.")
+            sub.get_style_context().add_class("dim-label")
+            left.pack_start(sub, False, False, 0)
+            self.preview = Preview(self.s)
+            frame = Gtk.Frame()
+            frame.add(self.preview)
+            left.pack_start(frame, False, False, 0)
+            cap = Gtk.Label(xalign=0)
+            cap.set_markup("<small>Preview, with example numbers.</small>")
+            cap.get_style_context().add_class("dim-label")
+            left.pack_start(cap, False, False, 0)
+            try_btn = Gtk.Button.new_with_mnemonic("_Try It")
+            try_btn.set_tooltip_text("Open a spinning cube with the HUD on it")
+            try_btn.connect("clicked", lambda *_: self.try_it())
+            row = Gtk.Box(spacing=8)
+            row.pack_start(try_btn, False, False, 0)
+            left.pack_start(row, False, False, 0)
+            left.pack_start(self.where_section(), False, False, 6)
+
+            right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+            scroller = Gtk.ScrolledWindow()
+            scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+            scroller.add(right)
+            outer.pack_start(scroller, True, True, 0)
+
+            def heading(t):
+                lab = Gtk.Label(xalign=0)
+                lab.set_markup(f"<b>{t}</b>")
+                lab.set_margin_top(6)
+                right.pack_start(lab, False, False, 0)
+            heading("Style")
+            group = None
+            for key, name, desc in STYLES:
+                rb = Gtk.RadioButton.new_from_widget(group)
+                group = group or rb
+                lab = Gtk.Label(xalign=0)
+                lab.set_markup(f"{name}\n<small>{GLib.markup_escape_text(desc)}</small>")
+                rb.add(lab)
+                rb.set_active(self.s["style"] == key)
+                rb.connect("toggled", lambda b, k=key: b.get_active() and self.set("style", k))
+                right.pack_start(rb, False, False, 0)
+            heading("Where and how big")
+            grid = Gtk.Grid(column_spacing=10, row_spacing=8)
+            pos = Gtk.ComboBoxText()
+            for k, label in POSITIONS:
+                pos.append(k, label)
+            pos.set_active_id(self.s["position"])
+            pos.connect("changed", lambda c: self.set("position", c.get_active_id()))
+            size = Gtk.ComboBoxText()
+            for k, label, _px in SIZES:
+                size.append(k, label)
+            size.set_active_id(self.s["size"])
+            size.connect("changed", lambda c: self.set("size", c.get_active_id()))
+            opacity = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 1, 0.05)
+            opacity.set_value(float(self.s["opacity"]))
+            opacity.set_draw_value(False)
+            opacity.set_hexpand(True)
+            opacity.connect("value-changed", lambda sc: self.set("opacity", f"{sc.get_value():.2f}"))
+            for i, (label, w) in enumerate((("Position:", pos), ("Size:", size), ("Background:", opacity))):
+                grid.attach(Gtk.Label(label=label, xalign=0), 0, i, 1, 1)
+                grid.attach(w, 1, i, 1, 1)
+            right.pack_start(grid, False, False, 0)
+            heading("What to show")
+            self.show_boxes = []
+            for key, label, _opts in SHOW:
+                cb = Gtk.CheckButton(label=label, active=on(self.s, key))
+                cb.connect("toggled", lambda b, k=key: self.set(k, "true" if b.get_active() else "false"))
+                right.pack_start(cb, False, False, 0)
+                self.show_boxes.append(cb)
+            heading("Frame-rate limit")
+            limit = Gtk.ComboBoxText()
+            for v, label in (("0", "No limit"), ("30", "30 FPS"), ("60", "60 FPS"), ("75", "75 FPS"),
+                             ("90", "90 FPS"), ("120", "120 FPS"), ("144", "144 FPS"), ("165", "165 FPS")):
+                limit.append(v, label)
+            if not limit.set_active_id(self.s["fps_limit"]):
+                limit.append(self.s["fps_limit"], f"{self.s['fps_limit']} FPS")
+                limit.set_active_id(self.s["fps_limit"])
+            limit.connect("changed", lambda c: self.set("fps_limit", c.get_active_id()))
+            right.pack_start(limit, False, False, 0)
+            note = Gtk.Label(xalign=0, wrap=True, max_width_chars=40)
+            note.set_markup("<small>Smooths out games that run faster than your screen. "
+                            "Left Shift+F1 turns it on and off in a game.</small>")
+            note.get_style_context().add_class("dim-label")
+            right.pack_start(note, False, False, 0)
+            self.update_show()
+            self.connect("destroy", Gtk.main_quit)
+            self.connect("key-press-event", lambda _w, ev: ev.keyval == Gdk.KEY_Escape and (self.close() or True))
+            if not shutil.which("mangohud"):
+                GLib.idle_add(lambda: self.message("MangoHud isn't installed",
+                                                   "The HUD needs MangoHud, which comes with Firox's image. "
+                                                   "Update Firox and try again.") and False)
+            apply(self.s)
+
+        def set(self, key, value):
+            if value is None:
+                return
+            self.s[key] = value
+            try:
+                write_settings(self.s)
+                apply(self.s)
+            except OSError as err:
+                self.message("Couldn't save the HUD settings", str(err))
+            self.update_show()
+            self.preview.queue_draw()
+
+        def update_show(self):
+            for cb in self.show_boxes:
+                cb.set_sensitive(self.s["style"] != "minimal")
+
+        def where_section(self):
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            lab = Gtk.Label(xalign=0)
+            lab.set_markup("<b>Show it in games from</b>")
+            box.pack_start(lab, False, False, 0)
+            self.status = Gtk.Label(xalign=0, wrap=True, max_width_chars=60)
+            self.status.get_style_context().add_class("dim-label")
+            launchers = installed_launchers()
+            for app, name in launchers:
+                sw = Gtk.Switch(active=launcher_on(app), valign=Gtk.Align.CENTER)
+                sw.connect("state-set", lambda s, state, a=app, n=name: self.toggle_launcher(s, state, a, n))
+                row = Gtk.Box(spacing=10)
+                row.pack_start(Gtk.Label(label=name, xalign=0), True, True, 0)
+                row.pack_start(sw, False, False, 0)
+                box.pack_start(row, False, False, 0)
+            if not launchers:
+                none = Gtk.Label(xalign=0, wrap=True, max_width_chars=60)
+                none.set_text("No game launchers from Flathub are installed (Steam, Lutris, Heroic, Bottles, "
+                              "Faugus, Prism Launcher). Install one from the app store, then come back here.")
+                box.pack_start(none, False, False, 0)
+            box.pack_start(self.status, False, False, 0)
+            other = Gtk.Label(xalign=0, wrap=True, max_width_chars=60)
+            other.set_markup("Any other game: add <tt>firox-hud run %command%</tt> to its launch options "
+                             "(in Steam: Properties → General → Launch Options).")
+            box.pack_start(other, False, False, 0)
+            copy = Gtk.Button.new_with_mnemonic("_Copy Launch Option")
+            copy.connect("clicked", lambda *_: Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).set_text(
+                "firox-hud run %command%", -1) or self.status.set_text("Copied: firox-hud run %command%"))
+            row = Gtk.Box()
+            row.pack_start(copy, False, False, 0)
+            box.pack_start(row, False, False, 0)
+            return box
+
+        def toggle_launcher(self, switch, state, app, name):
+            switch.set_sensitive(False)
+            self.status.set_text(f"{'Turning on' if state else 'Turning off'} the HUD for {name}…")
+
+            def work():
+                if state:
+                    err = enable_launcher(app, lambda t: GLib.idle_add(self.status.set_text, t))
+                else:
+                    err = disable_launcher(app)
+                GLib.idle_add(done, err)
+
+            def done(err):
+                switch.set_sensitive(True)
+                if err:
+                    switch.set_state(not state)
+                    self.status.set_text("")
+                    self.message(f"Couldn't change {name}", err)
+                else:
+                    switch.set_state(state)
+                    self.status.set_text(f"The HUD is {'on' if state else 'off'} for games from {name}. "
+                                         f"Restart {name} if it's open." if state else
+                                         f"The HUD is off for games from {name}.")
+                return False
+            threading.Thread(target=work, daemon=True).start()
+            return True                     # the switch moves when it's done
+
+        def try_it(self):
+            try:
+                subprocess.Popen([os.path.abspath(sys.argv[0]), "try"], start_new_session=True)
+            except OSError as err:
+                self.message("Couldn't start the test", str(err))
+
+        def message(self, title, detail=""):
+            dlg = Gtk.MessageDialog(transient_for=self, modal=True, message_type=Gtk.MessageType.INFO,
+                                    buttons=Gtk.ButtonsType.OK, text=title)
+            if detail:
+                dlg.format_secondary_text(detail)
+            dlg.connect("key-press-event", lambda d, ev: ev.keyval == Gdk.KEY_Escape and (d.response(0) or True))
+            dlg.run()
+            dlg.destroy()
+
+    win = Window()
+    win.show_all()
+    Gtk.main()
+    return 0
+
+
+def main(argv):
+    if argv[:1] == ["run"]:
+        return cmd_run(argv[1:])
+    if argv[:1] == ["try"]:
+        return cmd_try()
+    if argv[:1] == ["apply"]:
+        apply()
+        return 0
+    if argv[:1] in (["-h"], ["--help"]):
+        print(__doc__.strip())
+        return 0
+    return gui()
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

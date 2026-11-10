@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=System Information
+Comment=Everything about this computer: hardware, drivers, storage, network, software and problems
+Exec=firox-sysinfo
+Icon=computer
+Categories=System;Monitor;
+Keywords=msinfo32;hardware;specs;cpu;memory;ram;gpu;drivers;bios;disks;report;
+StartupNotify=true
