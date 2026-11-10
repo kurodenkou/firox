@@ -219,6 +219,12 @@ class SystemDialog(Gtk.Dialog):
             grid.attach(vl, 1, i, 1, 1)
         top.pack_start(grid, True, True, 0)
         box.pack_start(top, True, True, 0)
+        more = Gtk.Button.new_with_mnemonic("System _Information…")
+        more.set_tooltip_text("Everything about this computer: hardware, drivers, storage, network, software")
+        more.connect("clicked", lambda *_: spawn(["firox-sysinfo"]))
+        row = Gtk.Box()
+        row.pack_end(more, False, False, 0)
+        box.pack_start(row, False, False, 0)
         self.show_all()
 
 

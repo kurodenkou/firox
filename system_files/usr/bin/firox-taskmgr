@@ -2,17 +2,20 @@
 """
 firox-taskmgr: Firox Task Manager (Ctrl+Alt+Del).
 
-    firox-taskmgr [applications|processes|performance]
+    firox-taskmgr [applications|processes|performance|gpu]
 
 Applications: the open windows; Switch To or End Task (asks the program to
-close). Processes: what's running, with CPU and memory use; End Process.
-Performance: CPU and memory graphs and totals. For the terminal view, btop is
-in the Start menu.
+close). Processes: what's running, with CPU, memory and GPU use; End
+Process. Performance: CPU and memory graphs and totals. GPU: for each
+graphics card, usage and memory graphs, temperature, clock, power and fan,
+and the programs using it (like nvtop; see firox_gpu). For terminal views,
+btop and nvtop are in the View menu.
 """
 
 import os
 import pwd
 import sys
+import threading
 import time
 
 import gi
@@ -28,10 +31,11 @@ try:
     import firox_toplevels  # noqa: E402
 except ImportError:            # no pywayland: no Applications tab contents
     firox_toplevels = None
+import firox_gpu  # noqa: E402
 
 INTERVAL = 2000          # ms between updates
 HISTORY = 60             # points on the graphs
-TABS = ["applications", "processes", "performance"]
+TABS = ["applications", "processes", "performance", "gpu"]
 
 
 def human(n):
@@ -89,9 +93,10 @@ class Graph(Gtk.DrawingArea):
         self.set_size_request(-1, 110)
         self.connect("draw", self.on_draw)
 
-    def push(self, v):
+    def push(self, v, caption=None):
         self.values = self.values[1:] + [max(0.0, min(100.0, v))]
         self.offset = (self.offset + 1) % 4
+        self.caption = caption
         self.queue_draw()
 
     def on_draw(self, _w, cr):
@@ -122,7 +127,7 @@ class Graph(Gtk.DrawingArea):
         cr.select_font_face("Sans")
         cr.set_font_size(11)
         cr.move_to(6, 14)
-        cr.show_text(f"{self.label}: {self.values[-1]:.0f}%")
+        cr.show_text(getattr(self, "caption", None) or f"{self.label}: {self.values[-1]:.0f}%")
         return False
 
 
@@ -178,6 +183,9 @@ class TaskManager(Gtk.ApplicationWindow):
         self.ncpu = psutil.cpu_count() or 1
         self.rows = {}               # pid -> Gtk.TreeIter
         psutil.cpu_percent(None)
+        self.gpu_sampler = firox_gpu.Sampler()
+        self.gpu_snap = None         # the latest firox_gpu.Snapshot
+        self.gpu_busy = False        # a sample is being taken (in a thread: nvidia-smi can be slow)
 
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         self.add(outer)
@@ -188,12 +196,13 @@ class TaskManager(Gtk.ApplicationWindow):
         self.notebook.append_page(self.build_apps(), Gtk.Label(label="Applications"))
         self.notebook.append_page(self.build_procs(), Gtk.Label(label="Processes"))
         self.notebook.append_page(self.build_perf(), Gtk.Label(label="Performance"))
+        self.notebook.append_page(self.build_gpu(), Gtk.Label(label="GPU"))
         outer.pack_start(self.notebook, True, True, 0)
 
         self.status = Gtk.Box(spacing=0)
         self.status.set_border_width(2)
-        self.st_procs, self.st_cpu, self.st_mem = (Gtk.Label(xalign=0) for _ in range(3))
-        for lab in (self.st_procs, self.st_cpu, self.st_mem):
+        self.st_procs, self.st_cpu, self.st_mem, self.st_gpu = (Gtk.Label(xalign=0) for _ in range(4))
+        for lab in (self.st_procs, self.st_cpu, self.st_mem) + ((self.st_gpu,) if self.gpu_sampler.gpus else ()):
             fr = Gtk.Frame()
             fr.set_shadow_type(Gtk.ShadowType.IN)
             lab.set_margin_start(6)
@@ -232,7 +241,9 @@ class TaskManager(Gtk.ApplicationWindow):
         menu("_File", [("_New Task (Run…)", self.new_task), (None, None), ("E_xit Task Manager", self.close)])
         menu("_View", [("_Refresh Now", self.tick),
                        ("Resource Monitor (_btop)", lambda: self.spawn(
-                           ["xfce4-terminal", "--disable-server", "-T", "Resource Monitor", "-x", "btop", "--force-utf"]))])
+                           ["xdg-terminal-exec", "--title=Resource Monitor", "btop", "--force-utf"])),
+                       ("GPU Monitor (_nvtop)", lambda: self.spawn(
+                           ["xdg-terminal-exec", "--title=GPU Monitor", "nvtop"]))])
         menu("_Help", [("Task Manager _Help", lambda: self.spawn(["firox-open", "help"]))])
         return bar
 
@@ -319,11 +330,13 @@ class TaskManager(Gtk.ApplicationWindow):
     def build_procs(self):
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         box.set_border_width(8)
-        # pid, name, user, cpu %, memory bytes, memory text, cpu text
-        self.procs = Gtk.ListStore(int, str, str, float, GObject.TYPE_UINT64, str, str)
+        # pid, name, user, cpu %, memory bytes, memory text, cpu text, gpu %, gpu text
+        self.procs = Gtk.ListStore(int, str, str, float, GObject.TYPE_UINT64, str, str, float, str)
         view = Gtk.TreeView(model=self.procs)
-        for title, col_text, sort_col, xalign in (("Image Name", 1, 1, 0), ("User Name", 2, 2, 0),
-                                                  ("CPU", 6, 3, 1), ("Mem Usage", 5, 4, 1), ("PID", 0, 0, 1)):
+        cols = [("Image Name", 1, 1, 0), ("User Name", 2, 2, 0), ("CPU", 6, 3, 1), ("Mem Usage", 5, 4, 1)]
+        if self.gpu_sampler.gpus:
+            cols.append(("GPU", 8, 7, 1))
+        for title, col_text, sort_col, xalign in cols + [("PID", 0, 0, 1)]:
             r = Gtk.CellRendererText(xalign=xalign)
             c = Gtk.TreeViewColumn(title, r, text=col_text)
             c.set_sort_column_id(sort_col)
@@ -361,8 +374,10 @@ class TaskManager(Gtk.ApplicationWindow):
             mem = info["memory_info"].rss if info.get("memory_info") else 0
             pid = info["pid"]
             seen.add(pid)
+            use = self.gpu_snap.procs.get(pid) if self.gpu_snap is not None else None
+            gpu = max((pct for pct, _m in use.values()), default=0.0) if use else 0.0
             values = [pid, info.get("name") or "?", info.get("username") or "", cpu, mem,
-                      human(mem), f"{cpu:.0f}"]
+                      human(mem), f"{cpu:.0f}", gpu, f"{gpu:.0f}" if use else ""]
             it = self.rows.get(pid)
             if it is not None and self.procs.iter_is_valid(it):
                 for i, v in enumerate(values):
@@ -474,8 +489,139 @@ class TaskManager(Gtk.ApplicationWindow):
         self.t_swap["Used"].set_text(human(sw.used))
         return mem_pct
 
+    # -------------------------------------------------------------- gpu --
+    def build_gpu(self):
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        outer.set_border_width(8)
+        self.gpu_widgets = {}
+        if not self.gpu_sampler.gpus:
+            msg = Gtk.Label(label="No graphics card that Task Manager can read was found.", wrap=True)
+            msg.get_style_context().add_class("dim-label")
+            outer.pack_start(msg, True, True, 0)
+            return outer
+        cards = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        for g in self.gpu_sampler.gpus:
+            grid = Gtk.Grid(column_spacing=8, row_spacing=8)
+            grid.set_border_width(6)
+            meter, graph, mem_graph = Meter(), Graph("GPU"), Graph("Memory")
+            graph.set_hexpand(True)
+            grid.attach(meter, 0, 0, 1, 1)
+            grid.attach(graph, 1, 0, 1, 1)
+            grid.attach(mem_graph, 1, 1, 1, 1)
+            facts = Gtk.Grid(column_spacing=12, row_spacing=2)
+            labels = {}
+            names = ["Driver", "Memory", "Temperature", "Clock", "Power", "Fan"]
+            for i, name in enumerate(names):
+                facts.attach(Gtk.Label(label=name, xalign=0), 0, i, 1, 1)
+                v = Gtk.Label(xalign=1)
+                facts.attach(v, 1, i, 1, 1)
+                labels[name] = v
+            labels["Driver"].set_text(g.driver)
+            facts.set_valign(Gtk.Align.START)
+            grid.attach(facts, 0, 1, 1, 1)
+            cards.pack_start(framed(f"{g.name}  ({g.pci})", grid), False, False, 0)
+            self.gpu_widgets[g.pci] = (meter, graph, mem_graph, labels, g)
+        outer.pack_start(cards, False, False, 0)
+        # the programs using a GPU, busiest first (nvtop's list)
+        # pid, name, card, gpu %, gpu %, memory bytes, memory text
+        self.gpu_procs = Gtk.ListStore(int, str, str, float, str, GObject.TYPE_UINT64, str)
+        view = Gtk.TreeView(model=self.gpu_procs)
+        cols = [("Program", 1, 1, 0)]
+        if len(self.gpu_sampler.gpus) > 1:
+            cols.append(("Card", 2, 2, 0))
+        cols += [("GPU", 4, 3, 1), ("GPU Memory", 6, 5, 1), ("PID", 0, 0, 1)]
+        for title, col_text, sort_col, xalign in cols:
+            c = Gtk.TreeViewColumn(title, Gtk.CellRendererText(xalign=xalign), text=col_text)
+            c.set_sort_column_id(sort_col)
+            c.set_resizable(True)
+            if col_text == 1:
+                c.set_expand(True)
+            view.append_column(c)
+        self.gpu_procs.set_sort_column_id(3, Gtk.SortType.DESCENDING)
+        sw = Gtk.ScrolledWindow()
+        sw.set_shadow_type(Gtk.ShadowType.IN)
+        sw.set_min_content_height(120)
+        sw.add(view)
+        outer.pack_start(framed("Programs using the GPU", sw), True, True, 0)
+        note = Gtk.Label(xalign=0, wrap=True)
+        note.set_markup("<small>Programs are those you're running. Intel graphics usage is added up from "
+                        "them, so it doesn't include other users' programs.</small>"
+                        if any(g.vendor == "Intel" for g in self.gpu_sampler.gpus) else
+                        "<small>Programs are those you're running.</small>")
+        note.get_style_context().add_class("dim-label")
+        outer.pack_start(note, False, False, 0)
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroller.add(outer)
+        return scroller
+
+    def sample_gpu(self):
+        """Take a GPU sample in a thread; fill_gpu shows it."""
+        if self.gpu_busy or not self.gpu_sampler.gpus:
+            return
+        self.gpu_busy = True
+
+        def work():
+            try:
+                snap = self.gpu_sampler.sample()
+            except Exception as err:          # a driver oddity mustn't stop Task Manager
+                print(f"task manager: gpu: {err}", file=sys.stderr)
+                snap = None
+            GLib.idle_add(self.fill_gpu, snap)
+        threading.Thread(target=work, daemon=True).start()
+
+    def fill_gpu(self, snap):
+        self.gpu_busy = False
+        if snap is None:
+            return False
+        self.gpu_snap = snap
+        overall = []
+        for pci, (meter, graph, mem_graph, labels, g) in self.gpu_widgets.items():
+            st = snap.gpus.get(pci, {})
+            busy = st.get("busy")
+            if busy is not None:
+                overall.append(busy)
+                meter.set(busy, f"{busy:.0f}%")
+                graph.push(busy)
+            used, total = st.get("vram_used"), st.get("vram_total")
+            if used is not None and total:
+                mem_graph.push(100 * used / total, f"Memory: {human(used)} of {human(total)}")
+                labels["Memory"].set_text(f"{human(used)} / {human(total)}")
+            else:
+                shared = st.get("shared") or 0
+                vm_total = psutil.virtual_memory().total
+                mem_graph.push(100 * shared / vm_total if vm_total else 0, f"Shared memory: {human(shared)}")
+                labels["Memory"].set_text(f"{human(shared)} shared")
+            for name, key, fmt in (("Temperature", "temp", "{:.0f} °C"), ("Clock", "clock", "{:.0f} MHz"),
+                                   ("Power", "power", "{:.0f} W"), ("Fan", "fan", "{:.0f}%")):
+                v = st.get(key)
+                labels[name].set_text(fmt.format(v) if v is not None else "—")
+        if overall:
+            self.st_gpu.set_text(f"GPU: {max(overall):.0f}%")
+        # programs
+        names = {}
+        rows = []
+        cards = {g.pci: f"GPU {i}" for i, g in enumerate(self.gpu_sampler.gpus)}
+        for pid, use in snap.procs.items():
+            if pid not in names:
+                try:
+                    names[pid] = psutil.Process(pid).name()
+                except psutil.Error:
+                    continue
+            for pci, (pct, mem) in use.items():
+                rows.append([pid, names[pid], cards.get(pci, pci or "?"), pct, f"{pct:.0f}%", int(mem),
+                             human(mem) if mem else ""])
+        sel = self.gpu_procs.get_sort_column_id()
+        self.gpu_procs.clear()
+        for r in rows:
+            self.gpu_procs.append(r)
+        if sel[0] is not None:
+            self.gpu_procs.set_sort_column_id(*sel)
+        return False
+
     # ------------------------------------------------------------ tick --
     def tick(self):
+        self.sample_gpu()
         cpu = psutil.cpu_percent(None)
         self.fill_procs()
         nprocs = len(psutil.pids())

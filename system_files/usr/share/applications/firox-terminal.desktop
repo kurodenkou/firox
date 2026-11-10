@@ -1,0 +1,25 @@
+[Desktop Entry]
+Type=Application
+Name=Firox Terminal
+GenericName=Terminal
+Comment=Command Prompt with tabs and saved SSH connections
+Exec=firox-terminal
+Icon=utilities-terminal
+Terminal=false
+Categories=System;TerminalEmulator;Utility;GTK;
+Keywords=command prompt;shell;terminal;console;cmd;ssh;bash;
+StartupNotify=true
+Actions=new-window;connect;
+# How xdg-terminal-exec runs commands in it (btop, nvtop…)
+X-TerminalArgExec=-x
+X-TerminalArgTitle=--title=
+X-TerminalArgDir=--working-directory=
+X-TerminalArgHold=--hold
+
+[Desktop Action new-window]
+Name=New Window
+Exec=firox-terminal
+
+[Desktop Action connect]
+Name=Connect to an SSH Server
+Exec=firox-terminal --connect

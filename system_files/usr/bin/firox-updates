@@ -213,7 +213,7 @@ def nvidia_notify():
            "This computer runs the standard Firox image. Switch to the NVIDIA image for full "
            "graphics speed: click here, or run ujust install-nvidia.",
            "Switch to the NVIDIA image",
-           ["xfce4-terminal", "--disable-server", "-T", "NVIDIA driver", "-x", "sh", "-c",
+           ["firox-terminal", "-T", "NVIDIA driver", "-x", "sh", "-c",
             "ujust install-nvidia; echo; read -r -p 'Press Enter to close' _"])
 
 

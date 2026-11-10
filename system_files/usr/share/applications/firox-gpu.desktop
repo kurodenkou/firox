@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=GPU Monitor
+Comment=Graphics card usage, memory, temperature and the programs using it
+Exec=firox-taskmgr gpu
+Icon=video-display
+Categories=System;Monitor;
+Keywords=gpu;graphics;nvidia;amd;intel;radeon;vram;nvtop;
+StartupNotify=false

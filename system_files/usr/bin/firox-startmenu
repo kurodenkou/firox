@@ -65,7 +65,7 @@ DEFAULT_MFU = [
     "firox-explorer.desktop",
     "org.xfce.mousepad.desktop",
     "galculator.desktop",
-    "xfce4-terminal.desktop",
+    "firox-terminal.desktop",
     "org.xfce.ristretto.desktop",
     "org.pulseaudio.pavucontrol.desktop",
 ]
@@ -74,7 +74,7 @@ DEFAULT_MFU = [
 FRIENDLY_NAMES = {
     "org.xfce.mousepad.desktop": "Text Editor",
     "galculator.desktop": "Calculator",
-    "xfce4-terminal.desktop": "Command Prompt",
+    "firox-terminal.desktop": "Command Prompt",
     "btop.desktop": "Resource Monitor (btop)",
     "vlc.desktop": "Media Player",
     "org.xfce.ristretto.desktop": "Picture Viewer",
@@ -90,7 +90,7 @@ PINNED = [
 
 # Desktop entries we never list (helpers, duplicates, ourselves).
 HIDDEN = {
-    "foot.desktop",                      # the Command Prompt is xfce4-terminal
+    "foot.desktop",                      # the Command Prompt is firox-terminal
     "foot-server.desktop",
     "footclient.desktop",
     "xfce4-terminal-settings.desktop",   # its Edit > Preferences
@@ -715,7 +715,7 @@ class StartMenu(Gtk.Window):
             # can't (no xdg-terminal-exec), open them in the Command Prompt ourselves.
             cmd = re.sub(r"%[a-zA-Z]", "", info.get_commandline() or "").strip()
             if info.get_boolean("Terminal") and cmd:
-                spawn(["xfce4-terminal", "-x", "sh", "-c", cmd])
+                spawn(["firox-terminal", "-x", "sh", "-c", cmd])
                 self.usage.bump(info.get_id())
             else:
                 print(f"startmenu: launch failed: {err.message}", file=sys.stderr)

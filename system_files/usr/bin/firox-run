@@ -47,14 +47,15 @@ except (ValueError, ImportError):
 STATE = os.path.join(GLib.get_user_state_dir(), "firox")
 HISTORY = os.path.join(STATE, "run-history")
 HISTORY_MAX = 26
-TERMINAL = ["xfce4-terminal", "--disable-server"]
+TERMINAL = ["firox-terminal"]
 
 # Names people type out of habit -> what opens (first one that's installed)
 ALIASES = {
-    "cmd": [["xfce4-terminal"], ["foot"]],
-    "command": [["xfce4-terminal"], ["foot"]],
-    "powershell": [["xfce4-terminal"], ["foot"]],
-    "terminal": [["xfce4-terminal"], ["foot"]],
+    "cmd": [["firox-terminal"], ["xfce4-terminal"], ["foot"]],
+    "command": [["firox-terminal"], ["xfce4-terminal"], ["foot"]],
+    "powershell": [["firox-terminal"], ["xfce4-terminal"], ["foot"]],
+    "terminal": [["firox-terminal"], ["xfce4-terminal"], ["foot"]],
+    "ssh": [["firox-terminal", "--connect"]],
     "notepad": [["mousepad"]],
     "wordpad": [["mousepad"]],
     "write": [["mousepad"]],
@@ -66,6 +67,8 @@ ALIASES = {
     "msconfig": [["firox-startup"]],
     "snippingtool": [["firox-open", "screenshot-region"]],
     "winver": [["firox-control-panel", "system"]],
+    "msinfo32": [["firox-sysinfo"]],
+    "dxdiag": [["firox-sysinfo", "graphics"]],
     "iexplore": "browser",
     "msedge": "browser",
     "chrome": "browser",

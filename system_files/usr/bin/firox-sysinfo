@@ -1,0 +1,989 @@
+#!/usr/bin/python3
+"""
+firox-sysinfo: System Information. Everything about this computer, in one
+place (like msinfo32): the Firox image and updates, the computer, processor,
+memory, graphics, displays, storage, network, sound, Bluetooth, battery,
+sensors, USB, PCI and input devices, software, security, and problems.
+
+    firox-sysinfo                    the window
+    firox-sysinfo CATEGORY           open at a category (summary, cpu, …)
+    firox-sysinfo --report [FILE]    the whole report as text (to FILE, or
+                                     the terminal)
+
+Nothing here needs administrator rights except the memory modules (which
+slots are used, speeds, part numbers: dmidecode, asked for with your
+password on request). Information comes from /sys, /proc and the usual tools
+(lscpu, lsblk, ip, nmcli, pactl, wlr-randr, vulkaninfo, glxinfo, lspci,
+lsusb, rpm-ostree, flatpak, systemctl, journalctl).
+"""
+
+import datetime
+import glob
+import json
+import os
+import platform
+import pwd
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import time
+
+sys.path.insert(0, "/usr/lib/firox/python")
+try:
+    import firox_gpu
+except ImportError:
+    firox_gpu = None
+
+
+# ------------------------------------------------------------- helpers --
+
+def read(path, default=""):
+    try:
+        with open(path, errors="replace") as fh:
+            return fh.read().strip()
+    except OSError:
+        return default
+
+
+def run(argv, timeout=8, env=None):
+    if shutil.which(argv[0]) is None:
+        return ""
+    try:
+        return subprocess.run(argv, capture_output=True, text=True, timeout=timeout,
+                              env=env).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def run_json(argv, timeout=8):
+    try:
+        return json.loads(run(argv, timeout) or "null")
+    except ValueError:
+        return None
+
+
+def human(n, unit="B"):
+    try:
+        n = float(n)
+    except (TypeError, ValueError):
+        return str(n)
+    for u in ("", "K", "M", "G", "T", "P"):
+        if abs(n) < 1024 or u == "P":
+            return f"{n:.0f} {u}{unit}" if u == "" else f"{n:.1f} {u}i{unit}"
+        n /= 1024
+    return str(n)
+
+
+def duration(seconds):
+    seconds = int(seconds)
+    d, rem = divmod(seconds, 86400)
+    h, rem = divmod(rem, 3600)
+    m, _s = divmod(rem, 60)
+    out = []
+    if d:
+        out.append(f"{d} day{'s' if d != 1 else ''}")
+    if h or d:
+        out.append(f"{h} hour{'s' if h != 1 else ''}")
+    out.append(f"{m} minute{'s' if m != 1 else ''}")
+    return ", ".join(out)
+
+
+def when(epoch):
+    try:
+        return datetime.datetime.fromtimestamp(int(epoch)).strftime("%Y-%m-%d %H:%M")
+    except (TypeError, ValueError, OSError):
+        return ""
+
+
+def kv(lines, sep=":"):
+    out = {}
+    for line in lines.splitlines():
+        if sep in line:
+            k, v = line.split(sep, 1)
+            out.setdefault(k.strip(), v.strip())
+    return out
+
+
+def keep(entries):
+    """Drop rows with empty values (and empty groups)."""
+    out = []
+    for k, v in entries:
+        if isinstance(v, list):
+            v = keep(v)
+            if v:
+                out.append((k, v))
+        elif v not in (None, "", []):
+            out.append((k, str(v)))
+    return out
+
+
+# ---------------------------------------------------------- collectors --
+
+def c_summary():
+    osr = kv(read("/etc/os-release"), "=")
+    osr = {k: v.strip('"') for k, v in osr.items()}
+    fedora = "fedora" in (osr.get("ID", "") + " " + osr.get("ID_LIKE", ""))
+    e = [("Operating system", osr.get("PRETTY_NAME", "Firox Linux")),
+         ("Version", osr.get("VERSION", "")),
+         ("Based on", f"Fedora {osr.get('VERSION_ID', '')} Atomic (Universal Blue)" if fedora else ""),
+         ("Fedora support ends", osr.get("SUPPORT_END", "") if fedora else "")]
+    st = run_json(["rpm-ostree", "status", "--json"], 15) or {}
+    deps = st.get("deployments", []) if isinstance(st, dict) else []
+    booted = next((d for d in deps if d.get("booted")), None)
+    if booted:
+        e += [("Image", booted.get("container-image-reference", "")),
+              ("Image version", booted.get("version", "")),
+              ("Image built", when(booted.get("timestamp"))),
+              ("Image digest", (booted.get("container-image-reference-digest") or booted.get("checksum", ""))[:24])]
+        staged = next((d for d in deps if d.get("staged") or (not d.get("booted") and deps.index(d) == 0)), None)
+        if staged is not None and staged is not booted:
+            e.append(("Update waiting for a restart", staged.get("version", "") or "yes"))
+        else:
+            e.append(("Update waiting for a restart", "no"))
+        rollback = next((d for d in deps if not d.get("booted") and d is not staged), None)
+        if rollback:
+            e.append(("Previous version (System Restore)", rollback.get("version", "") or when(rollback.get("timestamp"))))
+    e += [("Kernel", platform.release()), ("Kernel built", platform.version()),
+          ("Architecture", platform.machine())]
+    efi = os.path.isdir("/sys/firmware/efi")
+    e.append(("Boot mode", "UEFI" if efi else "Legacy BIOS"))
+    e.append(("Secure Boot", secure_boot()))
+    e.append(("Computer name", platform.node()))
+    me = pwd.getpwuid(os.getuid())
+    e += [("User", f"{me.pw_gecos.split(',')[0] or me.pw_name} ({me.pw_name})"), ("Shell", me.pw_shell)]
+    try:
+        up = float(read("/proc/uptime").split()[0])
+        e += [("Up time", duration(up)), ("Started", when(time.time() - up))]
+    except (ValueError, IndexError):
+        pass
+    virt = run(["systemd-detect-virt"])
+    e.append(("Virtual machine", "no" if virt in ("none", "") else virt))
+    labwc = re.search(r"labwc\s+v?([\d.]+)", run(["labwc", "--version"]))
+    session = ", ".join(x for x in (os.environ.get("XDG_SESSION_TYPE", "").title(),
+                                    f"labwc {labwc.group(1)}" if labwc else "") if x)
+    e += [("Desktop", f"Firox ({session})" if session else ""),
+          ("Look", run(["firox-theme", "get"])),
+          ("Time zone", run(["timedatectl", "show", "-p", "Timezone", "--value"])),
+          ("Language", os.environ.get("LANG", ""))]
+    return e
+
+
+def secure_boot():
+    out = run(["mokutil", "--sb-state"])
+    if out:
+        return "on" if "enabled" in out.lower() else ("off" if "disabled" in out.lower() else out)
+    for f in glob.glob("/sys/firmware/efi/efivars/SecureBoot-*"):
+        try:
+            with open(f, "rb") as fh:
+                return "on" if fh.read()[-1] == 1 else "off"
+        except OSError:
+            pass
+    return "not available" if not os.path.isdir("/sys/firmware/efi") else "unknown"
+
+
+CHASSIS = {"3": "Desktop", "4": "Low-profile desktop", "6": "Mini tower", "7": "Tower", "8": "Portable",
+           "9": "Laptop", "10": "Notebook", "13": "All-in-one", "14": "Sub-notebook", "30": "Tablet",
+           "31": "Convertible", "32": "Detachable", "35": "Mini PC", "36": "Stick PC", "1": "Other"}
+
+
+def c_computer():
+    d = "/sys/class/dmi/id/"
+    r = lambda f: read(d + f)  # noqa: E731
+    return [("Manufacturer", r("sys_vendor")), ("Model", r("product_name")), ("Version", r("product_version")),
+            ("Family", r("product_family")), ("SKU", r("product_sku")),
+            ("Type", CHASSIS.get(r("chassis_type"), r("chassis_type"))),
+            ("Motherboard", [("Manufacturer", r("board_vendor")), ("Model", r("board_name")),
+                             ("Version", r("board_version"))]),
+            ("BIOS / firmware", [("Vendor", r("bios_vendor")), ("Version", r("bios_version")),
+                                 ("Date", r("bios_date")), ("Release", r("bios_release")),
+                                 ("Embedded controller", r("ec_firmware_release"))])]
+
+
+def flatten_lscpu(items, out):
+    for it in items or []:
+        out[it.get("field", "").rstrip(":")] = it.get("data")
+        flatten_lscpu(it.get("children"), out)
+
+
+def c_cpu():
+    j = run_json(["lscpu", "-J"]) or {}
+    f = {}
+    flatten_lscpu(j.get("lscpu"), f)
+    info = read("/proc/cpuinfo")
+    mhz = [float(m) for m in re.findall(r"^cpu MHz\s*:\s*([\d.]+)", info, re.M)]
+    micro = re.search(r"^microcode\s*:\s*(\S+)", info, re.M)
+    flags = set((f.get("Flags") or "").split())
+    features = [name for flag, name in (("sse4_2", "SSE4.2"), ("avx", "AVX"), ("avx2", "AVX2"), ("fma", "FMA"),
+                                        ("avx512f", "AVX-512"), ("avx_vnni", "AVX-VNNI"), ("aes", "AES-NI"),
+                                        ("sha_ni", "SHA"), ("vmx", "VT-x"), ("svm", "AMD-V"),
+                                        ("sme", "Memory encryption (SME)"), ("ht", "Hyper-threading/SMT"))
+                if flag in flags]
+    cf = "/sys/devices/system/cpu/cpu0/cpufreq/"
+    e = [("Name", f.get("Model name", "")), ("Vendor", f.get("Vendor ID", "")),
+         ("Architecture", f.get("Architecture", "")),
+         ("Cores", f"{f.get('Socket(s)', '1')} socket(s) × {f.get('Core(s) per socket', '?')} cores × "
+                   f"{f.get('Thread(s) per core', '?')} threads = {f.get('CPU(s)', '?')} logical processors"),
+         ("Family / model / stepping", f"{f.get('CPU family', '')} / {f.get('Model', '')} / {f.get('Stepping', '')}"),
+         ("Microcode", micro.group(1) if micro else ""),
+         ("Maximum speed", f"{float(f['CPU max MHz']):.0f} MHz" if f.get("CPU max MHz") else ""),
+         ("Minimum speed", f"{float(f['CPU min MHz']):.0f} MHz" if f.get("CPU min MHz") else ""),
+         ("Speed now", f"{sum(mhz) / len(mhz):.0f} MHz average ({min(mhz):.0f}–{max(mhz):.0f})" if mhz else ""),
+         ("Caches", [("L1 data", f.get("L1d cache", "")), ("L1 instruction", f.get("L1i cache", "")),
+                     ("L2", f.get("L2 cache", "")), ("L3", f.get("L3 cache", ""))]),
+         ("Features", ", ".join(features)),
+         ("Virtualization", f.get("Virtualization", "")),
+         ("Frequency driver", read(cf + "scaling_driver")), ("Governor", read(cf + "scaling_governor")),
+         ("Energy preference", read(cf + "energy_performance_preference")),
+         ("Boost", {"1": "on", "0": "off"}.get(read("/sys/devices/system/cpu/cpufreq/boost"), "")),
+         ("NUMA nodes", f.get("NUMA node(s)", ""))]
+    temps = []
+    for chip in sorted(glob.glob("/sys/class/hwmon/hwmon*")):
+        if read(chip + "/name") in ("k10temp", "coretemp", "zenpower", "cpu_thermal", "acpitz"):
+            for t in sorted(glob.glob(chip + "/temp*_input")):
+                label = read(t.replace("_input", "_label")) or read(chip + "/name")
+                try:
+                    temps.append((label, f"{int(read(t)) / 1000:.1f} °C"))
+                except ValueError:
+                    pass
+    if temps:
+        e.append(("Temperatures", temps))
+    vulns = []
+    for v in sorted(glob.glob("/sys/devices/system/cpu/vulnerabilities/*")):
+        vulns.append((os.path.basename(v).replace("_", " ").title(), read(v)))
+    if vulns:
+        e.append(("Security issues and mitigations", vulns))
+    e.append(("All flags", f.get("Flags", "")))
+    return e
+
+
+def c_memory():
+    m = {}
+    for line in read("/proc/meminfo").splitlines():
+        k, _, v = line.partition(":")
+        try:
+            m[k] = int(v.split()[0]) * 1024
+        except (ValueError, IndexError):
+            pass
+    total, avail = m.get("MemTotal", 0), m.get("MemAvailable", 0)
+    e = [("Installed (usable)", human(total)), ("In use", f"{human(total - avail)} ({100 * (total - avail) / total:.0f}%)"
+                                                if total else ""),
+         ("Available", human(avail)), ("Cache and buffers", human(m.get("Cached", 0) + m.get("Buffers", 0))),
+         ("Shared", human(m.get("Shmem", 0))), ("Swap", f"{human(m.get('SwapTotal', 0) - m.get('SwapFree', 0))} of "
+                                                       f"{human(m.get('SwapTotal', 0))} used"),
+         ("Huge pages (transparent)", re.sub(r".*\[(\w+)\].*", r"\1",
+                                             read("/sys/kernel/mm/transparent_hugepage/enabled")))]
+    swaps = []
+    for line in run(["swapon", "--show", "--bytes", "--raw", "--noheadings", "--output", "NAME,TYPE,SIZE,USED,PRIO"]).splitlines():
+        p = line.split()
+        if len(p) >= 5:
+            dev = p[0]
+            extra = ""
+            if "zram" in dev:
+                alg = read(f"/sys/block/{os.path.basename(dev)}/comp_algorithm")
+                alg = re.sub(r".*\[(\w+)\].*", r"\1", alg)
+                extra = f", compressed with {alg}" if alg else ", compressed"
+            swaps.append((dev, f"{human(p[2])} ({p[1]}{extra}), {human(p[3])} used, priority {p[4]}"))
+    if swaps:
+        e.append(("Swap devices", swaps))
+    e.append(("Memory modules", "Click “Read Memory Modules…” above (it asks for your password)."))
+    return e
+
+
+def memory_modules():
+    """dmidecode -t 17 (needs root, asked for with pkexec)."""
+    try:
+        r = subprocess.run(["pkexec", "dmidecode", "-t", "17"], capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.SubprocessError) as err:
+        return None, str(err)
+    if r.returncode != 0:
+        return None, (r.stderr.strip() or "dmidecode didn't run") if r.returncode not in (126, 127) else "Not allowed."
+    mods, empty = [], 0
+    for block in r.stdout.split("\n\n"):
+        if "Memory Device" not in block:
+            continue
+        f = kv(block)
+        if f.get("Size", "").startswith("No Module") or f.get("Size") in ("", "Unknown"):
+            empty += 1
+            continue
+        mods.append((f.get("Locator", "?") + (f" ({f['Bank Locator']})" if f.get("Bank Locator") else ""),
+                     [("Size", f.get("Size")), ("Type", f"{f.get('Type', '')} {f.get('Type Detail', '')}".strip()),
+                      ("Speed", f.get("Speed")), ("Running at", f.get("Configured Memory Speed")),
+                      ("Form factor", f.get("Form Factor")), ("Ranks", f.get("Rank")),
+                      ("Manufacturer", f.get("Manufacturer")), ("Part number", f.get("Part Number")),
+                      ("Voltage", f.get("Configured Voltage"))]))
+    mods.append(("Empty slots", str(empty)))
+    return keep(mods), None
+
+
+def c_graphics():
+    e = []
+    vk = run(["vulkaninfo", "--summary"], 15)
+    vk_devices = []
+    for block in re.split(r"\nGPU\d+:\n", "\n" + vk)[1:]:
+        f = kv(block, "=")
+        vk_devices.append(f)
+    gl = {}
+    if os.environ.get("DISPLAY"):
+        gl = kv(run(["glxinfo", "-B"], 8))
+    for i, g in enumerate(firox_gpu.find() if firox_gpu else []):
+        dev = g.dev
+        drv_ver = read(f"/sys/module/{g.driver}/version")
+        if g.driver == "nvidia":
+            drv_ver = read("/proc/driver/nvidia/version").splitlines()[0] if read("/proc/driver/nvidia/version") else drv_ver
+        hw = g.read_sysfs()
+        pci = [("Address", g.pci), ("Link now", f"{read(dev + '/current_link_speed')} x{read(dev + '/current_link_width')}"
+                                    if read(dev + "/current_link_speed") else ""),
+               ("Link maximum", f"{read(dev + '/max_link_speed')} x{read(dev + '/max_link_width')}"
+                if read(dev + "/max_link_speed") else "")]
+        rows = [("Name", g.name), ("Vendor", g.vendor), ("Driver", g.driver + (f" {drv_ver}" if drv_ver else "")),
+                ("Video memory", human(hw.get("vram_total")) if hw.get("vram_total") else
+                 ("shared with the system" if g.integrated else "")),
+                ("Shared (GTT) memory", human(int(read(dev + "/mem_info_gtt_total") or 0)) if read(dev + "/mem_info_gtt_total") else ""),
+                ("Video BIOS", read(dev + "/vbios_version")),
+                ("Temperature", f"{hw['temp']:.0f} °C" if hw.get("temp") is not None else ""),
+                ("Clock now", f"{hw['clock']:.0f} MHz" if hw.get("clock") else ""),
+                ("Power now", f"{hw['power']:.0f} W" if hw.get("power") is not None else ""),
+                ("PCI Express", pci)]
+        if g.vendor == "NVIDIA":
+            smi = run(["nvidia-smi", "--query-gpu=driver_version,vbios_version,power.limit,pcie.link.gen.current,"
+                       "pcie.link.width.current", "--format=csv,noheader"])
+            if smi:
+                rows.append(("nvidia-smi", smi))
+        e.append((f"GPU {i}: {g.name}", rows))
+    for i, f in enumerate(vk_devices):
+        kind = {"PHYSICAL_DEVICE_TYPE_DISCRETE_GPU": "Graphics card", "PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU":
+                "Built-in graphics", "PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU": "Virtual graphics",
+                "PHYSICAL_DEVICE_TYPE_CPU": "Software (runs on the processor)"}.get(f.get("deviceType"),
+                                                                                    f.get("deviceType"))
+        e.append((f"Vulkan device {i}", [("Name", f.get("deviceName")), ("Type", kind),
+                                         ("Driver", f"{f.get('driverName', '')} {f.get('driverInfo', '')}".strip()),
+                                         ("Vulkan version", f.get("apiVersion")),
+                                         ("Conformance", f.get("conformanceVersion"))]))
+    if gl:
+        e.append(("OpenGL", [("Renderer", gl.get("OpenGL renderer string")),
+                             ("Version", gl.get("OpenGL core profile version string") or gl.get("OpenGL version string")),
+                             ("Vendor", gl.get("OpenGL vendor string"))]))
+    mesa = run(["rpm", "-q", "--qf", "%{VERSION}", "mesa-dri-drivers"])
+    e.append(("Mesa", mesa if "not installed" not in mesa else ""))
+    if not e:
+        e.append(("Graphics", "No graphics card found."))
+    return e
+
+
+def c_displays():
+    j = run_json(["wlr-randr", "--json"]) or []
+    e = []
+    for o in j:
+        cur = next((m for m in o.get("modes", []) if m.get("current")), None)
+        size = o.get("physical_size") or {}
+        diag = ""
+        if size.get("width") and size.get("height"):
+            diag = f"{(size['width'] ** 2 + size['height'] ** 2) ** 0.5 / 25.4:.1f}″ ({size['width']}×{size['height']} mm)"
+        best = max(o.get("modes", []), key=lambda m: (m.get("width", 0) * m.get("height", 0), m.get("refresh", 0)),
+                   default=None)
+        e.append((o.get("name", "?"), [
+            ("Monitor", " ".join(x for x in (o.get("make"), o.get("model")) if x and x != "Unknown")),
+            ("Serial", o.get("serial") if o.get("serial") not in ("", "Unknown") else ""),
+            ("On", "yes" if o.get("enabled") else "no"),
+            ("Resolution", f"{cur['width']}×{cur['height']} at {cur['refresh']:.2f} Hz" if cur else ""),
+            ("Best mode", f"{best['width']}×{best['height']} at {best['refresh']:.2f} Hz" if best else ""),
+            ("Scale", o.get("scale")), ("Position", f"{o.get('position', {}).get('x')}, {o.get('position', {}).get('y')}"),
+            ("Rotation", o.get("transform")), ("Adaptive sync (VRR)", o.get("adaptive_sync")),
+            ("Size", diag), ("Modes", str(len(o.get("modes", []))))]))
+    return e or [("Displays", "wlr-randr found no displays (or isn't running in a Firox session).")]
+
+
+def c_storage():
+    j = run_json(["lsblk", "-J", "-b", "-o", "NAME,PATH,TYPE,SIZE,MODEL,SERIAL,VENDOR,TRAN,ROTA,RM,RO,FSTYPE,FSVER,"
+                  "LABEL,MOUNTPOINTS,FSUSE%,FSSIZE,FSAVAIL,PTTYPE"]) or {}
+    e = []
+
+    def part_rows(p):
+        mounts = [m for m in (p.get("mountpoints") or []) if m]
+        rows = [("Size", human(p.get("size"))), ("Filesystem", " ".join(x for x in (p.get("fstype"), p.get("fsver")) if x)),
+                ("Label", p.get("label")),
+                ("Mounted at", ", ".join(mounts[:4]) + (" …" if len(mounts) > 4 else "")),
+                ("Used", f"{p.get('fsuse%')} of {human(p.get('fssize'))}, {human(p.get('fsavail'))} free"
+                 if p.get("fssize") else ""),
+                ("Encrypted", "yes (LUKS)" if p.get("fstype") == "crypto_LUKS" else "")]
+        for c in p.get("children") or []:
+            rows.append((f"{c.get('name')} ({c.get('type')})", part_rows(c)))
+        return rows
+    for d in j.get("blockdevices", []):
+        if d.get("type") not in ("disk",) or d.get("name", "").startswith(("zram", "loop")):
+            continue
+        tran = (d.get("tran") or "").upper()
+        kind = "SSD" if d.get("rota") in (False, "0", 0) else "Hard disk"
+        if d.get("name", "").startswith("nvme"):
+            kind, tran = "NVMe SSD", tran or "NVMe"
+        rows = [("Model", " ".join(x for x in (d.get("vendor"), d.get("model")) if x)), ("Kind", kind),
+                ("Connected by", tran), ("Size", human(d.get("size"))),
+                ("Removable", "yes" if d.get("rm") in (True, "1", 1) else ""),
+                ("Partition table", (d.get("pttype") or "").upper()), ("Serial", d.get("serial"))]
+        if d.get("name", "").startswith("nvme"):
+            ctrl = re.sub(r"n\d+$", "", d["name"])
+            rows.append(("Firmware", read(f"/sys/class/nvme/{ctrl}/firmware_rev")))
+        for chip in glob.glob("/sys/class/hwmon/hwmon*"):
+            if read(chip + "/name") in ("nvme", "drivetemp") and d.get("name", "") in os.path.realpath(chip):
+                t = read(chip + "/temp1_input")
+                if t.isdigit():
+                    rows.append(("Temperature", f"{int(t) / 1000:.0f} °C"))
+        for p in d.get("children") or []:
+            rows.append((f"{p.get('name')}", part_rows(p)))
+        e.append((f"{d.get('name')}: {' '.join(x for x in (d.get('model'),) if x) or kind}", rows))
+    for path, label in (("/", "System (/)"), (os.path.expanduser("~"), "Your files (home)")):
+        try:
+            st = os.statvfs(path)
+            total, free = st.f_blocks * st.f_frsize, st.f_bavail * st.f_frsize
+            e.append((label, f"{human(total - free)} used of {human(total)}, {human(free)} free"))
+        except OSError:
+            pass
+    return e
+
+
+def c_network():
+    j = run_json(["ip", "-j", "addr"]) or []
+    e = []
+    for i in j:
+        name = i.get("ifname")
+        if name == "lo":
+            continue
+        path = f"/sys/class/net/{name}"
+        kind = "Wi-Fi" if os.path.isdir(path + "/wireless") else ("Virtual" if not os.path.exists(path + "/device")
+                                                                    else "Wired")
+        addrs = [f"{a.get('local')}/{a.get('prefixlen')}" for a in i.get("addr_info", [])]
+        speed = read(path + "/speed")
+        rows = [("Kind", kind), ("State", (i.get("operstate") or "").lower()), ("MAC address", i.get("address")),
+                ("Addresses", ", ".join(addrs)), ("Speed", f"{speed} Mb/s" if speed.isdigit() and int(speed) > 0 else ""),
+                ("Driver", os.path.basename(os.path.realpath(path + "/device/driver")) if os.path.exists(path + "/device/driver") else ""),
+                ("MTU", i.get("mtu"))]
+        e.append((name, rows))
+    wifi = run(["nmcli", "-t", "-f", "IN-USE,SSID,SIGNAL,FREQ,CHAN,RATE,SECURITY", "dev", "wifi"])
+    for line in wifi.splitlines():
+        if line.startswith("*"):
+            p = re.split(r"(?<!\\):", line)
+            if len(p) >= 7:
+                e.append(("Wi-Fi connection", [("Network", p[1].replace("\\:", ":")), ("Signal", f"{p[2]}%"),
+                                               ("Frequency", p[3]), ("Channel", p[4]), ("Speed", p[5]),
+                                               ("Security", p[6])]))
+    route = run_json(["ip", "-j", "route", "show", "default"]) or []
+    if route:
+        e.append(("Default gateway", f"{route[0].get('gateway', '')} via {route[0].get('dev', '')}"))
+    dns = sorted(set(re.findall(r"IP[46]\.DNS\[\d+\]:(\S+)", run(["nmcli", "-t", "dev", "show"]))))
+    if dns:
+        e.append(("DNS servers", ", ".join(dns)))
+    e.append(("Computer name", platform.node()))
+    return e
+
+
+def c_sound():
+    e = []
+    info = kv(run(["pactl", "info"]))
+    e += [("Sound server", info.get("Server Name", "")), ("Default output", info.get("Default Sink", "")),
+          ("Default input", info.get("Default Source", ""))]
+    for what, label in (("sinks", "Output"), ("sources", "Input")):
+        for d in run_json(["pactl", "-f", "json", "list", what]) or []:
+            if d.get("monitor_source") is None and what == "sources" and ".monitor" in d.get("name", ""):
+                continue
+            if ".monitor" in d.get("name", ""):
+                continue
+            props = d.get("properties", {})
+            e.append((f"{label}: {d.get('description', d.get('name'))}", [
+                ("State", (d.get("state") or "").lower()), ("Format", d.get("sample_specification")),
+                ("Active port", d.get("active_port")), ("Device", props.get("alsa.card_name") or props.get("device.description")),
+                ("Bus", props.get("device.bus")), ("Muted", "yes" if d.get("mute") else "no")]))
+    return e or [("Sound", "No sound server is answering.")]
+
+
+def c_bluetooth():
+    show = run(["bluetoothctl", "show"], 5)
+    if not show:
+        return [("Bluetooth", "No Bluetooth adapter found.")]
+    f = kv(show)
+    m = re.search(r"Controller (\S+)", show)
+    e = [("Adapter", f"{f.get('Name', '')} ({m.group(1) if m else ''})"), ("On", f.get("Powered", "")),
+         ("Discoverable", f.get("Discoverable", ""))]
+    devs = []
+    for line in run(["bluetoothctl", "devices", "Paired"], 5).splitlines():
+        p = line.split(" ", 2)
+        if len(p) == 3:
+            info = kv(run(["bluetoothctl", "info", p[1]], 5))
+            devs.append((p[2], f"{p[1]}, {'connected' if info.get('Connected') == 'yes' else 'not connected'}"
+                               + (f", battery {info['Battery Percentage'].split('(')[-1].rstrip(')')}%"
+                                  if info.get("Battery Percentage") else "")))
+    if devs:
+        e.append(("Paired devices", devs))
+    return e
+
+
+def c_power():
+    e = []
+    for ps in sorted(glob.glob("/sys/class/power_supply/*")):
+        t = read(ps + "/type")
+        name = os.path.basename(ps)
+        if t == "Mains":
+            e.append((f"Charger ({name})", "plugged in" if read(ps + "/online") == "1" else "not plugged in"))
+        elif t == "Battery" and read(ps + "/scope") != "Device":
+            def num(f):
+                v = read(ps + "/" + f)
+                return int(v) if v.lstrip("-").isdigit() else None
+            full, design = num("energy_full") or num("charge_full"), num("energy_full_design") or num("charge_full_design")
+            now = num("energy_now") or num("charge_now")
+            rate = num("power_now") or num("current_now")
+            unit = "Wh" if num("energy_full") else "Ah"
+            est = ""
+            if rate and now is not None and full:
+                status = read(ps + "/status")
+                hours = (now / rate) if status == "Discharging" else ((full - now) / rate if status == "Charging" else 0)
+                est = f"about {duration(hours * 3600)} {'left' if status == 'Discharging' else 'to full'}" if hours else ""
+            e.append((f"Battery ({name})", [
+                ("Charge", f"{read(ps + '/capacity')}%"), ("Status", read(ps + "/status")), ("Time", est),
+                ("Health", f"{100 * full / design:.0f}% of its original capacity" if full and design else ""),
+                ("Capacity now", f"{full / 1e6:.1f} {unit}" if full else ""),
+                ("Designed for", f"{design / 1e6:.1f} {unit}" if design else ""),
+                ("Charge cycles", read(ps + "/cycle_count")), ("Chemistry", read(ps + "/technology")),
+                ("Maker", read(ps + "/manufacturer")), ("Model", read(ps + "/model_name")),
+                ("Power draw", f"{rate / 1e6:.1f} W" if rate and unit == "Wh" else ""),
+                ("Charge limit", f"{read(ps + '/charge_control_end_threshold')}%" if read(ps + "/charge_control_end_threshold") else "")]))
+    e.append(("Power mode", run(["powerprofilesctl", "get"]) or run(["tuned-adm", "active"])))
+    if not any(k.startswith("Battery") for k, _v in e):
+        e.insert(0, ("Battery", "none (desktop computer)"))
+    return e
+
+
+def c_sensors():
+    e = []
+    for chip in sorted(glob.glob("/sys/class/hwmon/hwmon*")):
+        name = read(chip + "/name")
+        rows = []
+        for f in sorted(glob.glob(chip + "/*_input"), key=lambda p: (re.sub(r"\d+", "", os.path.basename(p)),
+                                                                      int(re.sub(r"\D", "", os.path.basename(p)) or 0))):
+            base = os.path.basename(f).replace("_input", "")
+            label = read(f"{chip}/{base}_label") or base
+            v = read(f)
+            if not v.lstrip("-").isdigit():
+                continue
+            v = int(v)
+            if base.startswith("temp"):
+                rows.append((label, f"{v / 1000:.1f} °C"))
+            elif base.startswith("fan"):
+                rows.append((label, f"{v} RPM"))
+            elif base.startswith("in"):
+                rows.append((label, f"{v / 1000:.3f} V"))
+            elif base.startswith("curr"):
+                rows.append((label, f"{v / 1000:.2f} A"))
+            elif base.startswith("power"):
+                rows.append((label, f"{v / 1e6:.1f} W"))
+        for f in sorted(glob.glob(chip + "/power*_average")):
+            v = read(f)
+            if v.isdigit():
+                rows.append((os.path.basename(f).replace("_average", ""), f"{int(v) / 1e6:.1f} W"))
+        if rows:
+            e.append((name, rows))
+    return e or [("Sensors", "No sensors found.")]
+
+
+def c_usb():
+    e = []
+    for line in run(["lsusb"]).splitlines():
+        m = re.match(r"Bus (\d+) Device (\d+): ID (\S+)\s*(.*)", line)
+        if m and "root hub" not in m.group(4):
+            e.append((m.group(4) or m.group(3), f"ID {m.group(3)}, bus {int(m.group(1))} device {int(m.group(2))}"))
+    return e or [("USB", "No USB devices (besides the controllers).")]
+
+
+def c_pci():
+    e = []
+    for block in run(["lspci", "-vmmk"]).split("\n\n"):
+        f = kv(block)
+        if not f.get("Slot"):
+            continue
+        rows = [("Kind", f.get("Class")), ("Maker", f.get("Vendor")), ("Revision", f.get("Rev")),
+                ("Driver", f.get("Driver")), ("Subsystem", " ".join(x for x in (f.get("SVendor"), f.get("SDevice")) if x))]
+        e.append((f"{f.get('Slot')}: {f.get('Device')}", rows))
+    return e or [("PCI", "lspci isn't available.")]
+
+
+def c_input():
+    kinds = {"Keyboards": [], "Mice and touchpads": [], "Other": []}
+    for block in read("/proc/bus/input/devices").split("\n\n"):
+        name = re.search(r'N: Name="([^"]*)"', block)
+        handlers = re.search(r"H: Handlers=(.*)", block)
+        if not name:
+            continue
+        h = handlers.group(1) if handlers else ""
+        n = name.group(1)
+        if "kbd" in h and "mouse" not in h and re.search(r"keyboard|kbd", n, re.I):
+            kinds["Keyboards"].append((n, ""))
+        elif "mouse" in h:
+            kinds["Mice and touchpads"].append((n, "touchpad" if re.search(r"touchpad|trackpad", n, re.I) else ""))
+        else:
+            kinds["Other"].append((n, ""))
+    return [(k, [(n, v or "yes") for n, v in sorted(set(rows))]) for k, rows in kinds.items() if rows]
+
+
+def c_software():
+    e = []
+    st = run_json(["rpm-ostree", "status", "--json", "--booted"], 15) or {}
+    deps = st.get("deployments", []) if isinstance(st, dict) else []
+    if deps:
+        layered = deps[0].get("requested-packages", [])
+        e.append(("Added packages (layered)", ", ".join(layered) or "none"))
+    e.append(("Installed packages (RPM)", str(len(run(["rpm", "-qa"], 20).splitlines()))))
+    apps = []
+    for line in run(["flatpak", "list", "--app", "--columns=name,application,version,branch,origin,installation"], 15).splitlines():
+        p = line.split("\t")
+        if len(p) >= 6:
+            apps.append((p[0], f"{p[1]} {p[2]} ({p[4]}, {p[5]})".replace("  ", " ")))
+    e.append((f"Flatpak apps ({len(apps)})", apps or [("Flatpak apps", "none")]))
+    e.append(("Android (Waydroid)", "set up" if os.path.exists("/var/lib/waydroid/waydroid.cfg") else "not set up"))
+    e.append(("Kernel modules loaded", str(len(read("/proc/modules").splitlines()))))
+    e.append(("Kernel options", read("/proc/cmdline")))
+    for name, argv in (("Firefox", ["rpm", "-q", "--qf", "%{VERSION}", "firefox"]),
+                       ("Python", ["python3", "--version"]), ("GTK", ["rpm", "-q", "--qf", "%{VERSION}", "gtk3"]),
+                       ("labwc", ["rpm", "-q", "--qf", "%{VERSION}", "labwc"]),
+                       ("PipeWire", ["rpm", "-q", "--qf", "%{VERSION}", "pipewire"]),
+                       ("MangoHud", ["rpm", "-q", "--qf", "%{VERSION}", "mangohud"])):
+        v = run(argv)
+        if v and "not installed" not in v:
+            e.append((name, v.replace("Python ", "")))
+    return e
+
+
+def c_security():
+    e = [("SELinux", run(["getenforce"]) or "unknown"), ("Secure Boot", secure_boot())]
+    tpm = glob.glob("/sys/class/tpm/tpm*")
+    e.append(("TPM", f"version {read(tpm[0] + '/tpm_version_major') or '?'}" if tpm else "none found"))
+    blk = run_json(["lsblk", "-J", "-o", "NAME,FSTYPE"]) or {}
+
+    def luks(items):
+        return any(d.get("fstype") == "crypto_LUKS" or luks(d.get("children")) for d in items or [])
+    e.append(("Disk encryption", "yes (LUKS)" if luks(blk.get("blockdevices")) else "no"))
+    fw = run(["firewall-cmd", "--state"], 5)
+    e.append(("Firewall", fw or ("on" if run(["systemctl", "is-active", "firewalld"]) == "active" else "off")))
+    for unit, label in (("uupd.timer", "Automatic updates"), ("rpm-ostreed-automatic.timer", "Automatic updates (rpm-ostree)")):
+        state = run(["systemctl", "is-enabled", unit])
+        if state:
+            last = run(["systemctl", "show", unit, "-p", "LastTriggerUSec", "--value"])
+            e.append((label, f"{state}" + (f", last run {last}" if last and last != "n/a" else "")))
+    e.append(("Remote login (SSH server)", run(["systemctl", "is-enabled", "sshd"]) or "not installed"))
+    return e
+
+
+def c_problems():
+    e = []
+    sys_failed = run(["systemctl", "--failed", "--plain", "--no-legend"]).splitlines()
+    user_failed = run(["systemctl", "--user", "--failed", "--plain", "--no-legend"]).splitlines()
+    e.append(("Failed system services", [(l.split()[0], " ".join(l.split()[1:])) for l in sys_failed if l.strip()]
+              or [("System services", "none failed")]))
+    e.append(("Failed services of yours", [(l.split()[0], " ".join(l.split()[1:])) for l in user_failed if l.strip()]
+              or [("Your services", "none failed")]))
+    errs = run(["journalctl", "-b", "-p", "3", "-n", "40", "--no-pager", "-o", "short-iso"], 15).splitlines()
+    errs = [l for l in errs if l and not l.startswith("--")]
+    rows = []
+    for l in errs[-40:]:
+        m = re.match(r"(\S+)\s+\S+\s+([^:\[]+)(?:\[\d+\])?:\s*(.*)", l)
+        if m:
+            rows.append((f"{m.group(1)[11:19]} {m.group(2)}", m.group(3)))
+    e.append(("Errors since this start (newest last)", rows or [("Errors", "none you're allowed to see")]))
+    return e
+
+
+CATEGORIES = [("summary", "System Summary", "computer", c_summary),
+              ("computer", "Computer", "computer", c_computer),
+              ("cpu", "Processor", "cpu", c_cpu),
+              ("memory", "Memory", "media-memory", c_memory),
+              ("graphics", "Graphics", "video-display", c_graphics),
+              ("displays", "Displays", "video-display", c_displays),
+              ("storage", "Storage", "drive-harddisk", c_storage),
+              ("network", "Network", "network-wired", c_network),
+              ("sound", "Sound", "audio-card", c_sound),
+              ("bluetooth", "Bluetooth", "bluetooth", c_bluetooth),
+              ("power", "Battery and Power", "battery", c_power),
+              ("sensors", "Sensors", "sensors-temperature-symbolic", c_sensors),
+              ("usb", "USB Devices", "drive-removable-media", c_usb),
+              ("pci", "PCI Devices", "applications-system", c_pci),
+              ("input", "Input Devices", "input-keyboard", c_input),
+              ("software", "Software", "system-software-install", c_software),
+              ("security", "Security", "security-high", c_security),
+              ("problems", "Problems", "dialog-warning", c_problems)]
+
+
+def gather(keys=None, progress=None):
+    out = {}
+    for key, title, _icon, fn in CATEGORIES:
+        if keys and key not in keys:
+            continue
+        if progress:
+            progress(title)
+        try:
+            out[key] = keep(fn())
+        except Exception as err:            # one odd device mustn't spoil the rest
+            out[key] = [("Couldn't read this", f"{type(err).__name__}: {err}")]
+    return out
+
+
+def report_text(data):
+    lines = [f"Firox System Information, {datetime.datetime.now():%Y-%m-%d %H:%M}", ""]
+
+    def walk(entries, depth):
+        for k, v in entries:
+            if isinstance(v, list):
+                lines.append("  " * depth + f"{k}:")
+                walk(v, depth + 1)
+            else:
+                lines.append("  " * depth + f"{k}: {v}")
+    for key, title, _icon, _fn in CATEGORIES:
+        if key in data:
+            lines += [f"== {title} ==", ""]
+            walk(data[key], 0)
+            lines.append("")
+    return "\n".join(lines)
+
+
+# ----------------------------------------------------------------- gui --
+
+def gui(start=None):
+    import gi
+    gi.require_version("Gtk", "3.0")
+    gi.require_version("Gdk", "3.0")
+    from gi.repository import Gdk, GLib, Gtk, Pango
+
+    class Window(Gtk.Window):
+        def __init__(self):
+            super().__init__(title="System Information")
+            self.set_icon_name("computer")
+            self.set_default_size(1000, 660)
+            self.data = {}
+            root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+            self.add(root)
+            bar = Gtk.Box(spacing=6)
+            bar.set_border_width(6)
+            self.search = Gtk.SearchEntry(placeholder_text="Find in all categories", width_chars=30)
+            self.search.connect("search-changed", lambda *_: self.show_category())
+            bar.pack_start(self.search, False, False, 0)
+            self.mods_btn = Gtk.Button.new_with_mnemonic("Read _Memory Modules…")
+            self.mods_btn.set_tooltip_text("Which slots are used, speeds and part numbers (asks for your password)")
+            self.mods_btn.connect("clicked", lambda *_: self.read_modules())
+            self.mods_btn.set_no_show_all(True)
+            bar.pack_start(self.mods_btn, False, False, 0)
+            for label, cb, tip in (("_Save Report…", self.save, "Everything, as a text file"),
+                                   ("_Copy", self.copy, "The selected rows, or this whole category"),
+                                   ("_Refresh", self.refresh, "Read everything again")):
+                b = Gtk.Button.new_with_mnemonic(label)
+                b.set_tooltip_text(tip)
+                b.connect("clicked", lambda _b, cb=cb: cb())
+                bar.pack_end(b, False, False, 0)
+            root.pack_start(bar, False, False, 0)
+            paned = Gtk.Paned()
+            root.pack_start(paned, True, True, 0)
+            self.cats = Gtk.ListStore(str, str, str)       # key, title, icon
+            for key, title, icon, _fn in CATEGORIES:
+                self.cats.append([key, title, icon])
+            self.cat_view = Gtk.TreeView(model=self.cats, headers_visible=False)
+            col = Gtk.TreeViewColumn()
+            pix = Gtk.CellRendererPixbuf()
+            col.pack_start(pix, False)
+            col.add_attribute(pix, "icon-name", 2)
+            txt = Gtk.CellRendererText()
+            col.pack_start(txt, True)
+            col.add_attribute(txt, "text", 1)
+            self.cat_view.append_column(col)
+            self.cat_view.get_selection().connect("changed", lambda *_: self.show_category())
+            sw = Gtk.ScrolledWindow()
+            sw.set_size_request(200, -1)
+            sw.add(self.cat_view)
+            paned.pack1(sw, False, False)
+            self.store = Gtk.TreeStore(str, str)
+            self.view = Gtk.TreeView(model=self.store)
+            self.view.set_enable_search(False)
+            self.view.get_selection().set_mode(Gtk.SelectionMode.MULTIPLE)
+            k = Gtk.CellRendererText(weight=600)
+            kc = Gtk.TreeViewColumn("Item", k, text=0)
+            kc.set_resizable(True)
+            kc.set_min_width(220)
+            self.view.append_column(kc)
+            v = Gtk.CellRendererText(ellipsize=Pango.EllipsizeMode.END)
+            vc = Gtk.TreeViewColumn("Value", v, text=1)
+            vc.set_expand(True)
+            self.view.append_column(vc)
+            self.view.set_tooltip_column(1)
+            rsw = Gtk.ScrolledWindow()
+            rsw.add(self.view)
+            self.stack = Gtk.Stack()
+            spin = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, valign=Gtk.Align.CENTER)
+            sp = Gtk.Spinner()
+            sp.start()
+            spin.pack_start(sp, False, False, 0)
+            self.wait_label = Gtk.Label(label="Looking at this computer…")
+            spin.pack_start(self.wait_label, False, False, 0)
+            self.stack.add_named(spin, "wait")
+            self.stack.add_named(rsw, "info")
+            paned.pack2(self.stack, True, False)
+            paned.set_position(210)
+            self.status = Gtk.Label(xalign=0)
+            self.status.set_margin_start(8)
+            self.status.set_margin_top(3)
+            self.status.set_margin_bottom(3)
+            self.status.get_style_context().add_class("dim-label")
+            root.pack_start(self.status, False, False, 0)
+            self.connect("destroy", Gtk.main_quit)
+            self.connect("key-press-event", self.on_key)
+            index = next((i for i, c in enumerate(CATEGORIES) if c[0] == start), 0)
+            self.cat_view.get_selection().select_path(Gtk.TreePath.new_from_indices([index]))
+            self.refresh()
+
+        def on_key(self, _w, ev):
+            ctrl = ev.state & Gdk.ModifierType.CONTROL_MASK
+            if ctrl and ev.keyval in (Gdk.KEY_f, Gdk.KEY_F):
+                self.search.grab_focus()
+            elif ctrl and ev.keyval in (Gdk.KEY_c, Gdk.KEY_C) and not self.search.has_focus():
+                self.copy()
+            elif ctrl and ev.keyval in (Gdk.KEY_s, Gdk.KEY_S):
+                self.save()
+            elif ev.keyval == Gdk.KEY_F5:
+                self.refresh()
+            elif ev.keyval == Gdk.KEY_Escape and self.search.get_text():
+                self.search.set_text("")
+            else:
+                return False
+            return True
+
+        def current_key(self):
+            model, it = self.cat_view.get_selection().get_selected()
+            return model[it][0] if it is not None else CATEGORIES[0][0]
+
+        def refresh(self):
+            self.stack.set_visible_child_name("wait")
+            started = time.monotonic()
+
+            def work():
+                data = gather(progress=lambda t: GLib.idle_add(self.wait_label.set_text, f"Looking at: {t}…"))
+                GLib.idle_add(done, data)
+
+            def done(data):
+                self.data = data
+                self.stack.set_visible_child_name("info")
+                self.show_category()
+                self.status.set_text(f"Read in {time.monotonic() - started:.1f} s. "
+                                     "Select rows and press Ctrl+C to copy them, or save the whole report.")
+                return False
+            threading.Thread(target=work, daemon=True).start()
+
+        def fill(self, parent, entries, query=None):
+            shown = False
+            for k, v in entries:
+                if isinstance(v, list):
+                    it = self.store.append(parent, [k, ""])
+                    match_self = query and query in k.casefold()
+                    if self.fill(it, v, None if match_self else query) or not query or match_self:
+                        shown = True
+                    else:
+                        self.store.remove(it)
+                elif not query or query in k.casefold() or query in v.casefold():
+                    self.store.append(parent, [k, v])
+                    shown = True
+            return shown
+
+        def show_category(self):
+            key = self.current_key()
+            self.mods_btn.set_visible(key == "memory" and not self.search.get_text())
+            self.store.clear()
+            query = self.search.get_text().strip().casefold()
+            if query:
+                for ckey, title, _i, _f in CATEGORIES:
+                    if ckey in self.data:
+                        it = self.store.append(None, [title, ""])
+                        if not self.fill(it, self.data[ckey], query):
+                            self.store.remove(it)
+                if len(self.store) == 0:
+                    self.store.append(None, ["Nothing found", f"No item mentions “{self.search.get_text()}”."])
+            else:
+                self.fill(None, self.data.get(key, []))
+            self.view.expand_all()
+
+        def rows_text(self, paths=None):
+            lines = []
+
+            def walk(it, depth):
+                while it is not None:
+                    k, v = self.store[it][0], self.store[it][1]
+                    lines.append("  " * depth + (f"{k}: {v}" if v else f"{k}:"))
+                    walk(self.store.iter_children(it), depth + 1)
+                    it = self.store.iter_next(it)
+            if paths:
+                for p in paths:
+                    it = self.store.get_iter(p)
+                    lines.append(f"{self.store[it][0]}: {self.store[it][1]}")
+            else:
+                walk(self.store.get_iter_first(), 0)
+            return "\n".join(lines)
+
+        def copy(self):
+            _m, paths = self.view.get_selection().get_selected_rows()
+            text = self.rows_text(paths if paths else None)
+            Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).set_text(text, -1)
+            self.status.set_text(f"Copied {'the selected rows' if paths else 'this category'}.")
+
+        def save(self):
+            dlg = Gtk.FileChooserNative.new("Save Report", self, Gtk.FileChooserAction.SAVE, None, None)
+            dlg.set_current_name(f"system-information-{platform.node()}-{datetime.date.today()}.txt")
+            dlg.set_do_overwrite_confirmation(True)
+            docs = os.path.expanduser("~/Documents")
+            dlg.set_current_folder(docs if os.path.isdir(docs) else os.path.expanduser("~"))
+            if dlg.run() == Gtk.ResponseType.ACCEPT:
+                path = dlg.get_filename()
+                try:
+                    with open(path, "w") as fh:
+                        fh.write(report_text(self.data))
+                    self.status.set_text(f"Saved {path}. It includes details such as serial numbers and addresses; "
+                                         "check it before you share it.")
+                except OSError as err:
+                    self.status.set_text(f"Couldn't save: {err}")
+
+        def read_modules(self):
+            self.mods_btn.set_sensitive(False)
+            self.status.set_text("Reading the memory modules…")
+
+            def work():
+                mods, err = memory_modules()
+                GLib.idle_add(done, mods, err)
+
+            def done(mods, err):
+                self.mods_btn.set_sensitive(True)
+                if err:
+                    self.status.set_text(f"Couldn't read the memory modules: {err}")
+                    return False
+                entries = [(k, v) for k, v in self.data.get("memory", []) if k != "Memory modules"]
+                entries.append(("Memory modules", mods or [("Modules", "none reported")]))
+                self.data["memory"] = entries
+                self.show_category()
+                self.status.set_text("Memory modules read.")
+                return False
+            threading.Thread(target=work, daemon=True).start()
+
+    win = Window()
+    win.show_all()
+    Gtk.main()
+    return 0
+
+
+def main(argv):
+    if argv[:1] == ["--report"]:
+        text = report_text(gather())
+        if len(argv) > 1:
+            with open(argv[1], "w") as fh:
+                fh.write(text)
+        else:
+            print(text)
+        return 0
+    if argv[:1] in (["-h"], ["--help"]):
+        print(__doc__.strip())
+        return 0
+    return gui(argv[0] if argv else None)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

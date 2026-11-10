@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Firox Gaming HUD
+Comment=Frame rate, frame times, GPU and CPU over your games
+Exec=firox-hud
+Icon=applications-games
+Categories=Game;Settings;
+Keywords=hud;fps;mangohud;overlay;frame rate;frametime;gaming;performance;
+StartupNotify=true

@@ -93,7 +93,12 @@ PACKAGES=(
     ristretto                    # Picture viewer
     htop
     btop                         # Task Manager
-    xfce4-terminal               # Command Prompt (tabs, preferences)
+    xfce4-terminal               # spare terminal (the Command Prompt is firox-terminal)
+    nvtop                        # GPU Monitor in a terminal (Task Manager > View)
+    mangohud                     # Firox Gaming HUD (firox-hud): the in-game overlay
+    mangohud.i686                # ... for 32-bit games too
+    vulkan-tools                 # vulkaninfo (System Information), vkcube (Gaming HUD > Try It)
+    dmidecode                    # System Information: memory modules (asks for your password)
     vlc                          # Media Player (music, videos, DVDs)
     vlc-plugin-ffmpeg            # VLC's codecs (weak deps are off; uses the base's full ffmpeg)
     fastfetch
@@ -105,7 +110,7 @@ PACKAGES=(
     asciiquarium
     cmatrix
     cbonsai
-    vte291                       # screen savers on every monitor
+    vte291                       # screen savers on every monitor; firox-terminal
     pavucontrol                  # Sounds and Audio Devices
     alsa-tools                   # hda-verb, for `ujust fix-realtek-audio`
     network-manager-applet       # tray icon
