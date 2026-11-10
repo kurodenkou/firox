@@ -1,0 +1,1141 @@
+#!/usr/bin/python3
+"""
+firox-terminal: Firox Terminal, the Command Prompt. Tabs, saved SSH
+connections, find, clickable links and zoom (GTK3 + VTE).
+
+    firox-terminal [OPTIONS] [-x COMMAND [ARGS...]]
+      --working-directory=DIR, --dir=DIR   start in DIR
+      -T TITLE, --title=TITLE              the tab's title
+      -x CMD ARGS..., --execute CMD ARGS   run CMD instead of your shell
+      -e "CMD ARGS"                        the same, as one string
+      -H, --hold                           keep the tab open when CMD ends
+      --ssh NAME|[USER@]HOST               open an SSH connection (a saved
+                                           one, a Host from ~/.ssh/config,
+                                           or any host)
+      --connect                            open "Connect to a Server" (Run: ssh)
+      --disable-server                     ignored (xfce4-terminal's option)
+
+Keys: Ctrl+Shift+T new tab, Ctrl+Shift+W close tab, Ctrl+Shift+N new
+window, Ctrl+PgUp/PgDn switch tabs (Ctrl+Shift+PgUp/PgDn move them),
+Alt+1…9 go to a tab, Ctrl+Shift+C/V copy and paste, Ctrl+Shift+F find,
+Ctrl+Shift+O connect to an SSH server, Ctrl+= / Ctrl+- / Ctrl+0 zoom, F11
+full screen. Ctrl+click opens a link.
+
+SSH: the passwords and host-key questions are ssh's own, in the tab; Firox
+keeps no passwords. Saved connections (name, host, user, port, key file,
+jump host) are in ~/.config/firox/ssh-connections.json (0600); hosts from
+~/.ssh/config are listed too. "Browse Files on This Server" opens the
+server in Firox Explorer over SFTP.
+
+Settings (font, colours, scrollback, cursor, bell): ~/.config/firox/terminal.conf.
+"""
+
+import configparser
+import json
+import os
+import pwd
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+gi.require_version("Vte", "2.91")
+from gi.repository import Gdk, Gio, GLib, Gtk, Pango, Vte  # noqa: E402
+
+APP_ID = "org.firox.Terminal"
+CFG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "firox")
+CONF = os.path.join(CFG_DIR, "terminal.conf")
+HOSTS = os.path.join(CFG_DIR, "ssh-connections.json")
+DEFAULTS = {"font": "Monospace 11", "scheme": "campbell", "scrollback": "10000", "cursor": "block",
+            "blink": "true", "bell": "false", "width": "100", "height": "30"}
+
+# Colour schemes: (foreground, background, cursor, 16 colours)
+SCHEMES = {
+    "campbell": ("Campbell (dark)", "#cccccc", "#0c0c0c", "#ffffff",
+                 "#0c0c0c #c50f1f #13a10e #c19c00 #0037da #881798 #3a96dd #cccccc "
+                 "#767676 #e74856 #16c60c #f9f1a5 #3b78ff #b4009e #61d6d6 #f2f2f2"),
+    "one-half-dark": ("One Half Dark", "#dcdfe4", "#282c34", "#ffffff",
+                      "#282c34 #e06c75 #98c379 #e5c07b #61afef #c678dd #56b6c2 #dcdfe4 "
+                      "#5a6374 #e06c75 #98c379 #e5c07b #61afef #c678dd #56b6c2 #dcdfe4"),
+    "one-half-light": ("One Half Light", "#383a42", "#fafafa", "#4f525d",
+                       "#383a42 #e45649 #50a14f #c18301 #0184bc #a626a4 #0997b3 #fafafa "
+                       "#4f525d #df6c75 #98c379 #e4c07a #61afef #c577dd #56b5c1 #ffffff"),
+    "vintage": ("Vintage (green on black)", "#00ff00", "#000000", "#00ff00",
+                "#000000 #800000 #008000 #808000 #000080 #800080 #008080 #c0c0c0 "
+                "#808080 #ff0000 #00ff00 #ffff00 #0000ff #ff00ff #00ffff #ffffff"),
+}
+CURSORS = {"block": Vte.CursorShape.BLOCK, "ibeam": Vte.CursorShape.IBEAM,
+           "underline": Vte.CursorShape.UNDERLINE}
+URL_RE = r"(?:https?|ftp|sftp|smb|file)://[^\s<>\"'`]*[^\s<>\"'`.,;:!?)\]}]"
+PCRE2_CASELESS, PCRE2_MULTILINE = 0x00000008, 0x00000400
+
+
+def rgba(text):
+    c = Gdk.RGBA()
+    c.parse(text)
+    return c
+
+
+# ---------------------------------------------------------------- settings --
+
+def read_settings():
+    p = configparser.ConfigParser(interpolation=None)
+    try:
+        p.read(CONF)
+    except configparser.Error:
+        pass
+    out = dict(DEFAULTS)
+    if p.has_section("Terminal"):
+        out.update({k: v for k, v in p["Terminal"].items() if k in DEFAULTS})
+    return out
+
+
+def write_settings(settings):
+    p = configparser.ConfigParser(interpolation=None)
+    p["Terminal"] = settings
+    os.makedirs(CFG_DIR, exist_ok=True)
+    with open(CONF + ".tmp", "w") as fh:
+        p.write(fh)
+    os.replace(CONF + ".tmp", CONF)
+
+
+# ------------------------------------------------------------- ssh hosts --
+
+def load_connections():
+    try:
+        with open(HOSTS) as fh:
+            data = json.load(fh)
+        return [c for c in data if isinstance(c, dict) and c.get("host")]
+    except (OSError, ValueError):
+        return []
+
+
+def save_connections(conns):
+    os.makedirs(CFG_DIR, exist_ok=True)
+    fd = os.open(HOSTS + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        json.dump(conns, fh, indent=1)
+    os.replace(HOSTS + ".tmp", HOSTS)
+
+
+def ssh_config_hosts():
+    """The Host aliases in ~/.ssh/config (and files it Includes), without
+    patterns."""
+    out, seen = [], set()
+
+    def read(path, depth=0):
+        if depth > 4 or path in seen:
+            return
+        seen.add(path)
+        try:
+            with open(path) as fh:
+                lines = fh.readlines()
+        except OSError:
+            return
+        for line in lines:
+            words = line.strip().split()
+            if len(words) < 2:
+                continue
+            key = words[0].lower()
+            if key == "host":
+                out.extend(w for w in words[1:] if not any(ch in w for ch in "*?!") and w not in out)
+            elif key == "include":
+                for pattern in words[1:]:
+                    pattern = os.path.expanduser(pattern)
+                    if not os.path.isabs(pattern):
+                        pattern = os.path.expanduser(os.path.join("~/.ssh", pattern))
+                    import glob
+                    for p in sorted(glob.glob(pattern)):
+                        read(p, depth + 1)
+    read(os.path.expanduser("~/.ssh/config"))
+    return out
+
+
+def ssh_argv(conn):
+    argv = ["ssh"]
+    if conn.get("port") and str(conn["port"]) != "22":
+        argv += ["-p", str(conn["port"])]
+    if conn.get("key"):
+        argv += ["-i", os.path.expanduser(conn["key"])]
+    if conn.get("jump"):
+        argv += ["-J", conn["jump"]]
+    argv.append((conn["user"] + "@" if conn.get("user") else "") + conn["host"])
+    return argv
+
+
+def sftp_uri(conn):
+    user = conn.get("user") or ""
+    port = str(conn.get("port") or "")
+    return "sftp://" + (GLib.Uri.escape_string(user, None, False) + "@" if user else "") + conn["host"] + \
+        (f":{port}" if port and port != "22" else "") + "/"
+
+
+def conn_label(conn):
+    return conn.get("name") or ((conn["user"] + "@" if conn.get("user") else "") + conn["host"])
+
+
+def find_connection(text):
+    """--ssh NAME: a saved connection, a ~/.ssh/config Host, or [user@]host[:port]."""
+    for c in load_connections():
+        if text in (c.get("name"), c["host"], conn_label(c)):
+            return dict(c)
+    if text in ssh_config_hosts():
+        return {"host": text, "name": text}
+    user, _, host = text.rpartition("@")
+    port = ""
+    if host.count(":") == 1:
+        host, port = host.split(":")
+    return {"host": host, "user": user, "port": port}
+
+
+# -------------------------------------------------------------------- tab --
+
+class Tab:
+    """One terminal: a shell, a command or an SSH connection."""
+
+    def __init__(self, win, argv=None, cwd=None, title=None, hold=False, conn=None):
+        self.win = win
+        self.conn = conn                     # an SSH connection (dict) or None
+        self.argv = argv
+        self.cwd = cwd
+        self.fixed_title = title or (conn_label(conn) if conn else None)
+        self.hold = hold or conn is not None
+        self.pid = None
+        self.exited = False
+
+        self.term = Vte.Terminal()
+        self.term.set_allow_hyperlink(True)
+        self.term.set_mouse_autohide(True)
+        self.term.set_scroll_on_keystroke(True)
+        self.term.set_scroll_on_output(False)
+        tag = self.term.match_add_regex(Vte.Regex.new_for_match(URL_RE, -1, PCRE2_MULTILINE), 0)
+        self.term.match_set_cursor_name(tag, "pointer")
+        self.term.connect("child-exited", self.on_exited)
+        self.term.connect("button-press-event", self.on_press)
+        self.term.connect("bell", lambda *_: self.win.on_bell(self))
+        # the title the shell (or ssh) sets
+        try:
+            self.term.connect("termprop-changed", self.on_termprop)
+        except TypeError:
+            pass
+        try:
+            self.term.connect("window-title-changed", lambda *_: self.update_title())
+        except TypeError:
+            pass
+        self.win.apply_settings(self.term)
+
+        self.scroll = Gtk.Scrollbar(orientation=Gtk.Orientation.VERTICAL, adjustment=self.term.get_vadjustment())
+        row = Gtk.Box()
+        row.pack_start(self.term, True, True, 0)
+        row.pack_start(self.scroll, False, False, 0)
+        # shown when the program in the tab has finished
+        self.ended = Gtk.InfoBar(message_type=Gtk.MessageType.INFO, show_close_button=False)
+        self.ended_label = Gtk.Label(xalign=0, wrap=True)
+        self.ended_label.show()          # (show_all doesn't reach inside a no-show-all widget)
+        self.ended.get_content_area().add(self.ended_label)
+        self.ended.add_button("_Reconnect" if conn else "_Restart", 1)
+        self.ended.add_button("_Close Tab", 2)
+        self.ended.connect("response", lambda _b, r: self.restart() if r == 1 else self.win.close_tab(self))
+        self.ended.set_no_show_all(True)
+        self.page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.page.pack_start(self.ended, False, False, 0)
+        self.page.pack_start(row, True, True, 0)
+
+        self.label = Gtk.Label(label="…", ellipsize=Pango.EllipsizeMode.END, max_width_chars=28, width_chars=16)
+        icon = Gtk.Image.new_from_icon_name("network-server-symbolic" if conn else "utilities-terminal-symbolic",
+                                            Gtk.IconSize.MENU)
+        close = Gtk.Button.new_from_icon_name("window-close-symbolic", Gtk.IconSize.MENU)
+        close.set_relief(Gtk.ReliefStyle.NONE)
+        close.set_focus_on_click(False)
+        close.set_tooltip_text("Close tab (Ctrl+Shift+W)")
+        close.connect("clicked", lambda *_: self.win.close_tab(self, ask=True))
+        box = Gtk.Box(spacing=4)
+        box.pack_start(icon, False, False, 0)
+        box.pack_start(self.label, True, True, 0)
+        box.pack_start(close, False, False, 0)
+        self.handle = Gtk.EventBox(visible_window=False)
+        self.handle.add(box)
+        self.handle.connect("button-press-event",
+                            lambda _w, ev: ev.button == 2 and (self.win.close_tab(self, ask=True) or True))
+        self.handle.show_all()
+        self.update_title()
+
+    # ---- running
+    def start(self):
+        self.exited = False
+        self.ended.hide()
+        if self.conn is not None:
+            argv = ssh_argv(self.conn)
+        elif self.argv:
+            argv = list(self.argv)
+        else:
+            shell = os.environ.get("SHELL") or pwd.getpwuid(os.getuid()).pw_shell or "/bin/bash"
+            argv = [shell]
+        env = [f"{k}={v}" for k, v in os.environ.items()
+               if k not in ("TERM", "COLORTERM", "VTE_VERSION", "COLUMNS", "LINES")]
+        env += ["COLORTERM=truecolor", "TERM_PROGRAM=firox-terminal"]
+        cwd = self.cwd if self.cwd and os.path.isdir(self.cwd) else os.path.expanduser("~")
+
+        def spawned(_term, pid, error, *_):
+            if error is not None or pid == -1:
+                self.exited = True
+                msg = error.message if error is not None else "couldn't start"
+                self.ended_label.set_text(f"Couldn't start {argv[0]}: {msg}")
+                self.ended.show()
+                self.ended.show_all()
+                return
+            self.pid = pid
+        self.term.spawn_async(Vte.PtyFlags.DEFAULT, cwd, argv, env, GLib.SpawnFlags.SEARCH_PATH,
+                              None, None, -1, None, spawned)
+
+    def restart(self):
+        self.term.reset(True, True)
+        self.start()
+        self.term.grab_focus()
+
+    def on_exited(self, _term, status):
+        self.exited = True
+        self.pid = None
+        code = os.waitstatus_to_exitcode(status) if hasattr(os, "waitstatus_to_exitcode") else status
+        if not self.hold:
+            self.win.close_tab(self)
+            return
+        if self.conn is not None:
+            text = f"The connection to {conn_label(self.conn)} has closed" + (f" (exit code {code})." if code else ".")
+        else:
+            text = f"{(self.argv or ['The program'])[0]} has finished" + (f" (exit code {code})." if code else ".")
+        self.ended_label.set_text(text)
+        self.ended.show()
+        self.ended.show_all()
+        self.update_title()
+
+    def busy(self):
+        """Something besides the shell is running (or an SSH connection is open)."""
+        if self.exited or self.pid is None:
+            return False
+        if self.conn is not None or self.argv:
+            return True
+        pty = self.term.get_pty()
+        try:
+            return os.tcgetpgrp(pty.get_fd()) != self.pid if pty is not None else False
+        except OSError:
+            return False
+
+    # ---- title and folder
+    def on_termprop(self, _term, name):
+        if name in (getattr(Vte, "TERMPROP_XTERM_TITLE", "xterm.title"),):
+            self.update_title()
+
+    def shell_title(self):
+        for getter in (lambda: self.term.get_termprop_string(getattr(Vte, "TERMPROP_XTERM_TITLE", "xterm.title")),
+                       lambda: self.term.get_window_title()):
+            try:
+                t = getter()
+            except (AttributeError, TypeError):
+                continue
+            if isinstance(t, tuple):            # (text, length) in some bindings
+                t = t[0]
+            if t:
+                return t
+        return None
+
+    def current_dir(self):
+        for getter in (lambda: self.term.get_termprop_uri(getattr(Vte, "TERMPROP_CURRENT_DIRECTORY_URI", "vte.cwd")),
+                       lambda: self.term.get_current_directory_uri()):
+            try:
+                uri = getter()
+                if uri is not None and not isinstance(uri, str):
+                    uri = uri.to_string()
+                if uri:
+                    path = Gio.File.new_for_uri(uri).get_path()
+                    if path:
+                        return path
+            except (AttributeError, TypeError, GLib.Error):
+                continue
+        # the shell didn't say (no vte.sh in its startup files): ask the kernel
+        if self.pid and self.conn is None:
+            try:
+                return os.readlink(f"/proc/{self.pid}/cwd")
+            except OSError:
+                pass
+        return self.cwd
+
+    def title(self):
+        t = self.fixed_title or self.shell_title() or "Command Prompt"
+        return t + (" (closed)" if self.exited and self.conn is not None else "")
+
+    def update_title(self):
+        t = self.title()
+        self.label.set_text(t)
+        self.handle.set_tooltip_text(t)
+        if self.win.current_tab() is self:
+            self.win.set_title(t)
+
+    # ---- mouse
+    def link_at(self, event):
+        try:
+            uri = self.term.hyperlink_check_event(event)
+        except (AttributeError, TypeError):
+            uri = None
+        if not uri:
+            try:
+                uri, _tag = self.term.match_check_event(event)
+            except (AttributeError, TypeError):
+                uri = None
+        return uri
+
+    def on_press(self, _term, event):
+        if event.type != Gdk.EventType.BUTTON_PRESS:
+            return False
+        if event.button == 1 and event.state & Gdk.ModifierType.CONTROL_MASK:
+            uri = self.link_at(event)
+            if uri:
+                self.win.open_uri(uri)
+                return True
+        if event.button == 3:
+            self.win.context_menu(self, event, self.link_at(event))
+            return True
+        return False
+
+
+# ----------------------------------------------------------------- window --
+
+class Terminal(Gtk.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="Command Prompt")
+        self.set_icon_name("utilities-terminal")
+        self.settings = read_settings()
+        self.tabs = {}                       # page widget -> Tab
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.add(root)
+
+        self.notebook = Gtk.Notebook(scrollable=True, show_border=False)
+        self.notebook.connect("switch-page", self.on_switch)
+        self.notebook.connect("page-removed", lambda *_: self.update_tabs())
+        actions = Gtk.Box(spacing=2)
+        plus = Gtk.Button.new_from_icon_name("list-add-symbolic", Gtk.IconSize.BUTTON)
+        plus.set_relief(Gtk.ReliefStyle.NONE)
+        plus.set_tooltip_text("New tab (Ctrl+Shift+T)")
+        plus.connect("clicked", lambda *_: self.new_tab())
+        actions.pack_start(plus, False, False, 0)
+        self.ssh_button = Gtk.MenuButton()
+        self.ssh_button.set_relief(Gtk.ReliefStyle.NONE)
+        self.ssh_button.add(Gtk.Image.new_from_icon_name("network-server-symbolic", Gtk.IconSize.BUTTON))
+        self.ssh_button.set_tooltip_text("SSH connections")
+        self.ssh_button.connect("toggled", lambda b: b.get_active() and b.set_popup(self.ssh_menu()))
+        self.ssh_button.set_popup(self.ssh_menu())
+        actions.pack_start(self.ssh_button, False, False, 0)
+        main = Gtk.MenuButton()
+        main.set_relief(Gtk.ReliefStyle.NONE)
+        main.add(Gtk.Image.new_from_icon_name("open-menu-symbolic", Gtk.IconSize.BUTTON))
+        main.set_tooltip_text("Menu")
+        main.connect("toggled", lambda b: b.get_active() and b.set_popup(self.main_menu()))
+        main.set_popup(self.main_menu())
+        actions.pack_start(main, False, False, 0)
+        actions.show_all()
+        self.notebook.set_action_widget(actions, Gtk.PackType.END)
+        root.pack_start(self.notebook, True, True, 0)
+
+        # find bar
+        self.find_bar = Gtk.SearchBar()
+        fbox = Gtk.Box(spacing=6)
+        self.find_entry = Gtk.SearchEntry(width_chars=30, placeholder_text="Find")
+        self.find_entry.connect("search-changed", lambda *_: self.find(1, new=True))
+        self.find_entry.connect("key-press-event", self.on_find_key)
+        self.find_case = Gtk.CheckButton.new_with_mnemonic("Match _case")
+        self.find_case.connect("toggled", lambda *_: self.find(1, new=True))
+        up = Gtk.Button.new_from_icon_name("go-up-symbolic", Gtk.IconSize.BUTTON)
+        up.set_tooltip_text("Previous (Shift+Enter)")
+        up.connect("clicked", lambda *_: self.find(-1))
+        down = Gtk.Button.new_from_icon_name("go-down-symbolic", Gtk.IconSize.BUTTON)
+        down.set_tooltip_text("Next (Enter)")
+        down.connect("clicked", lambda *_: self.find(1))
+        for w in (self.find_entry, up, down, self.find_case):
+            fbox.pack_start(w, False, False, 0)
+        self.find_bar.add(fbox)
+        self.find_bar.connect_entry(self.find_entry)
+        self.find_bar.set_show_close_button(True)
+        root.pack_start(self.find_bar, False, False, 0)
+
+        self.connect("key-press-event", self.on_key)
+        self.connect("delete-event", self.on_delete)
+        root.show_all()
+
+    # ---- settings
+    def apply_settings(self, term):
+        s = self.settings
+        term.set_font(Pango.FontDescription.from_string(s["font"]))
+        _name, fg, bg, cursor, palette = SCHEMES.get(s["scheme"], SCHEMES["campbell"])
+        term.set_colors(rgba(fg), rgba(bg), [rgba(c) for c in palette.split()])
+        term.set_color_cursor(rgba(cursor))
+        term.set_color_cursor_foreground(rgba(bg))
+        try:
+            term.set_scrollback_lines(int(s["scrollback"]))
+        except ValueError:
+            term.set_scrollback_lines(10000)
+        term.set_cursor_shape(CURSORS.get(s["cursor"], Vte.CursorShape.BLOCK))
+        term.set_cursor_blink_mode(Vte.CursorBlinkMode.ON if s["blink"] == "true" else Vte.CursorBlinkMode.OFF)
+        term.set_audible_bell(s["bell"] == "true")
+
+    def set_setting(self, key, value):
+        self.settings[key] = value
+        try:
+            write_settings(self.settings)
+        except OSError:
+            pass
+        for tab in self.tabs.values():
+            self.apply_settings(tab.term)
+
+    def size_from_settings(self, tab):
+        """The window's first size: width x height characters of the first tab."""
+        try:
+            cols, rows = int(self.settings["width"]), int(self.settings["height"])
+        except ValueError:
+            cols, rows = 100, 30
+        tab.term.set_size(cols, rows)
+
+    # ---- tabs
+    def current_tab(self):
+        page = self.notebook.get_nth_page(self.notebook.get_current_page())
+        return self.tabs.get(page)
+
+    def add_tab(self, tab, switch=True):
+        self.tabs[tab.page] = tab
+        n = self.notebook.append_page(tab.page, tab.handle)
+        self.notebook.set_tab_reorderable(tab.page, True)
+        tab.page.show_all()
+        tab.ended.hide()
+        if len(self.tabs) == 1:
+            self.size_from_settings(tab)
+        tab.start()
+        if switch:
+            self.notebook.set_current_page(n)
+            tab.term.grab_focus()
+        self.update_tabs()
+        return tab
+
+    def new_tab(self, argv=None, cwd=None, title=None, hold=False, conn=None, switch=True):
+        if cwd is None and argv is None and conn is None and self.current_tab() is not None:
+            cwd = self.current_tab().current_dir()      # a new shell starts where you are
+        return self.add_tab(Tab(self, argv, cwd, title, hold, conn), switch)
+
+    def close_tab(self, tab, ask=False):
+        if tab.page not in self.tabs:
+            return
+        if ask and tab.busy() and not self.confirm_close([tab]):
+            return
+        if tab.pid:
+            try:
+                os.kill(tab.pid, 1)                       # SIGHUP, as when a terminal closes
+            except OSError:
+                pass
+        n = self.notebook.page_num(tab.page)
+        del self.tabs[tab.page]
+        if n >= 0:
+            self.notebook.remove_page(n)
+        if not self.tabs:
+            self.destroy()
+
+    def update_tabs(self):
+        self.notebook.set_show_tabs(True)
+        tab = self.current_tab()
+        if tab is not None:
+            self.set_title(tab.title())
+
+    def on_switch(self, _nb, page, _n):
+        tab = self.tabs.get(page)
+        if tab is not None:
+            self.set_title(tab.title())
+            GLib.idle_add(lambda: tab.term.grab_focus() and False)
+
+    def switch_tab(self, step=None, index=None):
+        n = self.notebook.get_n_pages()
+        if not n:
+            return
+        if index is None:
+            index = (self.notebook.get_current_page() + step) % n
+        if 0 <= index < n:
+            self.notebook.set_current_page(index)
+
+    def move_tab(self, step):
+        tab = self.current_tab()
+        if tab is None:
+            return
+        n = self.notebook.get_n_pages()
+        pos = (self.notebook.page_num(tab.page) + step) % n
+        self.notebook.reorder_child(tab.page, pos)
+
+    def confirm_close(self, tabs):
+        busy = [t for t in tabs if t.busy()]
+        if not busy:
+            return True
+        what = (f"“{busy[0].title()}” is still running something" if len(busy) == 1 else
+                f"{len(busy)} tabs are still running something")
+        dlg = Gtk.MessageDialog(transient_for=self, modal=True, message_type=Gtk.MessageType.QUESTION,
+                                buttons=Gtk.ButtonsType.NONE, text=f"Close? {what}.")
+        dlg.format_secondary_text("Closing ends it, and anything it hasn't saved is lost. "
+                                  "SSH connections are disconnected.")
+        dlg.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        dlg.add_button("Close", Gtk.ResponseType.OK)
+        esc_closes(dlg)
+        ok = dlg.run() == Gtk.ResponseType.OK
+        dlg.destroy()
+        return ok
+
+    def on_delete(self, *_):
+        return not self.confirm_close(list(self.tabs.values()))
+
+    # ---- clipboard, find, zoom
+    def copy(self):
+        tab = self.current_tab()
+        if tab is not None and tab.term.get_has_selection():
+            tab.term.copy_clipboard_format(Vte.Format.TEXT)
+
+    def paste(self):
+        tab = self.current_tab()
+        if tab is not None:
+            tab.term.paste_clipboard()
+
+    def show_find(self):
+        self.find_bar.set_search_mode(True)
+        self.find_entry.grab_focus()
+
+    def find(self, step, new=False):
+        tab = self.current_tab()
+        if tab is None:
+            return
+        text = self.find_entry.get_text()
+        if new:
+            if not text:
+                tab.term.search_set_regex(None, 0)
+                return
+            flags = PCRE2_MULTILINE | (0 if self.find_case.get_active() else PCRE2_CASELESS)
+            try:
+                regex = Vte.Regex.new_for_search(re.escape(text), -1, flags)
+            except GLib.Error:
+                return
+            tab.term.search_set_regex(regex, 0)
+            tab.term.search_set_wrap_around(True)
+        if not text:
+            return
+        found = tab.term.search_find_next() if step > 0 else tab.term.search_find_previous()
+        self.find_entry.get_style_context().remove_class("error")
+        if not found:
+            self.find_entry.get_style_context().add_class("error")
+
+    def on_find_key(self, _e, ev):
+        if ev.keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):
+            self.find(-1 if ev.state & Gdk.ModifierType.SHIFT_MASK else 1)
+            return True
+        if ev.keyval == Gdk.KEY_Escape:
+            self.find_bar.set_search_mode(False)
+            tab = self.current_tab()
+            if tab is not None:
+                tab.term.grab_focus()
+            return True
+        return False
+
+    def zoom(self, step):
+        for tab in self.tabs.values():
+            scale = tab.term.get_font_scale()
+            tab.term.set_font_scale(1.0 if step == 0 else max(0.5, min(4.0, scale * (1.1 if step > 0 else 1 / 1.1))))
+
+    def on_bell(self, tab):
+        if tab is not self.current_tab():
+            tab.label.set_markup(f"<b>{GLib.markup_escape_text(tab.title())}</b>")
+            GLib.timeout_add_seconds(3, lambda: tab.update_title() and False)
+
+    # ---- opening things
+    def open_uri(self, uri):
+        try:
+            Gtk.show_uri_on_window(self, uri, Gdk.CURRENT_TIME)
+        except GLib.Error as err:
+            self.error("Couldn't open the link", err.message)
+
+    def browse_files(self, tab):
+        if tab.conn is not None:
+            uri = sftp_uri(tab.conn)
+        else:
+            uri = Gio.File.new_for_path(tab.current_dir() or os.path.expanduser("~")).get_uri()
+        try:
+            subprocess.Popen(["firox-explorer", uri], start_new_session=True, stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError as err:
+            self.error("Couldn't open Firox Explorer", str(err))
+
+    def error(self, title, detail=""):
+        dlg = Gtk.MessageDialog(transient_for=self, modal=True, message_type=Gtk.MessageType.ERROR,
+                                buttons=Gtk.ButtonsType.OK, text=title)
+        if detail:
+            dlg.format_secondary_text(detail)
+        esc_closes(dlg)
+        dlg.run()
+        dlg.destroy()
+
+    # ---- menus
+    @staticmethod
+    def item(menu, label, cb, accel=None, sensitive=True):
+        it = Gtk.MenuItem.new_with_mnemonic(label)
+        it.set_sensitive(sensitive and cb is not None)
+        if accel:
+            key, mods = Gtk.accelerator_parse(accel)
+            child = it.get_child()
+            if isinstance(child, Gtk.AccelLabel):
+                child.set_accel(key, mods)
+        if cb is not None:
+            it.connect("activate", lambda _i: cb())
+        menu.append(it)
+        return it
+
+    def ssh_menu(self):
+        menu = Gtk.Menu()
+        conns = load_connections()
+        for c in conns:
+            self.item(menu, conn_label(c).replace("_", "__"), lambda c=c: self.new_tab(conn=dict(c)))
+        aliases = [h for h in ssh_config_hosts() if h not in {c.get("name") for c in conns}]
+        if aliases:
+            if conns:
+                menu.append(Gtk.SeparatorMenuItem())
+            head = Gtk.MenuItem(label="From ~/.ssh/config")
+            head.set_sensitive(False)
+            menu.append(head)
+            for h in aliases:
+                self.item(menu, h.replace("_", "__"), lambda h=h: self.new_tab(conn={"host": h, "name": h}))
+        if conns or aliases:
+            menu.append(Gtk.SeparatorMenuItem())
+        self.item(menu, "_Connect to a Server…", self.connect_dialog, accel="<Control><Shift>o")
+        self.item(menu, "_Edit Saved Connections…", self.edit_connections, sensitive=bool(conns))
+        menu.show_all()
+        return menu
+
+    def main_menu(self):
+        menu = Gtk.Menu()
+        tab = self.current_tab()
+        self.item(menu, "New _Tab", lambda: self.new_tab(), accel="<Control><Shift>t")
+        self.item(menu, "New _Window", lambda: spawn_self([]), accel="<Control><Shift>n")
+        menu.append(Gtk.SeparatorMenuItem())
+        self.item(menu, "_Copy", self.copy, accel="<Control><Shift>c")
+        self.item(menu, "_Paste", self.paste, accel="<Control><Shift>v")
+        self.item(menu, "_Find…", self.show_find, accel="<Control><Shift>f")
+        menu.append(Gtk.SeparatorMenuItem())
+        self.item(menu, "Zoom _In", lambda: self.zoom(1), accel="<Control>equal")
+        self.item(menu, "Zoom _Out", lambda: self.zoom(-1), accel="<Control>minus")
+        self.item(menu, "_Normal Size", lambda: self.zoom(0), accel="<Control>0")
+        self.item(menu, "_Full Screen", self.toggle_fullscreen, accel="F11")
+        menu.append(Gtk.SeparatorMenuItem())
+        self.item(menu, "_Browse Files Here" if tab is None or tab.conn is None else "_Browse Files on This Server",
+                  (lambda: self.browse_files(tab)) if tab is not None else None)
+        self.item(menu, "P_references…", self.preferences)
+        self.item(menu, "_Keyboard Shortcuts", self.shortcuts)
+        self.item(menu, "_About Firox Terminal", self.about)
+        menu.show_all()
+        return menu
+
+    def context_menu(self, tab, event, link):
+        menu = Gtk.Menu()
+        if link:
+            self.item(menu, "_Open Link", lambda: self.open_uri(link))
+            self.item(menu, "Copy _Link Address", lambda: Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).set_text(link, -1))
+            menu.append(Gtk.SeparatorMenuItem())
+        self.item(menu, "_Copy", self.copy, accel="<Control><Shift>c", sensitive=tab.term.get_has_selection())
+        self.item(menu, "_Paste", self.paste, accel="<Control><Shift>v")
+        self.item(menu, "Select _All", tab.term.select_all)
+        menu.append(Gtk.SeparatorMenuItem())
+        self.item(menu, "New _Tab", lambda: self.new_tab(), accel="<Control><Shift>t")
+        self.item(menu, "_Find…", self.show_find, accel="<Control><Shift>f")
+        self.item(menu, "_Browse Files Here" if tab.conn is None else "_Browse Files on This Server",
+                  lambda: self.browse_files(tab))
+        if tab.conn is not None or tab.argv:
+            self.item(menu, "_Reconnect" if tab.conn else "_Restart", tab.restart, sensitive=tab.exited)
+        menu.append(Gtk.SeparatorMenuItem())
+        self.item(menu, "Close Ta_b", lambda: self.close_tab(tab, ask=True), accel="<Control><Shift>w")
+        menu.show_all()
+        menu.popup_at_pointer(event)
+
+    def toggle_fullscreen(self):
+        win = self.get_window()
+        if win is not None and win.get_state() & Gdk.WindowState.FULLSCREEN:
+            self.unfullscreen()
+        else:
+            self.fullscreen()
+
+    # ---- keys
+    def on_key(self, _w, ev):
+        key = Gdk.keyval_to_lower(ev.keyval)
+        mods = ev.state & (Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK | Gdk.ModifierType.MOD1_MASK)
+        cs = Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK
+        ctrl = Gdk.ModifierType.CONTROL_MASK
+        alt = Gdk.ModifierType.MOD1_MASK
+        tab = self.current_tab()
+        actions = {
+            (cs, Gdk.KEY_t): lambda: self.new_tab(),
+            (cs, Gdk.KEY_w): lambda: tab and self.close_tab(tab, ask=True),
+            (cs, Gdk.KEY_n): lambda: spawn_self([]),
+            (cs, Gdk.KEY_q): self.close,
+            (cs, Gdk.KEY_c): self.copy,
+            (cs, Gdk.KEY_v): self.paste,
+            (cs, Gdk.KEY_f): self.show_find,
+            (cs, Gdk.KEY_o): self.connect_dialog,
+            (ctrl, Gdk.KEY_Page_Up): lambda: self.switch_tab(-1),
+            (ctrl, Gdk.KEY_Page_Down): lambda: self.switch_tab(1),
+            (cs, Gdk.KEY_Page_Up): lambda: self.move_tab(-1),
+            (cs, Gdk.KEY_Page_Down): lambda: self.move_tab(1),
+            (ctrl, Gdk.KEY_equal): lambda: self.zoom(1),
+            (ctrl, Gdk.KEY_plus): lambda: self.zoom(1),
+            (cs, Gdk.KEY_plus): lambda: self.zoom(1),
+            (ctrl, Gdk.KEY_KP_Add): lambda: self.zoom(1),
+            (ctrl, Gdk.KEY_minus): lambda: self.zoom(-1),
+            (ctrl, Gdk.KEY_KP_Subtract): lambda: self.zoom(-1),
+            (ctrl, Gdk.KEY_0): lambda: self.zoom(0),
+            (ctrl, Gdk.KEY_KP_0): lambda: self.zoom(0),
+            (0, Gdk.KEY_F11): self.toggle_fullscreen,
+        }
+        act = actions.get((mods, key))
+        if act is None and mods == alt and Gdk.KEY_1 <= key <= Gdk.KEY_9:
+            act = lambda: self.switch_tab(index=key - Gdk.KEY_1)  # noqa: E731
+        if act is None:
+            return False                # everything else goes to the terminal
+        act()
+        return True
+
+    # ---- dialogs
+    def connect_dialog(self, conn=None, save_index=None):
+        """Connect to a server (or edit a saved connection)."""
+        editing = save_index is not None
+        conn = dict(conn or {})
+        dlg = Gtk.Dialog(title="Edit Connection" if editing else "Connect to a Server", transient_for=self,
+                         modal=True)
+        dlg.add_button("_Cancel", Gtk.ResponseType.CANCEL)
+        dlg.add_button("_Save" if editing else "C_onnect", Gtk.ResponseType.OK)
+        dlg.set_default_response(Gtk.ResponseType.OK)
+        esc_closes(dlg)
+        box = dlg.get_content_area()
+        box.set_border_width(14)
+        box.set_spacing(10)
+        grid = Gtk.Grid(column_spacing=10, row_spacing=8)
+        fields = {}
+        rows = [("host", "Server:", "e.g. server.example.com or 192.168.1.20"),
+                ("user", "User name:", "your name on the server (optional)"),
+                ("port", "Port:", "22"),
+                ("key", "Key file:", "~/.ssh/id_ed25519 (optional)"),
+                ("jump", "Jump host:", "user@gateway (optional)"),
+                ("name", "Name:", "shown on the tab and in the list (optional)")]
+        for i, (key, label, hint) in enumerate(rows):
+            e = Gtk.Entry(activates_default=True, width_chars=32, placeholder_text=hint)
+            e.set_text(str(conn.get(key, "") or ""))
+            e.connect("key-press-event", lambda _e, ev: ev.keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter)
+                      and (dlg.response(Gtk.ResponseType.OK) or True))
+            fields[key] = e
+            grid.attach(Gtk.Label(label=label, xalign=0), 0, i, 1, 1)
+            grid.attach(e, 1, i, 1, 1)
+        browse = Gtk.Button.new_from_icon_name("document-open-symbolic", Gtk.IconSize.BUTTON)
+        browse.set_tooltip_text("Choose a key file")
+
+        def pick_key(*_):
+            fc = Gtk.FileChooserNative.new("Choose a key file", dlg, Gtk.FileChooserAction.OPEN, None, None)
+            fc.set_current_folder(os.path.expanduser("~/.ssh"))
+            fc.set_show_hidden(True)
+            if fc.run() == Gtk.ResponseType.ACCEPT:
+                path = fc.get_filename()
+                home = os.path.expanduser("~")
+                fields["key"].set_text("~" + path[len(home):] if path.startswith(home + "/") else path)
+        browse.connect("clicked", pick_key)
+        grid.attach(browse, 2, 3, 1, 1)
+        completion = Gtk.EntryCompletion()
+        store = Gtk.ListStore(str)
+        for h in ssh_config_hosts():
+            store.append([h])
+        completion.set_model(store)
+        completion.set_text_column(0)
+        fields["host"].set_completion(completion)
+        box.pack_start(grid, False, False, 0)
+        save = Gtk.CheckButton.new_with_mnemonic("_Save this connection")
+        save.set_active(True)
+        if not editing:
+            box.pack_start(save, False, False, 0)
+        problem = Gtk.Label(xalign=0, wrap=True, max_width_chars=50)
+        problem.get_style_context().add_class("error")
+        problem.set_no_show_all(True)
+        box.pack_start(problem, False, False, 0)
+        note = Gtk.Label(xalign=0, wrap=True, max_width_chars=50)
+        note.set_markup("<small>Passwords and the server's key are asked for in the tab, by ssh. "
+                        "Nothing secret is saved.</small>")
+        note.get_style_context().add_class("dim-label")
+        box.pack_start(note, False, False, 0)
+        dlg.show_all()
+        fields["host"].grab_focus()
+        while True:
+            if dlg.run() != Gtk.ResponseType.OK:
+                dlg.destroy()
+                return
+            values = {k: e.get_text().strip() for k, e in fields.items()}
+            bad = None
+            if not values["host"]:
+                bad = ("host", "Type the server's name or address.")
+            elif re.search(r"\s", values["host"]):
+                bad = ("host", "The server's name can't contain spaces.")
+            elif re.search(r"\s", values["user"]):
+                bad = ("user", "The user name can't contain spaces.")
+            elif values["port"] and not (values["port"].isdigit() and 0 < int(values["port"]) < 65536):
+                bad = ("port", "The port is a number from 1 to 65535.")
+            if bad is None:
+                break
+            problem.set_text(bad[1])
+            problem.show()
+            fields[bad[0]].grab_focus()
+        dlg.destroy()
+        new = {k: v for k, v in values.items() if v}
+        conns = load_connections()
+        if editing:
+            conns[save_index] = new
+        elif save.get_active():
+            conns = [c for c in conns if conn_label(c) != conn_label(new)] + [new]
+        if editing or save.get_active():
+            try:
+                save_connections(conns)
+            except OSError as err:
+                self.error("Couldn't save the connection", str(err))
+        if not editing:
+            self.new_tab(conn=new)
+
+    def edit_connections(self):
+        dlg = Gtk.Dialog(title="Saved Connections", transient_for=self, modal=True)
+        dlg.add_button("_Close", Gtk.ResponseType.CLOSE)
+        esc_closes(dlg)
+        dlg.set_default_size(460, 300)
+        store = Gtk.ListStore(str, str, int)
+
+        def fill():
+            store.clear()
+            for i, c in enumerate(load_connections()):
+                store.append([conn_label(c), " ".join(ssh_argv(c)[1:]), i])
+        fill()
+        view = Gtk.TreeView(model=store)
+        view.append_column(Gtk.TreeViewColumn("Name", Gtk.CellRendererText(), text=0))
+        view.append_column(Gtk.TreeViewColumn("ssh", Gtk.CellRendererText(ellipsize=Pango.EllipsizeMode.END), text=1))
+        sw = Gtk.ScrolledWindow(hexpand=True, vexpand=True)
+        sw.set_shadow_type(Gtk.ShadowType.IN)
+        sw.add(view)
+
+        def selected():
+            _m, it = view.get_selection().get_selected()
+            return store[it][2] if it is not None else None
+
+        def connect():
+            i = selected()
+            if i is not None:
+                self.new_tab(conn=dict(load_connections()[i]))
+
+        def edit():
+            i = selected()
+            if i is not None:
+                self.connect_dialog(load_connections()[i], save_index=i)
+                fill()
+
+        def remove():
+            i = selected()
+            if i is not None:
+                conns = load_connections()
+                del conns[i]
+                save_connections(conns)
+                fill()
+        buttons = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        for label, cb in (("C_onnect", connect), ("_Edit…", edit), ("_Remove", remove)):
+            b = Gtk.Button.new_with_mnemonic(label)
+            b.connect("clicked", lambda _b, cb=cb: cb())
+            buttons.pack_start(b, False, False, 0)
+        row = Gtk.Box(spacing=10)
+        row.set_border_width(10)
+        row.pack_start(sw, True, True, 0)
+        row.pack_start(buttons, False, False, 0)
+        dlg.get_content_area().pack_start(row, True, True, 0)
+        dlg.show_all()
+        dlg.run()
+        dlg.destroy()
+
+    def preferences(self):
+        dlg = Gtk.Dialog(title="Terminal Preferences", transient_for=self, modal=True)
+        dlg.add_button("_Close", Gtk.ResponseType.CLOSE)
+        esc_closes(dlg)
+        grid = Gtk.Grid(column_spacing=12, row_spacing=10)
+        grid.set_border_width(14)
+        s = self.settings
+        font = Gtk.FontButton(font=s["font"])
+        font.set_filter_func(lambda family, _face: family.is_monospace())
+        font.connect("font-set", lambda b: self.set_setting("font", b.get_font()))
+        scheme = Gtk.ComboBoxText()
+        for key, (name, *_rest) in SCHEMES.items():
+            scheme.append(key, name)
+        scheme.set_active_id(s["scheme"] if s["scheme"] in SCHEMES else "campbell")
+        scheme.connect("changed", lambda c: self.set_setting("scheme", c.get_active_id()))
+        cursor = Gtk.ComboBoxText()
+        for key, name in (("block", "Block"), ("ibeam", "Line"), ("underline", "Underline")):
+            cursor.append(key, name)
+        cursor.set_active_id(s["cursor"])
+        cursor.connect("changed", lambda c: self.set_setting("cursor", c.get_active_id()))
+        blink = Gtk.CheckButton(label="Blinking cursor", active=s["blink"] == "true")
+        blink.connect("toggled", lambda b: self.set_setting("blink", "true" if b.get_active() else "false"))
+        bell = Gtk.CheckButton(label="Beep when a program rings the bell", active=s["bell"] == "true")
+        bell.connect("toggled", lambda b: self.set_setting("bell", "true" if b.get_active() else "false"))
+        lines = Gtk.SpinButton.new_with_range(1000, 1000000, 1000)
+        try:
+            lines.set_value(int(s["scrollback"]))
+        except ValueError:
+            lines.set_value(10000)
+        lines.connect("value-changed", lambda b: self.set_setting("scrollback", str(int(b.get_value()))))
+        size = Gtk.Box(spacing=6)
+        cols = Gtk.SpinButton.new_with_range(40, 400, 1)
+        rows = Gtk.SpinButton.new_with_range(10, 200, 1)
+        cols.set_value(int(s["width"]) if s["width"].isdigit() else 100)
+        rows.set_value(int(s["height"]) if s["height"].isdigit() else 30)
+        cols.connect("value-changed", lambda b: self.set_setting("width", str(int(b.get_value()))))
+        rows.connect("value-changed", lambda b: self.set_setting("height", str(int(b.get_value()))))
+        size.pack_start(cols, False, False, 0)
+        size.pack_start(Gtk.Label(label="columns ×"), False, False, 0)
+        size.pack_start(rows, False, False, 0)
+        size.pack_start(Gtk.Label(label="rows"), False, False, 0)
+        for i, (label, w) in enumerate((("Font:", font), ("Colours:", scheme), ("Cursor:", cursor),
+                                        ("Scrollback lines:", lines), ("New windows:", size))):
+            grid.attach(Gtk.Label(label=label, xalign=0), 0, i, 1, 1)
+            grid.attach(w, 1, i, 1, 1)
+        grid.attach(blink, 1, 5, 1, 1)
+        grid.attach(bell, 1, 6, 1, 1)
+        dlg.get_content_area().pack_start(grid, True, True, 0)
+        esc_closes(dlg)
+        dlg.show_all()
+        dlg.run()
+        dlg.destroy()
+
+    def shortcuts(self):
+        keys = [("Ctrl+Shift+T", "New tab"), ("Ctrl+Shift+W", "Close tab"), ("Ctrl+Shift+N", "New window"),
+                ("Ctrl+PgUp / PgDn", "Previous / next tab"), ("Ctrl+Shift+PgUp / PgDn", "Move the tab"),
+                ("Alt+1…9", "Go to a tab"), ("Ctrl+Shift+C / V", "Copy / paste"),
+                ("Shift+Insert", "Paste"), ("Ctrl+Shift+F", "Find"), ("Ctrl+Shift+O", "Connect to an SSH server"),
+                ("Ctrl+= / Ctrl+- / Ctrl+0", "Zoom in / out / normal"), ("F11", "Full screen"),
+                ("Ctrl+click", "Open a link"), ("Middle-click a tab", "Close it")]
+        dlg = Gtk.Dialog(title="Keyboard Shortcuts", transient_for=self, modal=True)
+        dlg.add_button("_Close", Gtk.ResponseType.CLOSE)
+        grid = Gtk.Grid(column_spacing=18, row_spacing=4)
+        grid.set_border_width(16)
+        for i, (k, what) in enumerate(keys):
+            kl = Gtk.Label(label=k, xalign=0)
+            kl.get_style_context().add_class("dim-label")
+            grid.attach(kl, 0, i, 1, 1)
+            grid.attach(Gtk.Label(label=what, xalign=0), 1, i, 1, 1)
+        dlg.get_content_area().pack_start(grid, True, True, 0)
+        esc_closes(dlg)
+        dlg.show_all()
+        dlg.run()
+        dlg.destroy()
+
+    def about(self):
+        dlg = Gtk.AboutDialog(transient_for=self, modal=True, program_name="Firox Terminal",
+                              logo_icon_name="utilities-terminal",
+                              comments="The Firox Linux Command Prompt: tabs and saved SSH connections.",
+                              website="https://kurodenkou.github.io/firox/", website_label="Firox Linux",
+                              license_type=Gtk.License.GPL_3_0)
+        esc_closes(dlg)
+        dlg.run()
+        dlg.destroy()
+
+
+def esc_closes(dialog):
+    """Escape cancels the dialog (handled directly: GTK doesn't always pass
+    it on, the same as in Firox Explorer)."""
+    def on_key(d, ev):
+        if ev.keyval == Gdk.KEY_Escape:
+            d.response(Gtk.ResponseType.CANCEL)
+            return True
+        return False
+    dialog.connect("key-press-event", on_key)
+
+
+def spawn_self(args):
+    try:
+        subprocess.Popen([os.path.abspath(sys.argv[0])] + args, start_new_session=True, stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError as err:
+        print(f"firox-terminal: {err}", file=sys.stderr)
+
+
+# -------------------------------------------------------------------- app --
+
+def parse_args(args):
+    """Options, accepting xfce4-terminal's spellings so existing launchers
+    keep working."""
+    opts = {"cwd": None, "title": None, "argv": None, "hold": False, "ssh": None, "connect": False}
+    i = 0
+    while i < len(args):
+        a = args[i]
+        val = None
+        if "=" in a and a.startswith("--"):
+            a, val = a.split("=", 1)
+
+        def take():
+            nonlocal i
+            if val is not None:
+                return val
+            i += 1
+            return args[i] if i < len(args) else None
+        if a in ("-x", "--execute", "--"):
+            opts["argv"] = args[i + 1:] or None
+            break
+        if a in ("-e", "--command"):
+            cmd = take()
+            opts["argv"] = shlex.split(cmd) if cmd else None
+        elif a in ("--working-directory", "--dir", "-w"):
+            opts["cwd"] = take()
+        elif a in ("-T", "--title"):
+            opts["title"] = take()
+        elif a in ("-H", "--hold"):
+            opts["hold"] = True
+        elif a == "--ssh":
+            opts["ssh"] = take()
+        elif a == "--connect":
+            opts["connect"] = True
+        elif a in ("--disable-server", "--tab", "--window", "--maximize", "--fullscreen"):
+            if a == "--fullscreen":
+                opts["fullscreen"] = True
+            elif a == "--maximize":
+                opts["maximize"] = True
+        elif a.startswith("-"):
+            print(f"firox-terminal: unknown option {a} (ignored)", file=sys.stderr)
+        else:
+            opts["argv"] = args[i:]           # a bare command, as xdg-terminal-exec may give
+            break
+        i += 1
+    return opts
+
+
+class App(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE
+                         | Gio.ApplicationFlags.NON_UNIQUE)
+
+    def do_command_line(self, cmdline):
+        opts = parse_args(cmdline.get_arguments()[1:])
+        win = Terminal(self)
+        if opts["ssh"]:
+            win.new_tab(conn=find_connection(opts["ssh"]))
+        else:
+            win.new_tab(argv=opts["argv"], cwd=opts["cwd"] or cmdline.get_cwd(), title=opts["title"],
+                        hold=opts["hold"])
+        if opts["connect"]:
+            GLib.idle_add(lambda: win.connect_dialog() and False)
+        if opts.get("maximize"):
+            win.maximize()
+        if opts.get("fullscreen"):
+            win.fullscreen()
+        win.present()
+        return 0
+
+
+if __name__ == "__main__":
+    if shutil.which("ssh") is None:
+        print("firox-terminal: ssh isn't installed; SSH connections won't work", file=sys.stderr)
+    sys.exit(App().run(sys.argv))

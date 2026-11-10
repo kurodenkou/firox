@@ -7,7 +7,7 @@
     </item>
     <separator />
     <item label="Command Prompt">
-      <action name="Execute" command="xfce4-terminal" />
+      <action name="Execute" command="firox-terminal" />
     </item>
     <item label="Computer">
       <action name="Execute" command="firox-open computer" />

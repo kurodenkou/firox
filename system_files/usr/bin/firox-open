@@ -7,7 +7,7 @@ notify() { notify-send -a Firox -i "${3:-dialog-information}" "$1" "${2:-}" 2>/d
 files() { exec firox-explorer "$@"; }
 dir() { local d; d="$(xdg-user-dir "$1" 2>/dev/null)"; [ -d "$d" ] || d="$HOME"; echo "$d"; }
 # A window of its own (--disable-server), titled, running the command
-terminal() { exec xfce4-terminal --disable-server -T "$1" -x "${@:2}"; }
+terminal() { exec firox-terminal -T "$1" -x "${@:2}"; }
 waydroid_ready() { [ -f /var/lib/waydroid/waydroid.cfg ]; }
 CFG="${XDG_CONFIG_HOME:-$HOME/.config}"
 # Themed config for TOOL unless the user has their own

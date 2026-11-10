@@ -1856,7 +1856,7 @@ class Explorer(Gtk.ApplicationWindow):
 
     def terminal_here(self):
         path = local_path(self.current) or HOME
-        spawn(["xfce4-terminal", f"--working-directory={path}"])
+        spawn(["firox-terminal", f"--working-directory={path}"])
 
     # ---- menus and keys
     @staticmethod
@@ -2118,7 +2118,7 @@ class Explorer(Gtk.ApplicationWindow):
         """Run the step-by-step check in a terminal, so its report can be
         read, copied and found later in the log folder."""
         argv = [os.path.abspath(sys.argv[0]), "--test", conn["id"]]
-        if not spawn(["xfce4-terminal", "--hold", "--title", f"Testing {conn.get('name')}", "-x"] + argv):
+        if not spawn(["firox-terminal", "--hold", "--title", f"Testing {conn.get('name')}", "-x"] + argv):
             error_box(self, "Couldn't open a terminal", "Run this in a terminal instead:\n" + " ".join(argv))
 
     def show_log(self, conn):

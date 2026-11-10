@@ -306,9 +306,10 @@
     <li><b>Applications:</b> switch to or end a program.</li>
     <li><b>Processes:</b> CPU and memory for each process.</li>
     <li><b>Performance:</b> green-on-black graphs of CPU and memory use.</li>
+    <li><b>GPU:</b> for each graphics card, usage and memory graphs, its temperature, clock speed, power and fan, and the programs using it, busiest first. <b>GPU Monitor</b> in the Start menu opens it straight there, and the Processes tab has a GPU column.</li>
 </ul>
-<p>btop is in the Start menu too, as Resource Monitor.</p>
-        <p class="tech">firox-taskmgr</p>
+<p>Works with AMD, Intel and NVIDIA graphics. For a terminal view, the View menu opens btop (Resource Monitor) and nvtop (GPU Monitor).</p>
+        <p class="tech">firox-taskmgr, firox_gpu (the driver's own readings, nvidia-smi, and per-program GPU use from the kernel, like nvtop)</p>
     </div>
     <figure>
     <img src="screenshots/task-manager.png" alt="Task Manager: Processes and Performance" loading="lazy">
@@ -334,13 +335,26 @@
 </div>
 <div class="card">
     <h3>Also included</h3>
-    <p>A Command Prompt (xfce4-terminal, with tabs; <kbd>Super</kbd>+<kbd>Enter</kbd>), Media Player (VLC, with full codecs), Notepad, Calculator and a picture viewer.</p><p><code>zenity</code> is included for dialogs in shell scripts.</p>
+    <p>A Command Prompt (Firox Terminal, below; <kbd>Super</kbd>+<kbd>Enter</kbd>), Media Player (VLC, with full codecs), Notepad, Calculator and a picture viewer.</p><p><code>zenity</code> is included for dialogs in shell scripts.</p>
 </div>
 </div>
 <figure>
     <img src="screenshots/alt-tab.png" alt="Alt+Tab window switcher" loading="lazy">
     <figcaption>Alt+Tab</figcaption>
 </figure>
+
+<div class="feature">
+    <div class="feature-text">
+        <h3>Firox Terminal</h3>
+        <p>The Command Prompt: <kbd>Super</kbd>+<kbd>Enter</kbd>, or Start → Command Prompt.</p>
+<ul>
+    <li><b>Tabs:</b> <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>T</kbd> opens one in the folder you're in; switch with <kbd>Ctrl</kbd>+<kbd>PgUp</kbd>/<kbd>PgDn</kbd>. Closing a tab that's still running something asks first.</li>
+    <li><b>SSH:</b> the server button keeps your connections (and lists the hosts in <code>~/.ssh/config</code>). Each opens in its own tab, and <b>Reconnect</b> brings a dropped one back. <b>Browse Files on This Server</b> opens it in Firox Explorer. Passwords stay with ssh; nothing secret is saved.</li>
+    <li><b>Also:</b> find (<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>F</kbd>), links you can <kbd>Ctrl</kbd>+click, zoom, full screen, and a choice of fonts and colours.</li>
+</ul>
+        <p class="tech">firox-terminal (GTK, VTE)</p>
+    </div>
+</div>
 
 <h2 id="safe">Updates, restore and backup</h2>
 

@@ -93,7 +93,8 @@ PACKAGES=(
     ristretto                    # Picture viewer
     htop
     btop                         # Task Manager
-    xfce4-terminal               # Command Prompt (tabs, preferences)
+    xfce4-terminal               # spare terminal (the Command Prompt is firox-terminal)
+    nvtop                        # GPU Monitor in a terminal (Task Manager > View)
     vlc                          # Media Player (music, videos, DVDs)
     vlc-plugin-ffmpeg            # VLC's codecs (weak deps are off; uses the base's full ffmpeg)
     fastfetch
@@ -105,7 +106,7 @@ PACKAGES=(
     asciiquarium
     cmatrix
     cbonsai
-    vte291                       # screen savers on every monitor
+    vte291                       # screen savers on every monitor; firox-terminal
     pavucontrol                  # Sounds and Audio Devices
     alsa-tools                   # hda-verb, for `ujust fix-realtek-audio`
     network-manager-applet       # tray icon
