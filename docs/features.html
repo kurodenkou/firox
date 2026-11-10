@@ -37,6 +37,7 @@
 <ul class="toc">
     <li><a href="#taskbar">Taskbar and Start menu</a></li>
     <li><a href="#network">Network and devices</a></li>
+    <li><a href="#files">Files and network places</a></li>
     <li><a href="#tools">Everyday tools</a></li>
     <li><a href="#safe">Updates, restore and backup</a></li>
     <li><a href="#settings">Settings and login</a></li>
@@ -212,6 +213,41 @@
     <img src="screenshots/power-options.png" alt="Power Options on a laptop" loading="lazy">
     <figcaption>Power Options</figcaption>
 </figure>
+</div>
+
+<h2 id="files">Files and network places</h2>
+
+<div class="feature">
+    <div class="feature-text">
+        <h3>Firox Explorer</h3>
+        <p>Firox's file manager. It opens when you double-click Computer or your home folder, press <kbd>Super</kbd>+<kbd>E</kbd>, or open any folder.</p>
+<ul>
+    <li><b>Sidebar:</b> your folders and bookmarks, your drives (click to open, right-click to eject) and your network places.</li>
+    <li><b>Tabs:</b> <kbd>Ctrl</kbd>+<kbd>T</kbd> opens one, a middle-click opens a folder in a new tab, and you can drop files on a tab to move them there.</li>
+    <li><b>Search:</b> type to find things in this folder. Click <b>Subfolders</b> to search everything inside it too; Start → <b>Search</b> opens it that way.</li>
+    <li><b>Everything else you'd expect:</b> Icons or Details, sorting, cut, copy and paste (shared with the desktop), the Recycle Bin with Restore, Properties and a full menu bar.</li>
+</ul>
+        <p class="tech">firox-explorer (GTK)</p>
+    </div>
+    <figure>
+    <img src="screenshots/explorer.png" alt="Firox Explorer with two tabs open" loading="lazy">
+    <figcaption>Firox Explorer</figcaption>
+</figure>
+</div>
+
+<div class="grid two">
+<div class="card">
+    <h3>Connect to Server</h3>
+    <p>In Explorer's sidebar, under Network. Connect to a Windows shared folder, an SFTP, FTP or WebDAV server, or cloud storage: Amazon S3 and compatible services (Wasabi, Cloudflare R2, MinIO…) and Backblaze B2. You can also open <b>Network</b> and double-click a computer, then a shared folder.</p>
+    <p>Connections are yours alone and last until you disconnect or log off. Tick <b>Remember</b> to keep the password in your keyring, and <b>Connect when I log in</b> to have it ready every time. Passwords are never written to a file or shown on a command line.</p>
+    <p class="tech">gvfs (SMB, SFTP, FTP, WebDAV), rclone (S3, B2)</p>
+</div>
+<div class="card">
+    <h3>When a connection doesn't work</h3>
+    <p>The error message says what went wrong. For more, right-click the connection and choose <b>Test Connection</b>: it checks each step, from your keyring to the server, and saves a report with every password replaced by <code>***</code>.</p>
+    <p>S3 and B2 connections keep a log in <code>~/.local/state/firox/mounts</code>. Right-click → <b>Show Log</b> opens the latest one.</p>
+    <p class="tech">firox-explorer --test NAME</p>
+</div>
 </div>
 
 <h2 id="tools">Everyday tools</h2>
