@@ -1,5 +1,4 @@
 # Terminal used for apps that run in one (btop, htop, nvtop, ...): see xdg-terminal-exec
 firox-terminal.desktop
-xfce4-terminal.desktop
 foot.desktop
 org.codeberg.dnkl.foot.desktop

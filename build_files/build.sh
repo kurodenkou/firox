@@ -103,7 +103,6 @@ PACKAGES=(
     ristretto                    # Picture viewer
     htop
     btop                         # Task Manager
-    xfce4-terminal               # spare terminal (the Command Prompt is firox-terminal)
     nvtop                        # GPU Monitor in a terminal (Task Manager > View)
     mangohud                     # Firox Gaming HUD (firox-hud): the in-game overlay
     mangohud.i686                # ... for 32-bit games too
