@@ -90,7 +90,7 @@ COMMAND=pipes.sh</code></pre></div>
     <li><b>Looks:</b> each look's styles are in <code>/usr/share/firox/themes/{classic,modern,glass}/</code>: taskbar, Start menu, pop-ups, notifications, clipboard picker and lock screen. Window frames are in <code>/usr/share/themes/Firox-{Luna,Modern,Glass}</code>.</li>
     <li><b>Your own look:</b> copy one of those folders and edit it; it appears in <b>Settings → Appearance</b> automatically. <code>GLASS=1</code> in its <code>theme.conf</code> gives it the frosted-wallpaper taskbar.</li>
     <li><b>Taskbar:</b> your own CSS rules go in <code>~/.config/firox/panel.css</code>.</li>
-    <li><b>System defaults:</b> in <code>/etc/xdg/{labwc,waybar,mako,foot,fuzzel}</code>. Anything you put in the matching <code>~/.config/</code> folder overrides them; <code>ujust customize-desktop</code> copies them there for you.</li>
+    <li><b>System defaults:</b> in <code>/etc/xdg/{labwc,waybar,mako,fuzzel}</code>. Anything you put in the matching <code>~/.config/</code> folder overrides them; <code>ujust customize-desktop</code> copies them there for you.</li>
     <li><b>The Start menu:</b> pinned and default apps are at the top of <code>system_files/usr/bin/firox-startmenu</code> (<code>PINNED</code>, <code>DEFAULT_MFU</code>). It also takes <code>--all-programs</code>, <code>--power</code> and <code>--log-off</code>, which you can bind to keys in labwc's <code>rc.xml</code>.</li>
 </ul>
 

@@ -63,7 +63,7 @@ APPLETS = [
     ("preferences-desktop-wallpaper", "Desktop Background", "Wallpaper and desktop icons", ["@background"]),
     ("multimedia-volume-control", "Sounds and Audio Devices", "Speakers, microphones and volume", ["pavucontrol"]),
     ("audio-card", "Sound Troubleshooter", "Fix silent or crackling Realtek onboard audio",
-     ["foot", "-T", "Sound Troubleshooter", "--", "sh", "-c",
+     ["firox-terminal", "-T", "Sound Troubleshooter", "-x", "sh", "-c",
       "ujust fix-realtek-audio; echo; read -r -p 'Press Enter to close' _"]),
     ("preferences-system-network", "Network Connections", "Wi-Fi, Ethernet and VPN", ["nm-connection-editor"]),
     ("bluetooth", "Bluetooth Devices", "Pair headphones, mice and phones", ["blueman-manager"]),
@@ -1581,7 +1581,7 @@ class AccountsDialog(Gtk.Dialog):
                                   xalign=0, wrap=True, max_width_chars=40), False, False, 0)
         pw = Gtk.Button(label="Change my password\u2026")
         pw.set_halign(Gtk.Align.START)
-        pw.connect("clicked", lambda *_: spawn(["foot", "-T", "Change Password", "--", "sh", "-c",
+        pw.connect("clicked", lambda *_: spawn(["firox-terminal", "-T", "Change Password", "-x", "sh", "-c",
                                                 "passwd; echo; read -r -p 'Press Enter to close' _"]))
         info.pack_start(pw, False, False, 0)
         top.pack_start(info, True, True, 0)
