@@ -93,7 +93,6 @@ HIDDEN = {
     "foot.desktop",                      # the Command Prompt is firox-terminal
     "foot-server.desktop",
     "footclient.desktop",
-    "xfce4-terminal-settings.desktop",   # its Edit > Preferences
     "htop.desktop",                      # Task Manager is btop
     "vlc-openbd.desktop", "vlc-opencda.desktop", "vlc-opendvd.desktop", "vlc-openvcd.desktop",
     "firox-startmenu.desktop",

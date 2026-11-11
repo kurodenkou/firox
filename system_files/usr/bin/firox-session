@@ -28,6 +28,13 @@ fi
 if grep -qs '^inode/directory=pcmanfm-qt.desktop' "$CFG/mimeapps.list"; then
     sed -i 's/^inode\/directory=pcmanfm-qt.desktop.*/inode\/directory=firox-explorer.desktop/' "$CFG/mimeapps.list"
 fi
+# xfce4-terminal is gone (the Command Prompt is firox-terminal): move a
+# Quick Launch pin and the Start menu's history over to it
+for f in "$CFG/firox/quicklaunch" "$STATE/firox/startmenu.json"; do
+    if grep -qs 'xfce4-terminal\.desktop' "$f"; then
+        sed -i 's/xfce4-terminal\.desktop/firox-terminal.desktop/g' "$f"
+    fi
+done
 # A personal rc.xml copied from the old defaults names the old window theme
 if [ -f "$CFG/labwc/rc.xml" ]; then
     sed -i 's|<name>FirefoxOS</name>|<name>Firox</name>|' "$CFG/labwc/rc.xml"
