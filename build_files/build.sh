@@ -5,6 +5,16 @@ set -ouex pipefail
 FEDORA_VERSION="$(rpm -E %fedora)"
 echo "Building Firox Linux on Fedora ${FEDORA_VERSION}"
 
+# What this image was built from. The nightly build checks this file before
+# publishing, so an image built from stale (cached) files is never pushed.
+install -Dm0644 /dev/stdin /usr/share/firox/build-info <<BUILDINFO
+commit=${FIROX_COMMIT:-unknown}
+source=${FIROX_SOURCE_HASH:-unknown}
+variant=${FIROX_VARIANT:-main}
+fedora=${FEDORA_VERSION}
+built=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+BUILDINFO
+
 ### ---------------------------------------------------------------------------
 ### 1. Third-party repos
 ### ---------------------------------------------------------------------------

@@ -145,6 +145,10 @@ def c_summary():
         rollback = next((d for d in deps if not d.get("booted") and d is not staged), None)
         if rollback:
             e.append(("Previous version (System Restore)", rollback.get("version", "") or when(rollback.get("timestamp"))))
+    build = kv(read("/usr/share/firox/build-info"), "=")
+    if build:
+        e.append(("Firox build", f"commit {build.get('commit', '?')}, {build.get('variant', 'main')} image, "
+                                 f"built {build.get('built', '?').replace('T', ' ').rstrip('Z')} UTC"))
     e += [("Kernel", platform.release()), ("Kernel built", platform.version()),
           ("Architecture", platform.machine())]
     efi = os.path.isdir("/sys/firmware/efi")

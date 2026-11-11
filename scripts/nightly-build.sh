@@ -179,6 +179,19 @@ for variant in $VARIANTS; do
         fail "unknown variant '$variant' (use main or nvidia)"; continue
     fi
 
+    # The image must really contain this commit's files: a build step reused
+    # from podman's cache once shipped the NVIDIA image with the previous
+    # night's files under tonight's tag. build.sh stamps the commit inside.
+    if [ "$DRY" != 1 ]; then
+        info="$(podman run --rm --pull=never --network none --entrypoint cat "localhost/$img:$TAG" \
+                /usr/share/firox/build-info 2>/dev/null || true)"
+        if ! grep -qx "commit=$COMMIT" <<<"$info"; then
+            fail "$img: the image holds $(grep '^commit=' <<<"$info" || echo 'no build-info'), not $COMMIT (stale build); not published"
+            continue
+        fi
+        say "[$variant] contains commit $COMMIT ($(grep '^source=' <<<"$info"))"
+    fi
+
     if [ "$RECHUNK" = 1 ]; then
         say "[$variant] rechunking"
         run just ostree-rechunk "$img" "$TAG" || { fail "$img: rechunk"; continue; }
