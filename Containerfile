@@ -24,13 +24,21 @@ COPY system_files /system_files
 # It already ships the ublue tooling (ujust, flatpak setup, codecs, RPM Fusion).
 FROM ${BASE_IMAGE}
 ARG FIROX_VARIANT=main
+# A hash of build_files/ and system_files/ (and the commit), set by `just
+# build`. It's part of the RUN line, so the build step is never reused from
+# podman's cache once the Firox files change: the bind-mounted files don't
+# reliably invalidate that cache by themselves, which left the NVIDIA image
+# shipping the previous build's files under the new commit's tag.
+ARG FIROX_SOURCE_HASH=unknown
+ARG FIROX_COMMIT=unknown
 
 RUN --mount=type=bind,from=ctx,source=/,target=/ctx \
     --mount=type=bind,from=akmods,source=/,target=/akmods \
     --mount=type=cache,dst=/var/cache \
     --mount=type=cache,dst=/var/log \
     --mount=type=tmpfs,dst=/tmp \
-    FIROX_VARIANT=${FIROX_VARIANT} /ctx/build.sh
+    FIROX_VARIANT=${FIROX_VARIANT} FIROX_SOURCE_HASH=${FIROX_SOURCE_HASH} FIROX_COMMIT=${FIROX_COMMIT} \
+    /ctx/build.sh
 
 ### LINTING
 RUN bootc container lint

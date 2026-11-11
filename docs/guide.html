@@ -122,6 +122,7 @@ COMMAND=pipes.sh</code></pre></div>
     <li><b>Results:</b> each run writes a log to <code>~/.local/state/firox-build/</code> (kept 14 days) and prints a short summary. It exits non-zero if anything failed, so cron mails you.</li>
     <li><b>Overlaps:</b> a night that finds the previous build still running skips itself.</li>
     <li><b>Options:</b> <code>--variant main|nvidia</code>, <code>--no-push</code>, <code>--dry-run</code>.</li>
+    <li><b>No stale images:</b> every image records the commit it was built from in <code>/usr/share/firox/build-info</code>, and the build step can't be reused from podman's cache once the Firox files change. The nightly build checks the record before pushing, and a mismatch is reported as a failure instead of being published. If the newest kernel has no NVIDIA modules yet, the NVIDIA image is built on the newest earlier base that has them.</li>
     <li><b>Testing a pull request:</b> <code>--pr 42</code> (or <code>--branch NAME</code>) builds it without publishing anything or making ISOs, so you can check it builds before merging.</li>
 </ul>
 

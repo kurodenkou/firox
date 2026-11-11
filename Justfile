@@ -99,6 +99,16 @@ build $target_image=image_name $tag=default_tag:
     set -euox pipefail
 
     BUILD_ARGS=()
+    # What's being built: the commit (with "-dirty" for uncommitted changes)
+    # and a hash of every file that goes into the image. The hash is a
+    # build argument used by the build step, so podman can't reuse a cached
+    # build step made from older files (see the Containerfile).
+    FIROX_COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+    [[ -z "$(git status -s 2>/dev/null)" ]] || FIROX_COMMIT="${FIROX_COMMIT}-dirty"
+    FIROX_SOURCE_HASH="$( { find build_files system_files -type f -print0 | sort -z | xargs -0 sha256sum; \
+        find build_files system_files -type l -printf '%p -> %l\n' | sort; } | sha256sum | cut -c1-16)"
+    BUILD_ARGS+=("--build-arg" "FIROX_COMMIT=${FIROX_COMMIT}" "--build-arg" "FIROX_SOURCE_HASH=${FIROX_SOURCE_HASH}")
+    echo "Firox ${FIROX_COMMIT}, sources ${FIROX_SOURCE_HASH}"
     # Variant settings (set by `just build-nvidia`)
     for var in BASE_IMAGE AKMODS_IMAGE FIROX_VARIANT; do
         if [[ -n "${!var:-}" ]]; then
@@ -138,9 +148,32 @@ build $target_image=image_name $tag=default_tag:
 build-nvidia $target_image=(image_name + "-nvidia-open") $tag=default_tag:
     #!/usr/bin/env bash
     set -euo pipefail
-    base="ghcr.io/ublue-os/base-main:latest"
+    repo="ghcr.io/ublue-os/base-main"
+    base="${repo}:latest"
+    inspect() { podman image inspect "$1" | python3 -c 'import json,sys; i=json.load(sys.stdin)[0]; print(i["Labels"]["ostree.linux"], i["Digest"])'; }
+    akmods_for() { echo "ghcr.io/ublue-os/akmods-nvidia-open:main-$(sed -E 's/.*\.fc([0-9]+)\..*/\1/' <<< "$1")-${1%.x86_64}"; }
+    published() { skopeo inspect --no-tags --raw "docker://$1" >/dev/null 2>&1; }
     podman pull -q "${base}" >/dev/null
-    read -r kver digest < <(podman image inspect "${base}" | python3 -c 'import json,sys; i=json.load(sys.stdin)[0]; print(i["Labels"]["ostree.linux"], i["Digest"])')
+    read -r kver digest < <(inspect "${base}")
+    # Universal Blue sometimes publishes a new kernel before the NVIDIA
+    # modules built for it. Rather than fail (and skip tonight's NVIDIA
+    # image), use the newest dated base whose kernel has its modules.
+    if command -v skopeo >/dev/null && ! published "$(akmods_for "${kver}")"; then
+        echo "No NVIDIA modules yet for kernel ${kver}; looking for the newest base that has them"
+        fedora="$(sed -E 's/.*\.fc([0-9]+)\..*/\1/' <<< "${kver}")"
+        found=""
+        for t in $(skopeo list-tags "docker://${repo}" | python3 -c 'import json,re,sys; f=sys.argv[1]; t=[x for x in json.load(sys.stdin)["Tags"] if re.fullmatch(f + r"-\d{8}", x)]; print(" ".join(sorted(t, reverse=True)[:14]))' "${fedora}"); do
+            k="$(skopeo inspect --no-tags "docker://${repo}:${t}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["Labels"].get("ostree.linux", ""))')"
+            if [ -n "$k" ] && published "$(akmods_for "$k")"; then
+                podman pull -q "${repo}:${t}" >/dev/null
+                read -r kver digest < <(inspect "${repo}:${t}")
+                found="$t"
+                break
+            fi
+        done
+        [ -n "$found" ] || { echo "No base from the last two weeks has NVIDIA modules for its kernel" >&2; exit 1; }
+        echo "Using ${repo}:${found}: its kernel ${kver} has NVIDIA modules"
+    fi
     fedora="$(sed -E 's/.*\.fc([0-9]+)\..*/\1/' <<< "${kver}")"
     # Pin the exact base that was inspected, so kernel and modules can't drift
     export BASE_IMAGE="ghcr.io/ublue-os/base-main@${digest}"
