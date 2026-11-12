@@ -92,6 +92,7 @@ PACKAGES=(
     gvfs-mtp
     gvfs-smb
     gvfs-fuse                    # network places as folders for every program
+    fuse-libs                    # libfuse.so.2: AppImages mount themselves with it
     rclone                       # Firox Explorer: S3 and Backblaze B2
     xdg-user-dirs
     xdg-utils
