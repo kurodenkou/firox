@@ -390,6 +390,36 @@
 </div>
 </div>
 
+<div class="feature">
+    <div class="feature-text">
+        <h3>Device Manager</h3>
+        <p>Every device in the computer, grouped by type, with the driver each one uses.</p>
+<ul>
+    <li><b>Missing drivers:</b> devices that need a driver but have none are shown under <b>Other devices</b>, with a button to search the web for one.</li>
+    <li><b>Properties:</b> status, the driver and its version, and every detail Linux knows about the device.</li>
+</ul>
+        <p class="tech">firox-devmgmt (lspci, /sys, /proc, udevadm, modinfo)</p>
+    </div>
+    <figure>
+    <img src="screenshots/device-manager.png" alt="Device Manager: devices by type, with a Wi-Fi card without a driver under Other devices" loading="lazy">
+</figure>
+</div>
+
+<div class="feature">
+    <div class="feature-text">
+        <h3>Disk Cleanup</h3>
+        <p>Shows how much space you can free and frees it.</p>
+<ul>
+    <li><b>Your files:</b> the Recycle Bin, thumbnails, Firefox's cache, old temporary files, program caches and, if you tick it, Downloads.</li>
+    <li><b>System</b> (asks for your password): unused app runtimes, old logs, crash reports, the update cache, and the previous version of Firox.</li>
+</ul>
+        <p class="tech">firox-cleanmgr</p>
+    </div>
+    <figure>
+    <img src="screenshots/disk-cleanup.png" alt="Disk Cleanup with the space each item frees" loading="lazy">
+</figure>
+</div>
+
 <h2 id="safe">Updates, restore and backup</h2>
 
 <div class="feature">
@@ -473,13 +503,34 @@
 </figure>
 </div>
 
+<div class="feature">
+    <div class="feature-text">
+        <h3>Virus Scan</h3>
+        <p>Checks your files for viruses and other malware with ClamAV.</p>
+<ul>
+    <li><b>Scans:</b> Quick (downloads and startup programs), Full (your home folder) or a folder you choose. Or right-click files in Firox Explorer.</li>
+    <li><b>Quarantine</b> locks away what's found, and can restore it.</li>
+    <li><b>Up to date:</b> the definitions update by themselves, and Security Center checks they're recent.</li>
+</ul>
+        <p class="tech">firox-virusscan (clamscan; definitions from clamav-freshclam)</p>
+    </div>
+    <figure>
+    <img src="screenshots/virus-scan.png" alt="Virus Scan after finding two test files in Downloads" loading="lazy">
+</figure>
+</div>
+
 <h2 id="settings">Settings and login</h2>
 
 <div class="grid two">
 <div class="card">
     <h3>Settings</h3>
-    <p>The Control Panel, in alphabetical order. It covers:</p><ul><li>Display, sound, network, Bluetooth, printers and disks</li><li>Web Apps, Android and the Bazaar app store</li><li>Date and Time, <b>Taskbar</b> and <b>Default Programs</b> (browser, email, music, pictures and more)</li><li><b>User Accounts</b> (your picture and password), Startup Programs, System Restore, Backup and Sync</li></ul>
+    <p>The Control Panel, in alphabetical order. It covers:</p><ul><li>Display, sound, network, Bluetooth, printers and disks</li><li>Web Apps, Android and the Bazaar app store</li><li>Date and Time, <b>Taskbar</b> and <b>Default Programs</b> (browser, email, music, pictures and more)</li><li><b>User Accounts</b> (your picture and password), Startup Programs, System Restore, Backup and Sync</li><li><b>Security Center</b>, Virus Scan, Event Viewer, Device Manager, Disk Cleanup and Night Light</li></ul>
     <p class="tech">firox-control-panel</p>
+</div>
+<div class="card">
+    <h3>Night Light</h3>
+    <p>Warmer screen colours in the evening. Click the moon on the taskbar to turn it on or off, or let it come on from sunset to sunrise (worked out for where you are, no internet needed) or at times you choose.</p>
+    <p class="tech">firox-nightlight (wlsunset)</p>
 </div>
 <div class="card">
     <h3>Startup Programs</h3>

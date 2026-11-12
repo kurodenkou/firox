@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Disk Cleanup
+Comment=Free up disk space: empty the Recycle Bin, clear caches, old logs and unused app runtimes
+Exec=firox-cleanmgr
+Icon=bleachbit
+Categories=System;Utility;
+Keywords=cleanmgr;disk space;free space;clean;cache;temporary files;trash;junk;
+StartupNotify=true

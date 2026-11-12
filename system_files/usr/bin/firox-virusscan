@@ -1,0 +1,652 @@
+#!/usr/bin/python3
+"""
+firox-virusscan: Virus Scan. Check your files for viruses and other malware
+with ClamAV.
+
+    firox-virusscan                  open Virus Scan
+    firox-virusscan PATH...          open it and scan those files or folders
+                                     (Firox Explorer > Scan for Viruses)
+    firox-virusscan status           print the definitions' date and the
+                                     last scan
+    firox-virusscan definitions      print the definitions' version and date
+
+Scans:
+  Quick scan   where downloaded and starting programs land: Downloads,
+               Desktop, ~/.local/share/applications, ~/.config/autostart,
+               ~/.local/bin and your files in /tmp
+  Full scan    your whole home folder
+  Custom scan  a folder you choose
+
+It uses clamscan (it reads the virus definitions each time, so a scan takes a
+few seconds to start and about 1 GB of memory while it runs). The definitions
+are kept up to date by the clamav-freshclam service.
+
+Found something: Quarantine (moved to ~/.local/share/firox/quarantine with
+no permissions, so it can't run or be opened; Restore puts it back), Delete,
+or Allow (leave it).
+
+State: ~/.local/state/firox/virusscan.json (the last scan, for Security
+Center).
+"""
+
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+import uuid
+
+HOME = os.path.expanduser("~")
+DATA = os.environ.get("XDG_DATA_HOME") or os.path.join(HOME, ".local", "share")
+STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.join(HOME, ".local", "state"), "firox")
+STATE = os.path.join(STATE_DIR, "virusscan.json")
+QUARANTINE = os.path.join(DATA, "firox", "quarantine")
+DB_DIR = os.environ.get("FIROX_CLAMAV_DB", "/var/lib/clamav")
+SKIP_DIRS = [os.path.join(DATA, "containers"), os.path.join(DATA, "flatpak"), os.path.join(DATA, "waydroid"),
+             QUARANTINE, os.path.join(HOME, ".cache")]
+CLAMSCAN = os.environ.get("FIROX_CLAMSCAN", "clamscan")
+
+
+def downloads_dir():
+    try:
+        out = subprocess.run(["xdg-user-dir", "DOWNLOAD"], capture_output=True, text=True, timeout=5).stdout.strip()
+        if out and out != HOME:
+            return out
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return os.path.join(HOME, "Downloads")
+
+
+def desktop_dir():
+    try:
+        out = subprocess.run(["xdg-user-dir", "DESKTOP"], capture_output=True, text=True, timeout=5).stdout.strip()
+        if out and out != HOME:
+            return out
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return os.path.join(HOME, "Desktop")
+
+
+def quick_paths():
+    paths = [downloads_dir(), desktop_dir(), os.path.join(DATA, "applications"),
+             os.path.join(HOME, ".config", "autostart"), os.path.join(HOME, ".local", "bin")]
+    uid = os.getuid()
+    for tmp in ("/tmp", "/var/tmp"):
+        try:
+            for name in os.listdir(tmp):
+                p = os.path.join(tmp, name)
+                try:
+                    st = os.lstat(p)
+                except OSError:
+                    continue
+                if st.st_uid == uid and not os.path.islink(p):
+                    paths.append(p)
+        except OSError:
+            pass
+    return [p for p in paths if os.path.exists(p)]
+
+
+# ------------------------------------------------------------- definitions --
+
+def definitions():
+    """(version, unix time) of the newest daily definitions, or (None, None)."""
+    best = (None, None)
+    for name in ("daily.cld", "daily.cvd", "main.cld", "main.cvd"):
+        path = os.path.join(DB_DIR, name)
+        try:
+            with open(path, "rb") as fh:
+                head = fh.read(512).decode("ascii", "replace")
+        except OSError:
+            continue
+        parts = head.split(":")
+        when = None
+        if len(parts) > 3 and parts[0].startswith("ClamAV-VDB"):
+            try:
+                when = time.mktime(time.strptime(parts[1].strip()[:17], "%d %b %Y %H-%M"))
+            except ValueError:
+                when = None
+            version = parts[2]
+        else:
+            version = None
+        if when is None:
+            try:
+                when = os.path.getmtime(path)
+            except OSError:
+                continue
+        if best[1] is None or when > best[1]:
+            best = (version, when)
+        if name.startswith("daily"):
+            break
+    return best
+
+
+def load_state():
+    try:
+        with open(STATE) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(**kw):
+    s = load_state()
+    s.update(kw)
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = STATE + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(s, fh)
+    os.replace(tmp, STATE)
+
+
+def us_date(ts, with_time=False):
+    t = time.localtime(ts)
+    s = f"{t.tm_mon}/{t.tm_mday}/{t.tm_year}"
+    if with_time:
+        s += f" {(t.tm_hour % 12) or 12}:{t.tm_min:02d} {'AM' if t.tm_hour < 12 else 'PM'}"
+    return s
+
+
+# ------------------------------------------------------------- quarantine --
+
+def quarantine(path, threat):
+    os.makedirs(QUARANTINE, mode=0o700, exist_ok=True)
+    os.chmod(QUARANTINE, 0o700)
+    qid = uuid.uuid4().hex
+    st = os.lstat(path)
+    dest = os.path.join(QUARANTINE, qid + ".bin")
+    shutil.move(path, dest)
+    os.chmod(dest, 0)
+    with open(os.path.join(QUARANTINE, qid + ".json"), "w") as fh:
+        json.dump({"path": path, "threat": threat, "time": time.time(), "mode": st.st_mode & 0o7777,
+                   "size": st.st_size}, fh)
+    return qid
+
+
+def quarantined():
+    out = []
+    for f in sorted(os.listdir(QUARANTINE)) if os.path.isdir(QUARANTINE) else []:
+        if f.endswith(".json"):
+            try:
+                with open(os.path.join(QUARANTINE, f)) as fh:
+                    info = json.load(fh)
+            except (OSError, ValueError):
+                continue
+            info["id"] = f[:-5]
+            out.append(info)
+    return sorted(out, key=lambda i: -i.get("time", 0))
+
+
+def restore(qid):
+    with open(os.path.join(QUARANTINE, qid + ".json")) as fh:
+        info = json.load(fh)
+    src = os.path.join(QUARANTINE, qid + ".bin")
+    dest = info["path"]
+    if os.path.exists(dest):
+        base, ext = os.path.splitext(dest)
+        dest = f"{base} (restored){ext}"
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    os.chmod(src, 0o600)
+    shutil.move(src, dest)
+    os.chmod(dest, info.get("mode", 0o644))
+    os.unlink(os.path.join(QUARANTINE, qid + ".json"))
+    return dest
+
+
+def forget(qid):
+    for ext in (".bin", ".json"):
+        p = os.path.join(QUARANTINE, qid + ext)
+        try:
+            os.chmod(p, 0o600)
+            os.unlink(p)
+        except OSError:
+            pass
+
+
+# ------------------------------------------------------------------- scan --
+
+def count_files(paths, stop):
+    n = 0
+    for p in paths:
+        if os.path.isfile(p):
+            n += 1
+            continue
+        for root, dirs, files in os.walk(p):
+            if stop.is_set():
+                return n
+            dirs[:] = [d for d in dirs if os.path.join(root, d) not in SKIP_DIRS]
+            n += len(files)
+    return n
+
+
+def scan(paths, on_progress, on_found, stop):
+    """Run clamscan; returns (files scanned, error message or "")."""
+    argv = [CLAMSCAN, "--recursive", "--stdout", "--no-summary", "--cross-fs=no"]
+    for d in SKIP_DIRS:
+        argv.append(f"--exclude-dir=^{re.escape(d)}")
+    argv += ["--"] + paths
+    try:
+        proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                errors="replace", start_new_session=True)
+    except OSError as err:
+        return 0, f"ClamAV isn't installed ({err.strerror})."
+    scanned = 0
+    for line in proc.stdout:
+        if stop.is_set():
+            os.killpg(proc.pid, signal.SIGTERM)
+            break
+        line = line.rstrip("\n")
+        m = re.match(r"^(.*): (.+) FOUND$", line)
+        if m:
+            scanned += 1
+            on_found(m.group(1), m.group(2))
+        elif line.endswith(": OK") or line.endswith(": Empty file") or line.endswith(": Symbolic link"):
+            scanned += 1
+            on_progress(scanned, line.rsplit(": ", 1)[0])
+    proc.wait()
+    err = proc.stderr.read()
+    if proc.returncode == 2 and not stop.is_set():
+        if "database" in err.lower() or "cvd" in err.lower():
+            return scanned, "The virus definitions haven't been downloaded yet."
+        lines = [l for l in err.splitlines() if l.strip() and "WARNING" not in l]
+        if scanned == 0:
+            return scanned, lines[-1] if lines else "The scan couldn't run."
+    return scanned, ""
+
+
+# --------------------------------------------------------------------- UI --
+
+def gui(paths):
+    import gi
+    gi.require_version("Gtk", "3.0")
+    from gi.repository import Gio, GLib, Gtk, Pango
+
+    class Window(Gtk.ApplicationWindow):
+        def __init__(self, app):
+            super().__init__(application=app, title="Virus Scan")
+            self.set_default_size(640, 600)
+            self.set_icon_name("clamav")
+            self.stop = threading.Event()
+            self.running = False
+            self.custom = None
+            outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+            outer.set_border_width(14)
+            self.add(outer)
+
+            head = Gtk.Box(spacing=12)
+            self.shield = Gtk.Image.new_from_icon_name("security-high", Gtk.IconSize.DIALOG)
+            self.shield.set_pixel_size(48)
+            head.pack_start(self.shield, False, False, 0)
+            self.headline = Gtk.Label(xalign=0, wrap=True)
+            head.pack_start(self.headline, True, True, 0)
+            self.update_b = Gtk.Button.new_with_mnemonic("_Update definitions")
+            self.update_b.set_valign(Gtk.Align.CENTER)
+            self.update_b.set_tooltip_text("Check for new virus definitions now (asks for your password)")
+            self.update_b.connect("clicked", lambda _b: self.update_definitions())
+            head.pack_end(self.update_b, False, False, 0)
+            outer.pack_start(head, False, False, 0)
+
+            nb = Gtk.Notebook()
+            outer.pack_start(nb, True, True, 0)
+
+            # ---- Scan
+            page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+            page.set_border_width(12)
+            self.r_quick = Gtk.RadioButton.new_with_label(None, "Quick scan")
+            self.r_full = Gtk.RadioButton.new_with_label_from_widget(self.r_quick, "Full scan")
+            self.r_custom = Gtk.RadioButton.new_with_label_from_widget(self.r_quick, "Custom scan")
+            self.r_quick.set_tooltip_text("Downloads, Desktop, and where programs that start by themselves are "
+                                          "kept. A few minutes.")
+            self.r_full.set_tooltip_text("Your whole home folder. This can take an hour or more.")
+            for r, note in ((self.r_quick, "Downloads, Desktop and startup programs"),
+                            (self.r_full, "your whole home folder; can take an hour or more"),
+                            (self.r_custom, "")):
+                row = Gtk.Box(spacing=8)
+                row.pack_start(r, False, False, 0)
+                if note:
+                    lab = Gtk.Label(label=note, xalign=0, ellipsize=Pango.EllipsizeMode.END)
+                    lab.get_style_context().add_class("dim-label")
+                    row.pack_start(lab, True, True, 0)
+                page.pack_start(row, False, False, 0)
+            crow = Gtk.Box(spacing=6)
+            crow.set_margin_start(26)
+            self.custom_label = Gtk.Label(label="No folder chosen", xalign=0,
+                                          ellipsize=Pango.EllipsizeMode.MIDDLE)
+            choose = Gtk.Button.new_with_mnemonic("C_hoose folder…")
+            choose.connect("clicked", lambda _b: self.choose())
+            crow.pack_start(choose, False, False, 0)
+            crow.pack_start(self.custom_label, True, True, 0)
+            page.pack_start(crow, False, False, 0)
+
+            brow = Gtk.Box(spacing=6)
+            self.scan_b = Gtk.Button.new_with_mnemonic("_Scan now")
+            self.scan_b.get_style_context().add_class("suggested-action")
+            self.scan_b.connect("clicked", lambda _b: self.start())
+            self.cancel_b = Gtk.Button.new_with_mnemonic("_Cancel")
+            self.cancel_b.set_sensitive(False)
+            self.cancel_b.connect("clicked", lambda _b: self.stop.set())
+            brow.pack_start(self.scan_b, False, False, 0)
+            brow.pack_start(self.cancel_b, False, False, 0)
+            page.pack_start(brow, False, False, 4)
+            self.progress = Gtk.ProgressBar(show_text=True)
+            page.pack_start(self.progress, False, False, 0)
+            self.current = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.MIDDLE)
+            self.current.get_style_context().add_class("dim-label")
+            page.pack_start(self.current, False, False, 0)
+
+            frow = Gtk.Box(spacing=6)
+            self.found_label = Gtk.Label(xalign=0)
+            frow.pack_start(self.found_label, True, True, 0)
+            page.pack_start(frow, False, False, 4)
+            self.found = Gtk.ListStore(bool, str, str)    # tick, path, threat
+            view = Gtk.TreeView(model=self.found)
+            tick = Gtk.CellRendererToggle()
+            tick.connect("toggled", lambda _r, p: self.found.set_value(self.found.get_iter(p), 0,
+                                                                        not self.found[p][0]))
+            view.append_column(Gtk.TreeViewColumn("", tick, active=0))
+            c = Gtk.TreeViewColumn("File", Gtk.CellRendererText(ellipsize=Pango.EllipsizeMode.MIDDLE), text=1)
+            c.set_expand(True)
+            view.append_column(c)
+            view.append_column(Gtk.TreeViewColumn("Threat", Gtk.CellRendererText(), text=2))
+            self.found_sw = Gtk.ScrolledWindow()
+            self.found_sw.set_shadow_type(Gtk.ShadowType.IN)
+            self.found_sw.set_min_content_height(70)
+            self.found_sw.add(view)
+            page.pack_start(self.found_sw, True, True, 0)
+            self.actions = []
+            for label, fn, tip in (("_Allow", self.do_allow, "Leave the ticked files where they are"),
+                                   ("_Delete", self.do_delete, "Delete the ticked files permanently"),
+                                   ("_Quarantine", self.do_quarantine,
+                                    "Move the ticked files where they can't be opened or run (safest)")):
+                b = Gtk.Button.new_with_mnemonic(label)
+                b.set_tooltip_text(tip)
+                b.connect("clicked", lambda _b, f=fn: f())
+                frow.pack_end(b, False, False, 0)
+                self.actions.append(b)
+            nb.append_page(page, Gtk.Label(label="Scan"))
+
+            # ---- Quarantine
+            qpage = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+            qpage.set_border_width(12)
+            qpage.pack_start(Gtk.Label(label="Files moved here can't be opened or run. Restore one only if "
+                                             "you're sure it's safe.", xalign=0, wrap=True), False, False, 0)
+            self.qstore = Gtk.ListStore(str, str, str, str)     # id, original path, threat, date
+            qview = Gtk.TreeView(model=self.qstore)
+            c = Gtk.TreeViewColumn("File", Gtk.CellRendererText(ellipsize=Pango.EllipsizeMode.MIDDLE), text=1)
+            c.set_expand(True)
+            qview.append_column(c)
+            qview.append_column(Gtk.TreeViewColumn("Threat", Gtk.CellRendererText(), text=2))
+            qview.append_column(Gtk.TreeViewColumn("Date", Gtk.CellRendererText(), text=3))
+            self.qview = qview
+            sw = Gtk.ScrolledWindow()
+            sw.set_shadow_type(Gtk.ShadowType.IN)
+            sw.add(qview)
+            qpage.pack_start(sw, True, True, 0)
+            qrow = Gtk.Box(spacing=6)
+            for label, fn in (("_Restore", self.q_restore), ("_Delete", self.q_delete)):
+                b = Gtk.Button.new_with_mnemonic(label)
+                b.connect("clicked", lambda _b, f=fn: f())
+                qrow.pack_start(b, False, False, 0)
+            qpage.pack_start(qrow, False, False, 0)
+            nb.append_page(qpage, Gtk.Label(label="Quarantine"))
+            self.nb = nb
+
+            self.status = Gtk.Label(xalign=0, wrap=True)
+            outer.pack_start(self.status, False, False, 0)
+            self.show_all()
+            self.show_found()
+            self.refresh_head()
+            self.refresh_quarantine()
+            if paths:
+                self.custom = paths
+                self.custom_label.set_text(", ".join(paths))
+                self.r_custom.set_active(True)
+                GLib.idle_add(lambda: self.start() or False)
+
+        # ---- header
+        def refresh_head(self):
+            version, when = definitions()
+            st = load_state()
+            last = st.get("last_scan")
+            lines = []
+            if when is None:
+                icon, head = "security-medium", "Virus definitions haven't been downloaded yet"
+                lines.append("They download automatically when the computer is online. Click Update definitions "
+                             "to try now.")
+            elif time.time() - when > 7 * 86400:
+                icon, head = "security-medium", "Virus definitions are out of date"
+                lines.append(f"Version {version or '?'}, from {us_date(when)}.")
+            else:
+                icon, head = "security-high", "Virus definitions are up to date"
+                lines.append(f"Version {version or '?'}, from {us_date(when)}.")
+            if last:
+                lines.append(f"Last scan: {st.get('kind', 'scan')} on {us_date(last, True)}, "
+                             f"{st.get('threats', 0)} threat{'s' if st.get('threats', 0) != 1 else ''} found.")
+            else:
+                lines.append("You haven't scanned this computer yet.")
+            self.shield.set_from_icon_name(icon, Gtk.IconSize.DIALOG)
+            self.headline.set_markup(f"<span size='large'><b>{GLib.markup_escape_text(head)}</b></span>\n"
+                                     + GLib.markup_escape_text("\n".join(lines)))
+
+        def update_definitions(self):
+            self.update_b.set_sensitive(False)
+            self.status.set_text("Checking for new virus definitions…")
+
+            def work():
+                try:
+                    r = subprocess.run(["pkexec", "systemctl", "restart", "clamav-freshclam.service"],
+                                       capture_output=True, text=True, timeout=120)
+                    ok = r.returncode == 0
+                except (OSError, subprocess.SubprocessError):
+                    ok = False
+                time.sleep(20 if ok else 0)          # give freshclam a moment
+                GLib.idle_add(self.updated, ok)
+            threading.Thread(target=work, daemon=True).start()
+
+        def updated(self, ok):
+            self.update_b.set_sensitive(True)
+            self.status.set_text("Checked for new definitions. They keep updating in the background."
+                                 if ok else "Couldn't start the update.")
+            self.refresh_head()
+            return False
+
+        # ---- scanning
+        def choose(self):
+            dlg = Gtk.FileChooserDialog(title="Choose a folder to scan", transient_for=self,
+                                        action=Gtk.FileChooserAction.SELECT_FOLDER)
+            dlg.add_buttons("_Cancel", Gtk.ResponseType.CANCEL, "_Select", Gtk.ResponseType.ACCEPT)
+            dlg.set_current_folder(HOME)
+            if dlg.run() == Gtk.ResponseType.ACCEPT:
+                self.custom = [dlg.get_filename()]
+                self.custom_label.set_text(self.custom[0])
+                self.r_custom.set_active(True)
+            dlg.destroy()
+
+        def start(self):
+            if self.running:
+                return
+            if self.r_custom.get_active():
+                if not self.custom:
+                    self.choose()
+                    if not self.custom:
+                        return
+                paths, kind = self.custom, "Custom scan"
+            elif self.r_full.get_active():
+                paths, kind = [HOME], "Full scan"
+            else:
+                paths, kind = quick_paths(), "Quick scan"
+            self.running = True
+            self.stop.clear()
+            self.found.clear()
+            self.show_found()
+            self.scan_b.set_sensitive(False)
+            self.cancel_b.set_sensitive(True)
+            self.progress.set_fraction(0)
+            self.progress.set_text("Loading the virus definitions…")
+            self.status.set_text("")
+            self.total = 0
+            started = time.time()
+
+            def progress(n, path):
+                GLib.idle_add(self.on_progress, n, path)
+
+            def found(path, threat):
+                GLib.idle_add(self.on_found, path, threat)
+
+            def work():
+                self.total = count_files(paths, self.stop)
+                n, err = scan(paths, progress, found, self.stop)
+                GLib.idle_add(self.finished, kind, n, err, time.time() - started)
+            threading.Thread(target=work, daemon=True).start()
+
+        def on_progress(self, n, path):
+            if self.total:
+                self.progress.set_fraction(min(1.0, n / self.total))
+            self.progress.set_text(f"{n:,} of {self.total:,} files scanned" if self.total else f"{n:,} files scanned")
+            self.current.set_text(path)
+            return False
+
+        def on_found(self, path, threat):
+            self.found.append([True, path, threat])
+            self.show_found()
+            return False
+
+        def show_found(self):
+            n = len(self.found)
+            self.found_label.set_markup(f"<b>{n} threat{'s' if n != 1 else ''} found</b>" if n else "")
+            self.found_sw.set_visible(n > 0)
+            for b in self.actions:
+                b.set_visible(n > 0)
+
+        def finished(self, kind, n, err, secs):
+            self.running = False
+            self.scan_b.set_sensitive(True)
+            self.cancel_b.set_sensitive(False)
+            self.current.set_text("")
+            mins, s = divmod(int(secs), 60)
+            took = f"{mins} min {s} s" if mins else f"{s} s"
+            threats = len(self.found)
+            if err:
+                self.progress.set_text("The scan didn't run")
+                self.status.set_text(err)
+            elif self.stop.is_set():
+                self.progress.set_text(f"Cancelled after {n:,} files")
+            else:
+                self.progress.set_fraction(1)
+                self.progress.set_text(f"{kind} finished: {n:,} file{'' if n == 1 else 's'} in {took}")
+                self.status.set_text("No threats found." if not threats else
+                                     "Choose what to do with what was found: Quarantine is safest.")
+                save_state(last_scan=time.time(), kind=kind, files=n, threats=threats)
+            if threats:
+                subprocess.Popen(["notify-send", "-a", "Virus Scan", "-i", "security-low", "-u", "critical",
+                                  f"{threats} threat{'s' if threats != 1 else ''} found",
+                                  "Open Virus Scan to quarantine or delete them."],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.refresh_head()
+            return False
+
+        # ---- what to do with threats
+        def ticked(self):
+            return [(r.path, r[1], r[2]) for r in self.found if r[0]]
+
+        def do_quarantine(self):
+            self.act(lambda p, t: quarantine(p, t), "Moved {n} to Quarantine.")
+
+        def do_delete(self):
+            dlg = Gtk.MessageDialog(transient_for=self, modal=True, message_type=Gtk.MessageType.WARNING,
+                                    buttons=Gtk.ButtonsType.OK_CANCEL,
+                                    text="Delete the ticked files permanently?")
+            ok = dlg.run() == Gtk.ResponseType.OK
+            dlg.destroy()
+            if ok:
+                self.act(lambda p, _t: os.unlink(p), "Deleted {n}.")
+
+        def do_allow(self):
+            self.act(lambda _p, _t: None, "Left {n} where they are.")
+
+        def act(self, fn, msg):
+            done, errors = 0, []
+            for path, file, threat in reversed(self.ticked()):
+                try:
+                    fn(file, threat)
+                    del self.found[path]
+                    done += 1
+                except OSError as err:
+                    errors.append(f"{os.path.basename(file)}: {err.strerror}")
+            self.status.set_text(msg.format(n=f"{done} file{'s' if done != 1 else ''}")
+                                 + (" Couldn't: " + "; ".join(errors) if errors else ""))
+            self.show_found()
+            self.refresh_quarantine()
+
+        def refresh_quarantine(self):
+            self.qstore.clear()
+            for q in quarantined():
+                self.qstore.append([q["id"], q.get("path", ""), q.get("threat", ""), us_date(q.get("time", 0), True)])
+
+        def q_selected(self):
+            model, it = self.qview.get_selection().get_selected()
+            return model[it][0] if it else None
+
+        def q_restore(self):
+            qid = self.q_selected()
+            if not qid:
+                return
+            dlg = Gtk.MessageDialog(transient_for=self, modal=True, message_type=Gtk.MessageType.WARNING,
+                                    buttons=Gtk.ButtonsType.OK_CANCEL,
+                                    text="Restore this file?")
+            dlg.format_secondary_text("ClamAV thinks it's harmful. Only restore it if you're sure it's safe.")
+            ok = dlg.run() == Gtk.ResponseType.OK
+            dlg.destroy()
+            if ok:
+                try:
+                    self.status.set_text(f"Restored to {restore(qid)}.")
+                except (OSError, ValueError) as err:
+                    self.status.set_text(f"Couldn't restore it: {err}")
+                self.refresh_quarantine()
+
+        def q_delete(self):
+            qid = self.q_selected()
+            if qid:
+                forget(qid)
+                self.status.set_text("Deleted it from Quarantine.")
+                self.refresh_quarantine()
+
+    class App(Gtk.Application):
+        def __init__(self):
+            super().__init__(application_id="org.firox.VirusScan", flags=Gio.ApplicationFlags.FLAGS_NONE)
+            self.win = None
+
+        def do_activate(self):
+            if self.win is None:
+                self.win = Window(self)
+            self.win.present()
+
+    return App().run([sys.argv[0]])
+
+
+def main():
+    args = sys.argv[1:]
+    if args[:1] == ["status"]:
+        version, when = definitions()
+        st = load_state()
+        print(f"definitions: {version or '?'} from {us_date(when) if when else 'never'}")
+        print(f"last scan: {st.get('kind', '')} {us_date(st['last_scan'], True) if st.get('last_scan') else 'never'}"
+              f"{', %d threats' % st.get('threats', 0) if st.get('last_scan') else ''}")
+        print(f"quarantined: {len(quarantined())}")
+        return 0
+    if args[:1] == ["definitions"]:
+        version, when = definitions()
+        print(json.dumps({"version": version, "time": when}))
+        return 0
+    if args[:1] in (["-h"], ["--help"]):
+        print(__doc__.strip())
+        return 0
+    paths = [os.path.abspath(a) for a in args if os.path.exists(a)]
+    return gui(paths)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

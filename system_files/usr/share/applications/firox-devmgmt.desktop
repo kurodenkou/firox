@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Device Manager
+Comment=See every device in the computer, the driver each one uses, and any without a driver
+Exec=firox-devmgmt
+Icon=gnome-device-manager
+Categories=System;Monitor;HardwareSettings;
+Keywords=devmgmt;devices;drivers;hardware;pci;usb;missing driver;
+StartupNotify=true

@@ -90,6 +90,10 @@ firox-backup watch >/dev/null 2>&1 &
 # Sync between Firox computers, if it's on (firox-sync)
 firox-sync daemon >/dev/null 2>&1 &
 
+# Night Light: warmer colours in the evening (firox-nightlight; Settings >
+# Night Light, or the moon on the taskbar)
+firox-nightlight daemon >/dev/null 2>&1 &
+
 # Desktop Gadgets (the Sidebar; off in Settings > Taskbar or `firox-gadgets off`)
 firox-gadgets start >/dev/null 2>&1 &
 

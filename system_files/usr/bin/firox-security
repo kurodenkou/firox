@@ -7,6 +7,8 @@ protections are on, with a button to fix each one that isn't.
     firox-security status     print each check's state
     firox-security login      at login: a notification if something
                               important is off (once per problem)
+    firox-security tray       check, and update the taskbar's shield
+                              (~/.local/state/firox/security-status.json)
 
 Checks:
   Firewall            firewalld is running
@@ -20,6 +22,8 @@ Checks:
                       Firox is installed
   Secure Boot         the firmware only starts signed software
   SELinux             enforcing
+  Virus protection    ClamAV's definitions are under a week old (and their
+                      updates are on); Scan now opens Virus Scan
 
 Turning things on asks for your password (pkexec).
 """
@@ -27,6 +31,7 @@ Turning things on asks for your password (pkexec).
 import glob
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -35,6 +40,7 @@ CONFIG = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~
 STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "firox")
 NOTIFIED = os.path.join(STATE_DIR, "security-notified")
 CONF = os.path.join(CONFIG, "security.conf")             # IGNORE=key,key: "Don't warn me"
+STATUS = os.path.join(STATE_DIR, "security-status.json")  # for the taskbar's shield
 UPDATE_TIMERS = ("uupd.timer", "rpm-ostreed-automatic.timer")
 OLD_DAYS = 30
 BACKUP_DAYS = 7
@@ -302,7 +308,44 @@ def c_selinux():
     return check("selinux", title, icon, INFO, "Unknown", "Couldn't read the SELinux mode.")
 
 
-CHECKS = [c_firewall, c_updates, c_backup, c_lock, c_remote, c_encryption, c_secureboot, c_selinux]
+def c_virus():
+    title, icon = "Virus protection", "security-high"
+    scan = [("Scan now…", ["firox-virusscan"])]
+    if not shutil.which("clamscan"):
+        return check("virus", title, icon, INFO, "Not installed",
+                     "ClamAV isn't installed, so Virus Scan can't check your files.")
+    raw = run(["firox-virusscan", "definitions"], 10) or "{}"
+    try:
+        defs = json.loads(raw)
+    except ValueError:
+        defs = {}
+    when = defs.get("time")
+    try:
+        with open(os.path.join(STATE_DIR, "virusscan.json")) as fh:
+            last = json.load(fh).get("last_scan")
+    except (OSError, ValueError):
+        last = None
+    scanned = f" Last scan: {ago(last)}." if last else " You haven't run a scan yet."
+    service = run(["systemctl", "is-enabled", "clamav-freshclam.service"]) or ""
+    if service not in ("enabled", "static", "alias", "") and service != "not-found":
+        return check("virus", title, icon, WARN, "Updates off",
+                     "Virus definitions aren't being updated, so new threats won't be recognized." + scanned,
+                     [("Turn on", ["pkexec", "systemctl", "enable", "--now", "clamav-freshclam.service"])] + scan)
+    if not when:
+        return check("virus", title, icon, WARN, "No definitions",
+                     "The virus definitions haven't been downloaded yet. They download by themselves when the "
+                     "computer is online." + scanned,
+                     [("Download now", ["pkexec", "systemctl", "restart", "clamav-freshclam.service"])] + scan)
+    if time.time() - when > 7 * 86400:
+        return check("virus", title, icon, WARN, "Out of date",
+                     f"The virus definitions are from {us_date(when)}, {ago(when)}." + scanned,
+                     [("Update now", ["pkexec", "systemctl", "restart", "clamav-freshclam.service"])] + scan)
+    return check("virus", title, icon, OK, "On",
+                 f"ClamAV's virus definitions are up to date ({us_date(when)}). Scan your files with Virus Scan, "
+                 "or right-click them in Firox Explorer." + scanned, scan)
+
+
+CHECKS = [c_firewall, c_updates, c_virus, c_backup, c_lock, c_remote, c_encryption, c_secureboot, c_selinux]
 
 
 def ignored():
@@ -350,7 +393,25 @@ def overall(results):
     return OK, "security-high", "Your computer is protected", "Everything important is on."
 
 
+def save_status(results):
+    """What the taskbar's shield shows."""
+    state, _icon, head, _sub = overall(results)
+    items = [f"{r['title']}: {r['status'].lower()}" for r in results if r["state"] in (BAD, WARN)]
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = STATUS + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump({"state": state, "headline": head, "items": items, "time": int(time.time())}, fh)
+    os.replace(tmp, STATUS)
+    return state, items
+
+
 # --------------------------------------------------------------- commands --
+
+def cmd_tray():
+    state, items = save_status(all_checks())
+    print(json.dumps({"state": state, "items": items}))
+    return 0
+
 
 def cmd_status():
     results = all_checks()
@@ -362,6 +423,7 @@ def cmd_status():
 def cmd_login():
     """Notify about red items, once for each new set of problems."""
     results = all_checks()
+    save_status(results)
     bad = [r for r in results if r["state"] == BAD]
     key = ",".join(f"{r['key']}:{r['status']}" for r in bad)
     if key == read(NOTIFIED):
@@ -467,6 +529,10 @@ def gui():
                              daemon=True).start()
 
         def show_results(self, results):
+            try:
+                save_status(results)
+            except OSError:
+                pass
             state, icon, head, sub = overall(results)
             ctx = self.banner.get_style_context()
             for s in (OK, WARN, BAD):
@@ -541,6 +607,8 @@ def main():
         return cmd_status()
     if cmd == "login":
         return cmd_login()
+    if cmd == "tray":
+        return cmd_tray()
     if cmd in ("-h", "--help"):
         print(__doc__.strip())
         return 0

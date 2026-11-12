@@ -2386,6 +2386,11 @@ class Explorer(Gtk.ApplicationWindow):
                 menu.append(Gtk.SeparatorMenuItem())
                 self.menu_item(menu, "Rena_me", self.rename if one is not None else None)
                 self.menu_item(menu, "Move to Recycle _Bin", self.trash)
+                local = [local_path(Gio.File.new_for_uri(r[C_URI])) for r in rows]
+                if all(local) and GLib.find_program_in_path("firox-virusscan") and \
+                        GLib.find_program_in_path("clamscan"):
+                    menu.append(Gtk.SeparatorMenuItem())
+                    self.menu_item(menu, "Scan for _Viruses", lambda: spawn(["firox-virusscan"] + local))
             menu.append(Gtk.SeparatorMenuItem())
             self.menu_item(menu, "P_roperties", self.properties if one is not None else None)
         else:
