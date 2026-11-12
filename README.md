@@ -9,7 +9,7 @@ A desktop Linux built on [Universal Blue](https://universal-blue.org/) (Fedora A
 - **Android apps** with [Waydroid](https://waydro.id/).
 - **Updates that can't break your computer:** each update is a complete new version of the system, switched to when you restart, and System Restore takes you back if one misbehaves.
 
-Themes, icons, wallpapers and the Start menu are original work; no Microsoft assets are used. Firox Linux was called FirefoxOS in its first versions.
+Themes, icons, wallpapers and the Start menu are original work; no Microsoft assets are used. It was briefly called FirefoxOS, until it was determined that the name was already used, and was quickly renamed Firox Linux.
 
 ![Firox Linux desktop with the Start menu open](docs/screenshots/start-menu.png)
 
