@@ -1647,6 +1647,12 @@ class Explorer(Gtk.ApplicationWindow):
 
     def open_file(self, gfile, name):
         path = local_path(gfile)
+        ct = Gio.content_type_guess(path, None)[0] if path else ""
+        if path and (Gio.content_type_is_a(ct, "application/x-msdownload") or ct == "application/x-msi"):
+            # Windows programs: Proton-GE (firox-windows), whether or not
+            # they're marked runnable; it asks before running a download
+            spawn(["firox-windows", path], cwd=os.path.dirname(path))
+            return
         if path and (path.lower().endswith(".appimage") or (
                 os.access(path, os.X_OK) and Gio.content_type_can_be_executable(
                     Gio.content_type_guess(path, None)[0]) and not path.endswith((".sh", ".py")))):

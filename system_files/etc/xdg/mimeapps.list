@@ -2,3 +2,8 @@
 # Default Programs, go in ~/.config/mimeapps.list and win over these).
 [Default Applications]
 inode/directory=firox-explorer.desktop
+application/x-msdownload=firox-windows.desktop
+application/x-ms-dos-executable=firox-windows.desktop
+application/vnd.microsoft.portable-executable=firox-windows.desktop
+application/x-msi=firox-windows.desktop
+application/x-bat=firox-windows.desktop

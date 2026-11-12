@@ -1,0 +1,5 @@
+#!/usr/bin/sh
+# umu-launcher (installed from source by build_files/build.sh into
+# /usr/lib/umu-launcher): runs Windows programs with Proton outside Steam.
+# Firox uses it through firox-windows.
+PYTHONPATH="/usr/lib/umu-launcher${PYTHONPATH:+:$PYTHONPATH}" exec /usr/bin/python3 -m umu "$@"
