@@ -169,9 +169,12 @@ def describe(entry):
     level = LEVEL_OF.get(int(field(entry, "PRIORITY") or 6), ("Information", ""))[0]
     rows = [("Level", level), ("Date and time", us_time(int(field(entry, "__REALTIME_TIMESTAMP") or 0))),
             ("Source", source(entry))]
+    about = field(entry, "UNIT") or field(entry, "USER_UNIT")
+    if about:
+        rows.append(("About", about))          # systemd's messages about a service
     unit = field(entry, "_SYSTEMD_UNIT") or field(entry, "_SYSTEMD_USER_UNIT")
-    if unit:
-        rows.append(("Service", unit))
+    if unit and unit != about:
+        rows.append(("Logged by" if about else "Service", unit))
     pid, exe = field(entry, "_PID"), field(entry, "_EXE")
     if pid or exe:
         rows.append(("Process", f"{pid} ({exe})" if pid and exe else pid or exe))
@@ -201,6 +204,7 @@ class Viewer(Gtk.ApplicationWindow):
         self.loading = 0            # generation, so stale results are dropped
         self.only = ""              # show just this source (from the Summary)
         self.only_ident = ""        # ... and its SYSLOG_IDENTIFIER as logged
+        self.only_unit = ""         # ... or a service: journalctl -u / --user-unit
         self.level_before = None    # the Show choice before Security changed it
 
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
@@ -233,6 +237,9 @@ class Viewer(Gtk.ApplicationWindow):
         self.search.connect("search-changed", self.on_search_changed)
         bar.pack_start(self.search, False, False, 0)
         self.only_button = Gtk.Button()
+        self.only_label = Gtk.Label(ellipsize=Pango.EllipsizeMode.MIDDLE, width_chars=20, max_width_chars=26)
+        self.only_label.show()
+        self.only_button.add(self.only_label)
         self.only_button.set_tooltip_text("Show events from every source")
         self.only_button.set_no_show_all(True)
         self.only_button.connect("clicked", lambda _b: self.set_source("") or self.reload())
@@ -330,6 +337,12 @@ class Viewer(Gtk.ApplicationWindow):
         self.extra.set_no_show_all(True)
         self.extra.connect("clicked", lambda _b: self.crash_report())
         drow.pack_start(self.extra, False, False, 0)
+        self.unit_b = Gtk.Button()
+        self.unit_b.set_no_show_all(True)
+        self.unit_b.set_tooltip_text("Everything this service logged, including the messages that explain "
+                                     "an error")
+        self.unit_b.connect("clicked", lambda _b: self.show_unit())
+        drow.pack_end(self.unit_b, False, False, 0)
         details.pack_start(drow, False, False, 0)
         vp.pack2(details, False, False)
         vp.set_position(400)
@@ -368,9 +381,10 @@ class Viewer(Gtk.ApplicationWindow):
         self.note.set_visible(bool(text))
         self.note_text.set_visible(bool(text))
 
-    def set_source(self, src, ident=""):
-        self.only, self.only_ident = src, ident
-        self.only_button.set_label(f"Only {src}  ✕")
+    def set_source(self, src, ident="", unit=""):
+        self.only, self.only_ident, self.only_unit = src, ident, unit
+        self.only_label.set_text(f"Only {src}  ✕")
+        self.only_button.set_tooltip_text(f"Showing only {src}. Click to show events from every source.")
         self.only_button.set_visible(bool(src))
 
     def load_boots(self):
@@ -453,12 +467,16 @@ class Viewer(Gtk.ApplicationWindow):
         self.entries = []
         self.status.set_text("Loading…")
         threading.Thread(target=self.load_events, args=(gen, log, self.journal_args(), self.only,
-                                                        self.only_ident),
+                                                        self.only_ident, self.only_unit),
                          daemon=True).start()
 
-    def load_events(self, gen, log, args, only="", ident=""):
+    def load_events(self, gen, log, args, only="", ident="", unit=""):
         note = ""
-        if ident and log in ("system", "apps"):
+        if unit and log in ("system", "apps"):
+            # the service's own messages and systemd's about it
+            args = args + (["--user-unit", unit] if log == "apps" else ["-u", unit])
+            only = ""
+        elif ident and log in ("system", "apps"):
             args = args + [f"SYSLOG_IDENTIFIER={ident}"]
         if log == "system":
             entries, note = journal(args)
@@ -640,6 +658,37 @@ class Viewer(Gtk.ApplicationWindow):
             text += "\n\n" + all_fields(e)
         buf.set_text(text)
         self.extra.set_visible(bool(e.get("_firox_crash")))
+        unit, _user = self.unit_of(e)
+        self.unit_b.set_label(f"Show events from {unit}")
+        self.unit_b.set_visible(bool(unit) and unit != self.only_unit)
+
+    @staticmethod
+    def unit_of(e):
+        """(the service an event is about, whether it's a user service)"""
+        for key, user in (("UNIT", False), ("USER_UNIT", True), ("_SYSTEMD_USER_UNIT", True),
+                          ("_SYSTEMD_UNIT", False)):
+            u = field(e, key)
+            if u and u != "init.scope" and not u.startswith(("session-", "user@")):
+                return u, user
+        return "", False
+
+    def show_unit(self):
+        e = self.selected()
+        if e is None:
+            return
+        unit, user = self.unit_of(e)
+        if not unit:
+            return
+        self.search.set_text("")
+        self.level.handler_block_by_func(self.reload_from_combo)
+        self.level.set_active(len(SHOW) - 1)     # everything: the reason is often logged as information
+        self.level.handler_unblock_by_func(self.reload_from_combo)
+        self.set_source(unit, unit=unit)
+        target = "apps" if user else "system"
+        if self.current_log() == target:
+            self.reload()
+        else:
+            self.select_log(target)
 
     def on_activated(self, _v, _path, _col):
         e = self.selected()
