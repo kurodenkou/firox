@@ -8,7 +8,10 @@ firox-lock: the Firox Linux lock screen ("This computer is locked").
 
 It looks like the login screen (the theme's welcome.css), with your account
 picture, the time and date, and a password box on every monitor; your
-wallpaper is behind it. Turn off computer offers Sleep, Turn Off and
+wallpaper is behind it, lightly blurred and dimmed so a busy picture doesn't
+get in the way of the text. ~/.config/firox/lock.conf: `blur = light`
+(the default), `strong` or `none`. The blurred copy is kept in
+~/.cache/firox/ until the wallpaper changes. Turn off computer offers Sleep, Turn Off and
 Restart. The password is checked with PAM (/etc/pam.d/firox-lock).
 
 Locking uses the Wayland ext-session-lock protocol (gtk-session-lock): if
@@ -16,6 +19,8 @@ the lock screen ever crashed, the screen would stay locked, not open. Exits
 with 2 if the compositor can't lock this way (firox-open then uses swaylock).
 """
 
+import configparser
+import hashlib
 import os
 import pwd
 import subprocess
@@ -28,10 +33,83 @@ DEFAULT_FACE = "/usr/share/firox/icons/user-default.svg"
 PAM_SERVICE = "firox-lock"
 CONFIG = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "firox")
 
+CACHE = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "firox")
+# blur radius as a share of the screen's longer side, and how much to dim
+BLUR = {"light": (1 / 160, 0.18), "strong": (1 / 60, 0.28), "none": (0, 0.0)}
+
+
+def blur_setting():
+    p = configparser.ConfigParser(interpolation=None)
+    try:
+        p.read(os.path.join(CONFIG, "lock.conf"))
+        v = p.get("Lock", "blur", fallback="light").strip().lower()
+    except configparser.Error:
+        v = "light"
+    return v if v in BLUR else "light"
+
+
+def blurred_wallpaper(path, width, height, level):
+    """A blurred copy of the wallpaper, cropped to fill width x height (like
+    background-size: cover), cached until the wallpaper changes. None if it
+    can't be made (the plain wallpaper is used then)."""
+    radius_share, _dim = BLUR[level]
+    if radius_share <= 0:
+        return None
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    key = hashlib.sha1(f"{path}|{st.st_mtime_ns}|{st.st_size}|{width}x{height}|{level}|1".encode()).hexdigest()[:16]
+    out = os.path.join(CACHE, f"lock-wallpaper-{key}.jpg")
+    if os.path.exists(out):
+        return out
+    os.makedirs(CACHE, exist_ok=True)
+    radius = max(width, height) * radius_share
+    tmp = out + ".tmp"
+    try:
+        from PIL import Image, ImageFilter, ImageOps
+        with Image.open(path) as img:
+            img = ImageOps.exif_transpose(img).convert("RGB")
+            img = ImageOps.fit(img, (width, height), Image.Resampling.LANCZOS)
+            img = img.filter(ImageFilter.GaussianBlur(radius))
+            img.save(tmp, "JPEG", quality=90)
+    except ImportError:
+        # No Pillow: shrink and enlarge again, which blurs too
+        from gi.repository import GdkPixbuf
+        try:
+            pix = GdkPixbuf.Pixbuf.new_from_file(path)
+            pw, ph = pix.get_width(), pix.get_height()
+            k = max(width / pw, height / ph)
+            sw, sh = max(1, round(pw * k)), max(1, round(ph * k))
+            pix = pix.scale_simple(sw, sh, GdkPixbuf.InterpType.BILINEAR).new_subpixbuf(
+                (sw - width) // 2, (sh - height) // 2, width, height)
+            f = max(2, round(radius / 1.5))
+            small = pix.scale_simple(max(1, width // f), max(1, height // f), GdkPixbuf.InterpType.BILINEAR)
+            mid = small.scale_simple(max(1, width // 4), max(1, height // 4), GdkPixbuf.InterpType.BILINEAR)
+            mid.scale_simple(width, height, GdkPixbuf.InterpType.BILINEAR).savev(tmp, "jpeg", ["quality"], ["90"])
+        except Exception as err:            # noqa: BLE001 - a bad picture mustn't stop the lock
+            print(f"firox-lock: couldn't blur the wallpaper: {err}", file=sys.stderr)
+            return None
+    except Exception as err:                # noqa: BLE001
+        print(f"firox-lock: couldn't blur the wallpaper: {err}", file=sys.stderr)
+        return None
+    os.replace(tmp, out)
+    # drop copies made for older wallpapers
+    for old in os.listdir(CACHE):
+        if old.startswith("lock-wallpaper-") and old != os.path.basename(out):
+            try:
+                os.remove(os.path.join(CACHE, old))
+            except OSError:
+                pass
+    return out
+
+
 EXTRA_CSS = b"""
 #logo.clock { font-size: 64px; }
 #hint.date { font-size: 18px; }
 #hint.locked { font-size: 14px; opacity: 0.85; }
+/* a soft shadow keeps the text readable over a bright wallpaper */
+#logo.clock, #hint.date, #hint.locked { text-shadow: 0 1px 4px rgba(0, 0, 0, 0.6); }
 .tile .caps { color: #ffd479; font-size: 12px; }
 """
 
@@ -134,8 +212,18 @@ def run(notify_fd):
     data = EXTRA_CSS
     wallpaper = firox_wallpaper.read().get("Wallpaper", "") if firox_wallpaper else ""
     if wallpaper and os.path.isfile(wallpaper):
-        uri = GLib.filename_to_uri(wallpaper, None).replace('"', "%22")
-        data += f'#middle {{ background-image: url("{uri}"); background-size: cover; }}\n'.encode()
+        # blurred for the biggest screen (the others scale it down: cover)
+        display = Gdk.Display.get_default()
+        mons = [display.get_monitor(i) for i in range(display.get_n_monitors())]
+        width = max([m.get_geometry().width * m.get_scale_factor() for m in mons] or [1920])
+        height = max([m.get_geometry().height * m.get_scale_factor() for m in mons] or [1080])
+        level = blur_setting()
+        picture_file = blurred_wallpaper(wallpaper, width, height, level) or wallpaper
+        uri = GLib.filename_to_uri(picture_file, None).replace('"', "%22")
+        dim = BLUR[level][1]
+        layers = (f"linear-gradient(rgba(0,0,0,{dim}), rgba(0,0,0,{dim})), " if dim else "") + f'url("{uri}")'
+        data += f'#middle {{ background-image: {layers}; background-size: cover; '\
+                f'background-position: center; }}\n'.encode()
     extra.load_from_data(data)
     Gtk.StyleContext.add_provider_for_screen(screen, extra, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 1)
 

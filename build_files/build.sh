@@ -96,7 +96,6 @@ PACKAGES=(
     xdg-utils
 
     # --- Accessories & Control Panel applets ---
-    foot                         # helper windows; screen saver fallback
     xdg-terminal-exec            # lets apps like btop/nvtop open in the Command Prompt
     mousepad                     # Notepad
     galculator                   # Calculator
@@ -107,6 +106,7 @@ PACKAGES=(
     mangohud                     # Firox Gaming HUD (firox-hud): the in-game overlay
     mangohud.i686                # ... for 32-bit games too
     vulkan-tools                 # vulkaninfo (System Information), vkcube (Gaming HUD > Try It)
+    python3-pillow               # the lock screen's blurred wallpaper
     dmidecode                    # System Information: memory modules (asks for your password)
     vlc                          # Media Player (music, videos, DVDs)
     vlc-plugin-ffmpeg            # VLC's codecs (weak deps are off; uses the base's full ffmpeg)

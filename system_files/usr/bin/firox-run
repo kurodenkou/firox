@@ -51,10 +51,10 @@ TERMINAL = ["firox-terminal"]
 
 # Names people type out of habit -> what opens (first one that's installed)
 ALIASES = {
-    "cmd": [["firox-terminal"], ["foot"]],
-    "command": [["firox-terminal"], ["foot"]],
-    "powershell": [["firox-terminal"], ["foot"]],
-    "terminal": [["firox-terminal"], ["foot"]],
+    "cmd": [["firox-terminal"]],
+    "command": [["firox-terminal"]],
+    "powershell": [["firox-terminal"]],
+    "terminal": [["firox-terminal"]],
     "ssh": [["firox-terminal", "--connect"]],
     "notepad": [["mousepad"]],
     "wordpad": [["mousepad"]],

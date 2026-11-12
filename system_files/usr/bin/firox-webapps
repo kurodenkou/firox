@@ -45,7 +45,7 @@ class WebApps(Gtk.ApplicationWindow):
             wrap=True, xalign=0))
         self.infobar.add_button("Install now", 1)
         self.infobar.connect("response", lambda *_: spawn(
-            ["foot", "-T", "Web App Runtime", "--", "sh", "-c",
+            ["firox-terminal", "-T", "Web App Runtime", "-x", "sh", "-c",
              "firefoxpwa runtime install; echo; read -rp 'Press Enter to close' _"]))
         outer.pack_start(self.infobar, False, False, 0)
 
@@ -135,7 +135,7 @@ class WebApps(Gtk.ApplicationWindow):
 
     def remove(self, site_id):
         # Run in a terminal so the user can answer firefoxpwa's confirmation prompts.
-        spawn(["foot", "-T", "Remove Web App", "--", "sh", "-c",
+        spawn(["firox-terminal", "-T", "Remove Web App", "-x", "sh", "-c",
                f"firefoxpwa site uninstall {GLib.shell_quote(site_id)}; echo; read -rp 'Press Enter to close' _"])
 
 

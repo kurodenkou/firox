@@ -194,7 +194,7 @@ install-explorer:
 reset-desktop:
     #!/usr/bin/bash
     set -euo pipefail
-    for d in labwc waybar mako foot fuzzel pcmanfm-qt/firox; do
+    for d in labwc waybar mako fuzzel pcmanfm-qt/firox; do
         if [ -e ~/.config/$d ]; then
             mv ~/.config/$d ~/.config/$d.bak-$(date +%s)
             echo "Backed up ~/.config/$d"
