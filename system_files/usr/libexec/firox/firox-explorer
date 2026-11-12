@@ -192,6 +192,12 @@ SETTINGS_DEFAULT = {"view": "icons", "sort": "name", "descending": "false", "fol
                     "hidden": "false", "toolbar": "true", "sidebar": "true", "statusbar": "true",
                     "thumbnails": "true"}
 MNEMONICS = {getattr(Gdk, "KEY_" + c) for c in "fevgbth"}     # File Edit View Go Bookmarks Tools Help
+def us_date(stamp):
+    """11/12/2026 3:07 PM, the way Windows shows dates in the US."""
+    t = time.localtime(stamp)
+    return f"{t.tm_mon}/{t.tm_mday}/{t.tm_year} {(t.tm_hour % 12) or 12}:{t.tm_min:02d} {'AM' if t.tm_hour < 12 else 'PM'}"
+
+
 SORTS = [("name", "_Name"), ("size", "_Size"), ("type", "_Type"), ("mtime", "_Date modified")]
 
 
@@ -1306,7 +1312,7 @@ class Explorer(Gtk.ApplicationWindow):
         self.store.append([name, ICONS.get(gicon, ICON_SIZE_BIG, thumb), uri, is_dir, size, mtime,
                            "Folder" if is_dir else (Gio.content_type_get_description(ct) or "File"),
                            "" if is_dir else human_size(size),
-                           time.strftime("%d/%m/%Y %H:%M", time.localtime(mtime)) if mtime else "",
+                           us_date(mtime) if mtime else "",
                            hidden, ICONS.get(gicon, ICON_SIZE_SMALL), orig, mountable, where])
 
     def loaded(self):
