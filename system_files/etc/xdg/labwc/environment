@@ -6,5 +6,8 @@ XCURSOR_SIZE=24
 QT_QPA_PLATFORM=wayland;xcb
 QT_QPA_PLATFORMTHEME=lxqt
 MOZ_ENABLE_WAYLAND=1
+# Proton (GE-Proton, and Valve's newer builds) draws games with Wine's native
+# Wayland driver instead of XWayland. Per game: PROTON_ENABLE_WAYLAND=0 to undo.
+PROTON_ENABLE_WAYLAND=1
 GTK_IM_MODULE=simple
 _JAVA_AWT_WM_NONREPARENTING=1
