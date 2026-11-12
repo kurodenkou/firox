@@ -1,0 +1,553 @@
+#!/usr/bin/python3
+"""
+firox-cleanmgr: Disk Cleanup. Free up disk space by deleting files you don't
+need: tick what to remove, see how much space each frees, click Clean up.
+
+    firox-cleanmgr                open Disk Cleanup
+    firox-cleanmgr list           print what could be freed
+    firox-cleanmgr --system KEYS  (run through pkexec by Disk Cleanup) clean
+                                  the system items in KEYS, comma-separated
+
+Your files:
+  Recycle Bin            ~/.local/share/Trash
+  Thumbnails             ~/.cache/thumbnails (made again when needed)
+  Web browser cache      Firefox's cache (installed and Flatpak)
+  Temporary files        your files in /tmp and /var/tmp older than a week
+  Other program caches   the rest of ~/.cache and Flatpak apps' caches
+  Downloads              everything in your Downloads folder (off unless
+                         you tick it)
+System (asks for your password):
+  Unused app runtimes    Flatpak runtimes no installed app needs
+                         (flatpak uninstall --unused)
+  System logs            journal entries older than two weeks
+                         (journalctl --vacuum-time=2weeks)
+  Crash reports          /var/lib/systemd/coredump
+  Update cache           rpm-ostree's cached update data (cleanup -m)
+  Previous version       the version System Restore goes back to
+                         (rpm-ostree cleanup -r; off unless you tick it)
+"""
+
+import glob
+import os
+import shutil
+import subprocess
+import sys
+import threading
+import time
+
+HOME = os.path.expanduser("~")
+CACHE = os.environ.get("XDG_CACHE_HOME") or os.path.join(HOME, ".cache")
+DATA = os.environ.get("XDG_DATA_HOME") or os.path.join(HOME, ".local", "share")
+TRASH = os.path.join(DATA, "Trash")
+WEEK = 7 * 86400
+COREDUMPS = "/var/lib/systemd/coredump"
+
+
+def run(argv, timeout=120, input_text=None):
+    try:
+        return subprocess.run(argv, capture_output=True, text=True, timeout=timeout, input=input_text)
+    except (OSError, subprocess.SubprocessError) as err:
+        return subprocess.CompletedProcess(argv, 1, "", str(err))
+
+
+def du(path, older_than=0, owner=None, skip=()):
+    """Bytes used under path (not following links, one file system)."""
+    total = 0
+    now = time.time()
+    try:
+        dev = os.lstat(path).st_dev
+    except OSError:
+        return 0
+    for root, dirs, files in os.walk(path, onerror=lambda _e: None):
+        dirs[:] = [d for d in dirs if os.path.join(root, d) not in skip]
+        for name in files + [d for d in dirs if os.path.islink(os.path.join(root, d))]:
+            try:
+                st = os.lstat(os.path.join(root, name))
+            except OSError:
+                continue
+            if st.st_dev != dev:
+                continue
+            if owner is not None and st.st_uid != owner:
+                continue
+            if older_than and now - max(st.st_mtime, st.st_atime) < older_than:
+                continue
+            total += st.st_blocks * 512
+        dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(root, d))]
+    return total
+
+
+def remove_contents(path, older_than=0, owner=None, skip=()):
+    """Delete what's inside path; returns bytes freed (best effort)."""
+    freed = 0
+    now = time.time()
+    try:
+        entries = os.listdir(path)
+    except OSError:
+        return 0
+    for name in entries:
+        p = os.path.join(path, name)
+        if p in skip:
+            continue
+        try:
+            st = os.lstat(p)
+        except OSError:
+            continue
+        if owner is not None and st.st_uid != owner:
+            continue
+        if os.path.isdir(p) and not os.path.islink(p):
+            if older_than:
+                freed += remove_contents(p, older_than, owner, skip)
+                try:
+                    os.rmdir(p)
+                except OSError:
+                    pass
+                continue
+            size = du(p)
+            shutil.rmtree(p, ignore_errors=True)
+            freed += size - (du(p) if os.path.exists(p) else 0)
+        else:
+            if older_than and now - max(st.st_mtime, st.st_atime) < older_than:
+                continue
+            try:
+                os.unlink(p)
+                freed += st.st_blocks * 512
+            except OSError:
+                pass
+    return freed
+
+
+def human(n):
+    if n is None:
+        return "—"
+    for unit in ("bytes", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:.0f} {unit}" if unit in ("bytes", "KB") else f"{n:.1f} {unit}"
+        n /= 1024
+
+
+def parse_size(s):
+    """'1.2 GB' -> bytes (flatpak's sizes)"""
+    try:
+        num, unit = s.replace(" ", " ").split()
+        mult = {"bytes": 1, "B": 1, "kB": 1e3, "KB": 1e3, "MB": 1e6, "GB": 1e9, "TB": 1e12}.get(unit, 1)
+        return int(float(num.replace(",", ".")) * mult)
+    except ValueError:
+        return 0
+
+
+# ------------------------------------------------------------------ items --
+
+def firefox_caches():
+    return (glob.glob(os.path.join(CACHE, "mozilla", "firefox", "*", "cache2"))
+            + glob.glob(os.path.join(HOME, ".var", "app", "org.mozilla.firefox", "cache", "mozilla", "firefox",
+                                     "*", "cache2")))
+
+
+def flatpak_app_caches():
+    return glob.glob(os.path.join(HOME, ".var", "app", "*", "cache"))
+
+
+def unused_runtimes():
+    """[(ref, installation, bytes)] of Flatpak runtimes nothing uses."""
+    import re
+    if not shutil.which("flatpak"):
+        return []
+    sizes = {}
+    r = run(["flatpak", "list", "--runtime", "--columns=ref,size,installation"], 60)
+    for line in r.stdout.splitlines():
+        parts = [p.strip() for p in line.split("\t")]
+        if len(parts) >= 3:
+            sizes[(parts[0], parts[2])] = parse_size(parts[1])
+    out = []
+    for inst in ("user", "system"):
+        # flatpak lists what it would remove (" 1.  org.gnome.Platform  45  r"),
+        # then asks: answer no
+        r = run(["flatpak", "uninstall", "--unused", f"--{inst}"], 60, input_text="n\n")
+        for line in r.stdout.splitlines():
+            parts = line.split()
+            if len(parts) >= 3 and re.fullmatch(r"\d+\.", parts[0]):
+                app_id, branch = parts[1], parts[2]
+                for (ref, i), size in sizes.items():
+                    bits = ref.split("/")
+                    if i == inst and bits[0] == app_id and bits[-1] == branch:
+                        out.append((ref, inst, size))
+                        break
+                else:
+                    out.append((f"{app_id}//{branch}", inst, 0))
+    return out
+
+
+def journal_old():
+    """Roughly what vacuuming to two weeks frees: all but the newest part."""
+    n = journal_size()
+    return None if n is None else max(0, n - 64 * 1024 * 1024)
+
+
+def journal_size():
+    r = run(["journalctl", "--disk-usage"], 30)
+    import re
+    m = re.search(r"take up ([\d.]+)\s*([KMGT]?)B?", r.stdout + r.stderr)
+    if not m:
+        return None
+    return int(float(m.group(1)) * {"": 1, "K": 1024, "M": 1024 ** 2, "G": 1024 ** 3, "T": 1024 ** 4}[m.group(2)])
+
+
+def has_rollback():
+    import json
+    r = run(["rpm-ostree", "status", "--json"], 30)
+    try:
+        deps = json.loads(r.stdout).get("deployments", [])
+    except ValueError:
+        return False
+    return any(not d.get("booted") and not d.get("staged") and not d.get("pinned") for d in deps)
+
+
+class Item:
+    def __init__(self, key, title, desc, icon, system=False, default=True, measure=None, clean=None):
+        self.key, self.title, self.desc, self.icon = key, title, desc, icon
+        self.system, self.default = system, default
+        self.measure, self.clean_fn = measure, clean
+        self.size = None            # bytes, None while measuring, -1 if unknown
+
+
+def downloads_dir():
+    try:
+        out = subprocess.run(["xdg-user-dir", "DOWNLOAD"], capture_output=True, text=True, timeout=5).stdout.strip()
+        if out and out != HOME:
+            return out
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return os.path.join(HOME, "Downloads")
+
+
+def items():
+    uid = os.getuid()
+    thumbs = os.path.join(CACHE, "thumbnails")
+    # not: thumbnails and Firefox (their own items), Firox's own, and the
+    # clipboard history (Super+V), which lives in ~/.cache/cliphist
+    skip_cache = {thumbs, os.path.join(CACHE, "mozilla"), os.path.join(CACHE, "firox"),
+                  os.path.join(CACHE, "cliphist")}
+
+    def tmp_size():
+        return sum(du(d, WEEK, uid) for d in ("/tmp", "/var/tmp"))
+
+    def tmp_clean():
+        return sum(remove_contents(d, WEEK, uid) for d in ("/tmp", "/var/tmp"))
+
+    def trash_clean():
+        before = du(TRASH)
+        subprocess.run(["gio", "trash", "--empty"], capture_output=True, timeout=600)
+        if du(TRASH) >= before:          # no gio: do it ourselves
+            for sub in ("files", "info", "expunged"):
+                remove_contents(os.path.join(TRASH, sub))
+        return before - du(TRASH)
+
+    def other_size():
+        return du(CACHE, skip=skip_cache) + sum(du(d) for d in flatpak_app_caches()
+                                                if "org.mozilla.firefox" not in d)
+
+    def other_clean():
+        freed = remove_contents(CACHE, skip=skip_cache)
+        for d in flatpak_app_caches():
+            if "org.mozilla.firefox" not in d:
+                freed += remove_contents(d)
+        return freed
+
+    dl = downloads_dir()
+    return [
+        Item("trash", "Recycle Bin", "Files you've deleted. Empty it to free their space for good.",
+             "user-trash-full", measure=lambda: du(TRASH), clean=trash_clean),
+        Item("thumbnails", "Thumbnails", "Small previews of your pictures and videos. They're made again when "
+             "you open a folder.", "image-x-generic", measure=lambda: du(thumbs),
+             clean=lambda: remove_contents(thumbs)),
+        Item("browser", "Web browser cache", "Copies of web pages Firefox keeps to show them faster. Sites may "
+             "load a little slower the first time afterwards.", "firefox",
+             measure=lambda: sum(du(d) for d in firefox_caches()),
+             clean=lambda: sum(remove_contents(d) for d in firefox_caches())),
+        Item("temp", "Temporary files", "Files programs left in the temporary folders more than a week ago.",
+             "folder-temp", measure=tmp_size, clean=tmp_clean),
+        Item("caches", "Other program caches", "Data programs keep to start or work faster; they make it "
+             "again when needed. Close your programs first.", "folder-download", default=False,
+             measure=other_size, clean=other_clean),
+        Item("downloads", "Downloads", f"Everything in your Downloads folder ({dl}). Only tick this if you've "
+             "kept what you need from it.", "folder-downloads", default=False,
+             measure=lambda: du(dl), clean=lambda: remove_contents(dl)),
+        Item("runtimes", "Unused app runtimes", "Parts of Flatpak apps that no installed app needs any more, "
+             "usually left behind by updates.", "application-x-addon", system=True,
+             measure=lambda: sum(size for _r, _i, size in unused_runtimes())),
+        Item("journal", "System logs", "Event Viewer's records older than two weeks.", "utilities-log-viewer",
+             system=True, measure=journal_old),
+        Item("coredumps", "Crash reports", "Details saved when programs crashed (Event Viewer > Crashes).",
+             "apport", system=True, measure=lambda: du(COREDUMPS)),
+        Item("updates", "Update cache", "Data kept from downloading updates; it's fetched again if needed.",
+             "system-software-update", system=True, measure=lambda: du("/var/cache/rpm-ostree")),
+        Item("rollback", "Previous version of Firox Linux", "The version System Restore goes back to. Removing "
+             "it frees space, but you can't go back until after the next update.", "document-revert",
+             system=True, default=False, measure=lambda: -1 if has_rollback() else 0),
+    ]
+
+
+# ---------------------------------------------------- system part (root) --
+
+SYSTEM_KEYS = {"runtimes", "journal", "coredumps", "updates", "rollback"}
+
+
+def clean_system(keys):
+    """Runs as root, through pkexec. Only the fixed actions below."""
+    if os.geteuid() != 0:
+        print("needs root", file=sys.stderr)
+        return 1
+    rc = 0
+    for key in keys:
+        if key not in SYSTEM_KEYS:
+            continue
+        if key == "runtimes":
+            rc |= run(["flatpak", "uninstall", "--unused", "--noninteractive", "-y", "--system"], 1800).returncode
+        elif key == "journal":
+            rc |= run(["journalctl", "--vacuum-time=2weeks"], 600).returncode
+        elif key == "coredumps":
+            for f in glob.glob(os.path.join(COREDUMPS, "*")):
+                try:
+                    os.unlink(f)
+                except OSError:
+                    rc = 1
+        elif key == "updates":
+            rc |= run(["rpm-ostree", "cleanup", "-m"], 600).returncode
+        elif key == "rollback":
+            rc |= run(["rpm-ostree", "cleanup", "-r"], 600).returncode
+        print(f"done {key}", flush=True)
+    return rc
+
+
+# --------------------------------------------------------------------- UI --
+
+def gui():
+    import gi
+    gi.require_version("Gtk", "3.0")
+    from gi.repository import Gio, GLib, Gtk, Pango
+
+    class Window(Gtk.ApplicationWindow):
+        def __init__(self, app):
+            super().__init__(application=app, title="Disk Cleanup")
+            self.set_default_size(560, 640)
+            self.set_icon_name("bleachbit")
+            self.items = items()
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+            box.set_border_width(14)
+            self.add(box)
+            head = Gtk.Box(spacing=12)
+            icon = Gtk.Image.new_from_icon_name("bleachbit", Gtk.IconSize.DIALOG)   # Papirus: a broom
+            icon.set_pixel_size(48)
+            head.pack_start(icon, False, False, 0)
+            self.headline = Gtk.Label(xalign=0, wrap=True)
+            head.pack_start(self.headline, True, True, 0)
+            box.pack_start(head, False, False, 0)
+
+            self.bar = Gtk.LevelBar()
+            self.bar_text = Gtk.Label(xalign=0)
+            box.pack_start(self.bar, False, False, 0)
+            box.pack_start(self.bar_text, False, False, 0)
+
+            lab = Gtk.Label(xalign=0)
+            lab.set_markup("<b>Files to delete:</b>")
+            box.pack_start(lab, False, False, 4)
+            self.store = Gtk.ListStore(bool, str, str, str, int)   # tick, icon, title, size text, index
+            for i, it in enumerate(self.items):
+                self.store.append([it.default, it.icon, it.title + ("  🔒" if it.system else ""), "Calculating…", i])
+            view = Gtk.TreeView(model=self.store, headers_visible=False)
+            tick = Gtk.CellRendererToggle()
+            tick.connect("toggled", self.on_toggle)
+            view.append_column(Gtk.TreeViewColumn("", tick, active=0))
+            col = Gtk.TreeViewColumn("")
+            r = Gtk.CellRendererPixbuf()
+            col.pack_start(r, False)
+            col.add_attribute(r, "icon-name", 1)
+            r = Gtk.CellRendererText(ellipsize=Pango.EllipsizeMode.END)
+            col.pack_start(r, True)
+            col.add_attribute(r, "text", 2)
+            col.set_expand(True)
+            view.append_column(col)
+            view.append_column(Gtk.TreeViewColumn("", Gtk.CellRendererText(xalign=1), text=3))
+            view.get_selection().connect("changed", self.on_select)
+            sw = Gtk.ScrolledWindow()
+            sw.set_shadow_type(Gtk.ShadowType.IN)
+            sw.add(view)
+            box.pack_start(sw, True, True, 0)
+
+            self.total = Gtk.Label(xalign=0)
+            box.pack_start(self.total, False, False, 0)
+            frame = Gtk.Frame(label="Description")
+            self.desc = Gtk.Label(xalign=0, yalign=0, wrap=True, max_width_chars=60)
+            for side in ("start", "end", "top", "bottom"):
+                getattr(self.desc, f"set_margin_{side}")(8)
+            self.desc.set_size_request(-1, 64)
+            frame.add(self.desc)
+            box.pack_start(frame, False, False, 0)
+            note = Gtk.Label(xalign=0, wrap=True)
+            note.set_markup("<small>🔒 Items marked with a lock ask for your password.</small>")
+            box.pack_start(note, False, False, 0)
+
+            row = Gtk.Box(spacing=6)
+            self.status = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END)
+            row.pack_start(self.status, True, True, 0)
+            self.close_b = Gtk.Button.new_with_mnemonic("_Close")
+            self.close_b.connect("clicked", lambda _b: self.close())
+            row.pack_end(self.close_b, False, False, 0)
+            self.clean_b = Gtk.Button.new_with_mnemonic("Clean _up")
+            self.clean_b.get_style_context().add_class("suggested-action")
+            self.clean_b.connect("clicked", lambda _b: self.confirm())
+            row.pack_end(self.clean_b, False, False, 0)
+            box.pack_start(row, False, False, 0)
+            view.get_selection().select_path(Gtk.TreePath.new_first())
+            self.show_all()
+            self.show_disk()
+            self.measure()
+
+        def show_disk(self):
+            try:
+                st = os.statvfs(HOME)
+            except OSError:
+                return
+            total, free = st.f_blocks * st.f_frsize, st.f_bavail * st.f_frsize
+            used = 1 - free / total if total else 0
+            self.bar.set_value(used)
+            self.bar_text.set_text(f"{human(free)} free of {human(total)}")
+
+        def measure(self):
+            self.clean_b.set_sensitive(False)
+            self.headline.set_markup("<span size='large'><b>Calculating how much space you can free…</b></span>")
+
+            def work(i, it):
+                try:
+                    size = it.measure()
+                except Exception as err:  # noqa: BLE001
+                    print(f"firox-cleanmgr: {it.key}: {err}", file=sys.stderr)
+                    size = None
+                GLib.idle_add(self.got_size, i, size)
+            self.pending = len(self.items)
+            for i, it in enumerate(self.items):
+                threading.Thread(target=work, args=(i, it), daemon=True).start()
+
+        def got_size(self, i, size):
+            it = self.items[i]
+            it.size = size
+            text = "Unknown" if size is None else ("Some" if size == -1 else human(size))
+            self.store[i][3] = text
+            self.pending -= 1
+            self.update_total()
+            if self.pending == 0:
+                self.clean_b.set_sensitive(True)
+                possible = sum(it.size for it in self.items if it.size and it.size > 0)
+                self.headline.set_markup(f"<span size='large'><b>You can free up to {human(possible)}</b></span>\n"
+                                         "Tick what to delete, then click Clean up.")
+            return False
+
+        def update_total(self):
+            n = sum(self.items[r[4]].size or 0 for r in self.store if r[0] and (self.items[r[4]].size or 0) > 0)
+            self.total.set_text(f"Total space freed by the ticked items: {human(n)}")
+
+        def on_toggle(self, _r, path):
+            self.store[path][0] = not self.store[path][0]
+            self.update_total()
+
+        def on_select(self, sel):
+            model, it = sel.get_selected()
+            if it is not None:
+                self.desc.set_text(self.items[model[it][4]].desc)
+
+        def chosen(self):
+            return [self.items[r[4]] for r in self.store if r[0]]
+
+        def confirm(self):
+            todo = [it for it in self.chosen() if it.size != 0]
+            if not todo:
+                self.status.set_text("Nothing to clean: tick something with space to free.")
+                return
+            dlg = Gtk.MessageDialog(transient_for=self, modal=True, message_type=Gtk.MessageType.QUESTION,
+                                    buttons=Gtk.ButtonsType.NONE,
+                                    text="Are you sure you want to permanently delete these files?")
+            dlg.format_secondary_text("\n".join(f"• {it.title}" for it in todo))
+            dlg.add_button("Cancel", Gtk.ResponseType.CANCEL)
+            dlg.add_button("Delete Files", Gtk.ResponseType.OK)
+            ok = dlg.run() == Gtk.ResponseType.OK
+            dlg.destroy()
+            if ok:
+                self.clean(todo)
+
+        def clean(self, todo):
+            self.clean_b.set_sensitive(False)
+            self.close_b.set_sensitive(False)
+            before = os.statvfs(HOME)
+            free_before = before.f_bavail * before.f_frsize
+
+            def work():
+                for it in [t for t in todo if not t.system]:
+                    GLib.idle_add(self.status.set_text, f"Cleaning up {it.title}…")
+                    try:
+                        it.clean_fn()
+                    except Exception as err:  # noqa: BLE001
+                        print(f"firox-cleanmgr: {it.key}: {err}", file=sys.stderr)
+                sys_keys = [t.key for t in todo if t.system]
+                if "runtimes" in sys_keys:       # your own installation needs no password
+                    GLib.idle_add(self.status.set_text, "Removing unused app runtimes…")
+                    run(["flatpak", "uninstall", "--unused", "--noninteractive", "-y", "--user"], 1800)
+                    if not any(i == "system" for _r, i, _s in unused_runtimes()):
+                        sys_keys.remove("runtimes")
+                failed = ""
+                if sys_keys:
+                    GLib.idle_add(self.status.set_text, "Cleaning up system files (asks for your password)…")
+                    me = os.path.realpath(sys.argv[0]) if os.path.exists(sys.argv[0]) else "/usr/bin/firox-cleanmgr"
+                    r = run(["pkexec", me, "--system", ",".join(sys_keys)], 3600)
+                    if r.returncode in (126, 127):
+                        failed = "The system items were skipped (no password given)."
+                    elif r.returncode != 0:
+                        failed = "Some system items couldn't be cleaned."
+                GLib.idle_add(self.done, free_before, failed)
+            threading.Thread(target=work, daemon=True).start()
+
+        def done(self, free_before, failed):
+            after = os.statvfs(HOME)
+            freed = max(0, after.f_bavail * after.f_frsize - free_before)
+            self.status.set_text(f"Freed {human(freed)}." + (f" {failed}" if failed else ""))
+            self.close_b.set_sensitive(True)
+            for r in self.store:
+                r[3] = "Calculating…"
+            self.show_disk()
+            self.measure()
+            return False
+
+    class App(Gtk.Application):
+        def __init__(self):
+            super().__init__(application_id="org.firox.DiskCleanup", flags=Gio.ApplicationFlags.FLAGS_NONE)
+            self.win = None
+
+        def do_activate(self):
+            if self.win is None:
+                self.win = Window(self)
+            self.win.present()
+
+    return App().run([sys.argv[0]])
+
+
+def main():
+    args = sys.argv[1:]
+    if args[:1] == ["--system"] and len(args) == 2:
+        return clean_system([k for k in args[1].split(",") if k])
+    if args[:1] == ["list"]:
+        for it in items():
+            try:
+                size = it.measure()
+            except Exception as err:  # noqa: BLE001
+                size = None
+                print(f"  ({it.key}: {err})", file=sys.stderr)
+            print(f"{it.title:<34} {('some' if size == -1 else human(size)):>10}"
+                  f"{'  (system)' if it.system else ''}{'' if it.default else '  (not ticked)'}")
+        return 0
+    if args[:1] in (["-h"], ["--help"]):
+        print(__doc__.strip())
+        return 0
+    return gui()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

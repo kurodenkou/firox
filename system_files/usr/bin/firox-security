@@ -1,0 +1,619 @@
+#!/usr/bin/python3
+"""
+firox-security: Security Center. One page that says whether this computer's
+protections are on, with a button to fix each one that isn't.
+
+    firox-security            open Security Center
+    firox-security status     print each check's state
+    firox-security login      at login: a notification if something
+                              important is off (once per problem)
+    firox-security tray       check, and update the taskbar's shield
+                              (~/.local/state/firox/security-status.json)
+
+Checks:
+  Firewall            firewalld is running
+  Automatic updates   the update timer (uupd or rpm-ostreed-automatic) is
+                      on, no update is waiting for a restart, and the
+                      running version is under 30 days old
+  Backup              Backup and Restore is set up and backed up this week
+  Screen lock         the screen locks when idle (Power Options)
+  Remote login        the SSH server is off (or you know it's on)
+  Disk encryption     the system disk is encrypted (LUKS); chosen when
+                      Firox is installed
+  Secure Boot         the firmware only starts signed software
+  SELinux             enforcing
+  Virus protection    ClamAV's definitions are under a week old (and their
+                      updates are on); Scan now opens Virus Scan
+
+Turning things on asks for your password (pkexec).
+"""
+
+import glob
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+
+CONFIG = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "firox")
+STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "firox")
+NOTIFIED = os.path.join(STATE_DIR, "security-notified")
+CONF = os.path.join(CONFIG, "security.conf")             # IGNORE=key,key: "Don't warn me"
+STATUS = os.path.join(STATE_DIR, "security-status.json")  # for the taskbar's shield
+UPDATE_TIMERS = ("uupd.timer", "rpm-ostreed-automatic.timer")
+OLD_DAYS = 30
+BACKUP_DAYS = 7
+LAPTOPS = {"8", "9", "10", "14", "30", "31", "32"}     # DMI chassis types
+
+OK, WARN, BAD, INFO = "ok", "warn", "bad", "info"
+
+
+def run(argv, timeout=20):
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        return r.stdout.strip() if r.returncode == 0 else (r.stdout.strip() or "")
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def read(path):
+    try:
+        with open(path) as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
+def kv_file(path):
+    out = {}
+    for line in read(path).splitlines():
+        if "=" in line and not line.lstrip().startswith("#"):
+            k, v = line.split("=", 1)
+            out[k.strip()] = v.strip()
+    return out
+
+
+def ago(ts):
+    days = int((time.time() - ts) // 86400)
+    if days <= 0:
+        hours = int((time.time() - ts) // 3600)
+        return "less than an hour ago" if hours <= 0 else f"{hours} hour{'s' if hours != 1 else ''} ago"
+    return "yesterday" if days == 1 else f"{days} days ago"
+
+
+def us_date(ts):
+    t = time.localtime(ts)
+    return f"{t.tm_mon}/{t.tm_mday}/{t.tm_year}"
+
+
+def check(key, title, icon, state, status, text, actions=()):
+    """A check's result. actions: [(label, argv)]; argv starting with
+    "pkexec" asks for the password."""
+    return {"key": key, "title": title, "icon": icon, "state": state, "status": status,
+            "text": text, "actions": list(actions)}
+
+
+# ------------------------------------------------------------------ checks --
+
+def c_firewall():
+    active = run(["systemctl", "is-active", "firewalld"]) == "active"
+    if active:
+        zone = run(["firewall-cmd", "--get-default-zone"], 5) or ""
+        extra = f" (zone: {zone})" if zone and "\n" not in zone else ""
+        return check("firewall", "Firewall", "firewall-config", OK, "On",
+                     "The firewall blocks connections to this computer that you haven't allowed" + extra + ".")
+    if run(["systemctl", "cat", "firewalld"]) in (None, ""):
+        return check("firewall", "Firewall", "firewall-config", BAD, "Missing",
+                     "No firewall is installed, so other computers on the network can reach any "
+                     "service running on this one.")
+    return check("firewall", "Firewall", "firewall-config", BAD, "Off",
+                 "The firewall is off, so other computers on the network can reach any service running "
+                 "on this one. Turn it on unless you have another firewall.",
+                 [("Turn on", ["pkexec", "systemctl", "enable", "--now", "firewalld"])])
+
+
+def c_updates():
+    title, icon = "Automatic updates", "system-software-update"
+    timers = {}
+    for t in UPDATE_TIMERS:
+        state = run(["systemctl", "is-enabled", t])
+        if state and state not in ("not-found",):
+            timers[t] = state
+    on = [t for t, s in timers.items() if s in ("enabled", "static", "alias")]
+    deps = []
+    raw = run(["rpm-ostree", "status", "--json"], 30)
+    try:
+        deps = json.loads(raw).get("deployments", []) if raw else []
+    except ValueError:
+        deps = []
+    booted = next((d for d in deps if d.get("booted")), None)
+    staged = next((d for d in deps if d.get("staged")), None)
+    if not timers and not deps:
+        return check("updates", title, icon, INFO, "Unknown",
+                     "Couldn't find the update service (rpm-ostree) on this computer.")
+    if not on:
+        unit = next(iter(timers), UPDATE_TIMERS[0])
+        return check("updates", title, icon, BAD, "Off",
+                     "Firox Linux won't download security fixes by itself. Turn automatic updates back on, "
+                     "or remember to run System Update yourself.",
+                     [("Turn on", ["pkexec", "systemctl", "enable", "--now", unit]),
+                      ("Update now", ["firox-open", "update"])])
+    if staged:
+        return check("updates", title, icon, WARN, "Restart needed",
+                     "An update has been downloaded. Restart to finish installing it.",
+                     [("Restart now…", ["firox-updates", "restart"]),
+                      ("What's new", ["firox-updates", "whatsnew"])])
+    ts = booted.get("timestamp") if booted else None
+    if ts and time.time() - ts > OLD_DAYS * 86400:
+        return check("updates", title, icon, WARN, "Out of date",
+                     f"This version of Firox Linux is from {us_date(ts)}, {ago(ts)}. Automatic updates are on, "
+                     "but none has been installed for a while: check that the computer can reach the internet.",
+                     [("Update now", ["firox-open", "update"]),
+                      ("See the logs", ["firox-eventvwr", "system", "--find", "update"])])
+    when = f" This version is from {us_date(ts)}." if ts else ""
+    return check("updates", title, icon, OK, "On",
+                 "Updates download in the background and install when you restart." + when)
+
+
+def c_backup():
+    title, icon = "Backup", "drive-harddisk"
+    conf = {"ENABLED": "1", "DEST": ""}
+    conf.update(kv_file(os.path.join(CONFIG, "backup.conf")))
+    try:
+        with open(os.path.join(STATE_DIR, "backup.json")) as fh:
+            state = json.load(fh)
+    except (OSError, ValueError):
+        state = {}
+    if not conf.get("DEST"):
+        return check("backup", title, icon, WARN, "Not set up",
+                     "Your files aren't being backed up. Back them up every hour to a USB drive or a network "
+                     "folder, so a broken disk or a mistake doesn't lose them.",
+                     [("Set up backup…", ["firox-backup"])])
+    if conf.get("ENABLED", "1") == "0":
+        return check("backup", title, icon, WARN, "Off",
+                     "Automatic backups are turned off.", [("Open Backup and Restore", ["firox-backup"])])
+    last = state.get("last_success") or 0
+    if not last or time.time() - last > BACKUP_DAYS * 86400:
+        why = state.get("message") or ""
+        text = ("Your files haven't been backed up yet." if not last else
+                f"The last backup was {ago(last)}.")
+        if why:
+            text += f" {why}."
+        return check("backup", title, icon, WARN, "Out of date", text.replace("..", "."),
+                     [("Open Backup and Restore", ["firox-backup"])])
+    return check("backup", title, icon, OK, "On", f"Your files are backed up every hour. The last backup "
+                 f"was {ago(last)}.")
+
+
+def c_lock():
+    title, icon = "Screen lock", "system-lock-screen"
+    conf = kv_file("/etc/firox/power.conf")
+    conf.update(kv_file(os.path.join(CONFIG, "power.conf")))
+
+    def num(k):
+        try:
+            return int(conf.get(k, "0"))
+        except ValueError:
+            return 0
+    mins, wake = num("LOCK"), num("LOCK_ON_WAKE")
+    action = [("Power Options…", ["firox-control-panel", "power"])]
+    if mins <= 0 and not wake:
+        return check("lock", title, icon, WARN, "Off",
+                     "The screen never locks by itself, so anyone at the computer can use your account "
+                     "while you're away.", action)
+    if mins <= 0:
+        return check("lock", title, icon, WARN, "Only after sleep",
+                     "The screen locks when the computer goes to sleep, but not when it's left idle.", action)
+    text = f"The screen locks after {mins} minute{'s' if mins != 1 else ''} without use"
+    text += " and when the computer sleeps." if wake else "."
+    if mins > 30:
+        return check("lock", title, icon, WARN, f"After {mins} min", text + " That's quite long.", action)
+    return check("lock", title, icon, OK, "On", text + " Press Super+L to lock it yourself.")
+
+
+def c_remote():
+    title, icon = "Remote login", "network-server"
+    active = run(["systemctl", "is-active", "sshd"]) == "active"
+    enabled = run(["systemctl", "is-enabled", "sshd"]) == "enabled"
+    if active or enabled:
+        return check("remote", title, icon, WARN, "On",
+                     "The SSH server is on: anyone on the network who knows a password on this computer can "
+                     "sign in to it. Turn it off unless you use it.",
+                     [("Turn off", ["pkexec", "systemctl", "disable", "--now", "sshd"])])
+    return check("remote", title, icon, OK, "Off", "Nobody can sign in to this computer over the network.")
+
+
+def is_laptop():
+    if read("/sys/class/dmi/id/chassis_type") in LAPTOPS:
+        return True
+    return any(read(p + "/type") == "Battery" for p in glob.glob("/sys/class/power_supply/*"))
+
+
+def c_encryption():
+    title, icon = "Disk encryption", "veracrypt"   # Papirus: a padlocked disk
+    raw = run(["lsblk", "-J", "-o", "NAME,FSTYPE,TYPE,MOUNTPOINTS"]) or "{}"
+    try:
+        devs = json.loads(raw).get("blockdevices") or []
+    except ValueError:
+        devs = []
+
+    def walk(items, crypt=False):
+        """Is a system mount point (/, /sysroot or /var) under a LUKS volume?"""
+        for d in items or []:
+            under = crypt or d.get("fstype") == "crypto_LUKS" or d.get("type") == "crypt"
+            mounts = [m for m in (d.get("mountpoints") or []) if m]
+            if under and any(m in ("/", "/sysroot", "/var", "/var/home", "/home") for m in mounts):
+                return True
+            if walk(d.get("children"), under):
+                return True
+        return False
+    if walk(devs):
+        return check("encryption", title, icon, OK, "On",
+                     "The system disk is encrypted: if the computer is lost or stolen, your files can't be "
+                     "read without your disk password.")
+    state = WARN if is_laptop() else INFO
+    return check("encryption", title, icon, state, "Off",
+                 "The system disk isn't encrypted, so anyone who takes the disk can read your files. "
+                 + ("That matters most on a laptop. " if state == WARN else "")
+                 + "Encryption is chosen when Firox Linux is installed: to turn it on, back up your files and "
+                 "reinstall with \"Encrypt my data\" ticked.")
+
+
+def c_secureboot():
+    title, icon = "Secure Boot", "security-high"
+    if not os.path.isdir("/sys/firmware/efi"):
+        return check("secureboot", title, icon, INFO, "Not available",
+                     "This computer starts in legacy BIOS mode, which doesn't have Secure Boot.")
+    out = (run(["mokutil", "--sb-state"]) or "").lower()
+    on = None
+    if "enabled" in out:
+        on = True
+    elif "disabled" in out:
+        on = False
+    else:
+        for f in glob.glob("/sys/firmware/efi/efivars/SecureBoot-*"):
+            try:
+                with open(f, "rb") as fh:
+                    on = fh.read()[-1] == 1
+            except OSError:
+                pass
+    if on:
+        return check("secureboot", title, icon, OK, "On",
+                     "The computer only starts software signed by Fedora or by you, which stops some "
+                     "malware from loading before Firox Linux does.")
+    if on is None:
+        return check("secureboot", title, icon, INFO, "Unknown", "Couldn't read the Secure Boot setting.")
+    return check("secureboot", title, icon, INFO, "Off",
+                 "Secure Boot is off in the computer's firmware settings. Firox Linux works either way; "
+                 "turning it on adds protection against malware that loads at startup. With an NVIDIA card, "
+                 "run `ujust enroll-secure-boot-key` first.")
+
+
+def c_selinux():
+    title, icon = "SELinux", "preferences-system-privacy"
+    mode = run(["getenforce"]) or ""
+    if mode == "Enforcing":
+        return check("selinux", title, icon, OK, "On",
+                     "SELinux keeps each program to what it needs, so a compromised program can do less harm.")
+    if mode == "Permissive":
+        return check("selinux", title, icon, WARN, "Permissive",
+                     "SELinux only logs what it would have blocked. Turn it back on; it stays on after a "
+                     "restart unless /etc/selinux/config says otherwise.",
+                     [("Turn on", ["pkexec", "setenforce", "1"]),
+                      ("See what it blocked", ["firox-eventvwr", "security", "--find", "avc"])])
+    if mode == "Disabled":
+        return check("selinux", title, icon, BAD, "Off",
+                     "SELinux is disabled. Set SELINUX=enforcing in /etc/selinux/config and restart.")
+    return check("selinux", title, icon, INFO, "Unknown", "Couldn't read the SELinux mode.")
+
+
+def c_virus():
+    title, icon = "Virus protection", "security-high"
+    scan = [("Scan now…", ["firox-virusscan"])]
+    if not shutil.which("clamscan"):
+        return check("virus", title, icon, INFO, "Not installed",
+                     "ClamAV isn't installed, so Virus Scan can't check your files.")
+    raw = run(["firox-virusscan", "definitions"], 10) or "{}"
+    try:
+        defs = json.loads(raw)
+    except ValueError:
+        defs = {}
+    when = defs.get("time")
+    try:
+        with open(os.path.join(STATE_DIR, "virusscan.json")) as fh:
+            last = json.load(fh).get("last_scan")
+    except (OSError, ValueError):
+        last = None
+    scanned = f" Last scan: {ago(last)}." if last else " You haven't run a scan yet."
+    service = run(["systemctl", "is-enabled", "clamav-freshclam.service"]) or ""
+    if service not in ("enabled", "static", "alias", "") and service != "not-found":
+        return check("virus", title, icon, WARN, "Updates off",
+                     "Virus definitions aren't being updated, so new threats won't be recognized." + scanned,
+                     [("Turn on", ["pkexec", "systemctl", "enable", "--now", "clamav-freshclam.service"])] + scan)
+    if not when:
+        return check("virus", title, icon, WARN, "No definitions",
+                     "The virus definitions haven't been downloaded yet. They download by themselves when the "
+                     "computer is online." + scanned,
+                     [("Download now", ["pkexec", "systemctl", "restart", "clamav-freshclam.service"])] + scan)
+    if time.time() - when > 7 * 86400:
+        return check("virus", title, icon, WARN, "Out of date",
+                     f"The virus definitions are from {us_date(when)}, {ago(when)}." + scanned,
+                     [("Update now", ["pkexec", "systemctl", "restart", "clamav-freshclam.service"])] + scan)
+    return check("virus", title, icon, OK, "On",
+                 f"ClamAV's virus definitions are up to date ({us_date(when)}). Scan your files with Virus Scan, "
+                 "or right-click them in Firox Explorer." + scanned, scan)
+
+
+CHECKS = [c_firewall, c_updates, c_virus, c_backup, c_lock, c_remote, c_encryption, c_secureboot, c_selinux]
+
+
+def ignored():
+    return {k for k in kv_file(CONF).get("IGNORE", "").split(",") if k}
+
+
+def set_ignored(key, on):
+    keys = ignored()
+    keys = keys | {key} if on else keys - {key}
+    os.makedirs(CONFIG, exist_ok=True)
+    with open(CONF, "w") as fh:
+        fh.write("# Security Center (firox-security): checks you chose not to be warned about\n")
+        fh.write(f"IGNORE={','.join(sorted(keys))}\n")
+
+
+def all_checks():
+    out = []
+    skip = ignored()
+    for fn in CHECKS:
+        try:
+            r = fn()
+        except Exception as err:  # noqa: BLE001
+            name = fn.__name__[2:]
+            r = check(name, name.title(), "dialog-question", INFO, "Unknown", f"Couldn't check: {err}")
+        if r["state"] == WARN:
+            if r["key"] in skip:
+                r["state"], r["ignored"] = INFO, True
+                r["text"] += " You chose not to be warned about this."
+                r["actions"] = [a for a in r["actions"] if a[1][0] != "pkexec"] + [("Warn me again", ["@warn"])]
+            else:
+                r["actions"].append(("Don't warn me", ["@ignore"]))
+        out.append(r)
+    return out
+
+
+def overall(results):
+    bad = [r for r in results if r["state"] == BAD]
+    warn = [r for r in results if r["state"] == WARN]
+    if bad:
+        return BAD, "security-low", "Your computer might be at risk", \
+            f"{len(bad) + len(warn)} setting{'s' if len(bad) + len(warn) != 1 else ''} need your attention."
+    if warn:
+        return WARN, "security-medium", "Check these settings", \
+            f"{len(warn)} setting{'s' if len(warn) != 1 else ''} could be safer."
+    return OK, "security-high", "Your computer is protected", "Everything important is on."
+
+
+def save_status(results):
+    """What the taskbar's shield shows."""
+    state, _icon, head, _sub = overall(results)
+    items = [f"{r['title']}: {r['status'].lower()}" for r in results if r["state"] in (BAD, WARN)]
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = STATUS + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump({"state": state, "headline": head, "items": items, "time": int(time.time())}, fh)
+    os.replace(tmp, STATUS)
+    return state, items
+
+
+# --------------------------------------------------------------- commands --
+
+def cmd_tray():
+    state, items = save_status(all_checks())
+    print(json.dumps({"state": state, "items": items}))
+    return 0
+
+
+def cmd_status():
+    results = all_checks()
+    for r in results:
+        print(f"{r['title']:<18} {r['state']:<5} {r['status']}: {r['text']}")
+    return 1 if any(r["state"] == BAD for r in results) else 0
+
+
+def cmd_login():
+    """Notify about red items, once for each new set of problems."""
+    results = all_checks()
+    save_status(results)
+    bad = [r for r in results if r["state"] == BAD]
+    key = ",".join(f"{r['key']}:{r['status']}" for r in bad)
+    if key == read(NOTIFIED):
+        return 0
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(NOTIFIED, "w") as fh:
+        fh.write(key)
+    if not bad:
+        return 0
+    body = "; ".join(f"{r['title']}: {r['status'].lower()}" for r in bad)
+    try:
+        r = subprocess.run(["notify-send", "-a", "Security Center", "-i", "security-low", "-u", "critical",
+                            "-A", "open=Open Security Center", "--wait",
+                            "Your computer might be at risk", body],
+                           capture_output=True, text=True, timeout=3600)
+        if r.stdout.strip() == "open":
+            subprocess.Popen(["firox-security"], start_new_session=True)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return 0
+
+
+# --------------------------------------------------------------------- UI --
+
+def gui():
+    import threading
+
+    import gi
+    gi.require_version("Gtk", "3.0")
+    from gi.repository import Gio, GLib, Gtk
+
+    CSS = b"""
+    .pill { border-radius: 10px; padding: 2px 12px; font-weight: bold; color: #ffffff; }
+    .pill.ok { background: #2e9e44; }
+    .pill.warn { background: #d99a06; color: #1d1d1d; }
+    .pill.bad { background: #d23a2b; }
+    .pill.info { background: alpha(currentColor, 0.25); }
+    .check { border-radius: 8px; padding: 10px 12px; border: 1px solid alpha(currentColor, 0.15); }
+    .check.bad { border-left: 5px solid #d23a2b; }
+    .check.warn { border-left: 5px solid #d99a06; }
+    .check.ok { border-left: 5px solid #2e9e44; }
+    .check.info { border-left: 5px solid alpha(currentColor, 0.3); }
+    .banner { border-radius: 8px; padding: 12px 14px; }
+    .banner.ok { background: alpha(#2e9e44, 0.18); }
+    .banner.warn { background: alpha(#d99a06, 0.20); }
+    .banner.bad { background: alpha(#d23a2b, 0.20); }
+    """
+
+    class Window(Gtk.ApplicationWindow):
+        def __init__(self, app):
+            super().__init__(application=app, title="Security Center")
+            self.set_default_size(700, 760)
+            self.set_icon_name("security-high")
+            prov = Gtk.CssProvider()
+            prov.load_from_data(CSS)
+            Gtk.StyleContext.add_provider_for_screen(self.get_screen(), prov,
+                                                     Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+            outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+            outer.set_border_width(14)
+            self.add(outer)
+
+            self.banner = Gtk.Box(spacing=14)
+            self.banner.get_style_context().add_class("banner")
+            self.shield = Gtk.Image.new_from_icon_name("security-high", Gtk.IconSize.DIALOG)
+            self.shield.set_pixel_size(56)
+            self.banner.pack_start(self.shield, False, False, 0)
+            self.headline = Gtk.Label(xalign=0, wrap=True)
+            self.banner.pack_start(self.headline, True, True, 0)
+            refresh = Gtk.Button.new_with_mnemonic("_Check again")
+            refresh.set_valign(Gtk.Align.CENTER)
+            refresh.connect("clicked", lambda _b: self.refresh())
+            self.banner.pack_end(refresh, False, False, 0)
+            outer.pack_start(self.banner, False, False, 0)
+
+            self.list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+            sw = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
+            sw.add(self.list)
+            outer.pack_start(sw, True, True, 0)
+
+            foot = Gtk.Box(spacing=12)
+            for label, argv in (("Event Viewer", ["firox-eventvwr", "security"]),
+                                ("System Information", ["firox-sysinfo"]),
+                                ("System Restore", ["firox-restore"])):
+                link = Gtk.Button(label=label, relief=Gtk.ReliefStyle.NONE)
+                link.connect("clicked", lambda _b, a=argv: self.spawn(a))
+                foot.pack_start(link, False, False, 0)
+            outer.pack_start(foot, False, False, 0)
+            self.show_all()
+            self.refresh()
+
+        def spawn(self, argv, then_refresh=False):
+            try:
+                proc = Gio.Subprocess.new(argv, Gio.SubprocessFlags.NONE)
+            except GLib.Error as err:
+                self.headline.set_text(f"Couldn't run {argv[0]}: {err.message}")
+                return
+            if then_refresh:
+                proc.wait_async(None, lambda _p, _r: self.refresh())
+
+        def refresh(self):
+            self.headline.set_markup("<span size='large'><b>Checking…</b></span>")
+            threading.Thread(target=lambda: GLib.idle_add(self.show_results, all_checks()),
+                             daemon=True).start()
+
+        def show_results(self, results):
+            try:
+                save_status(results)
+            except OSError:
+                pass
+            state, icon, head, sub = overall(results)
+            ctx = self.banner.get_style_context()
+            for s in (OK, WARN, BAD):
+                ctx.remove_class(s)
+            ctx.add_class(state)
+            self.shield.set_from_icon_name(icon, Gtk.IconSize.DIALOG)
+            self.headline.set_markup(f"<span size='x-large'><b>{GLib.markup_escape_text(head)}</b></span>\n"
+                                     f"{GLib.markup_escape_text(sub)}")
+            for child in self.list.get_children():
+                child.destroy()
+            order = {BAD: 0, WARN: 1, OK: 2, INFO: 3}
+            for r in sorted(results, key=lambda r: order[r["state"]]):
+                self.list.pack_start(self.row(r), False, False, 0)
+            self.list.show_all()
+            return False
+
+        def row(self, r):
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            ctx = box.get_style_context()
+            ctx.add_class("check")
+            ctx.add_class(r["state"])
+            top = Gtk.Box(spacing=10)
+            img = Gtk.Image.new_from_icon_name(r["icon"], Gtk.IconSize.DND)
+            img.set_pixel_size(32)
+            top.pack_start(img, False, False, 0)
+            title = Gtk.Label(xalign=0)
+            title.set_markup(f"<b>{GLib.markup_escape_text(r['title'])}</b>")
+            top.pack_start(title, True, True, 0)
+            pill = Gtk.Label(label=r["status"])
+            pill.get_style_context().add_class("pill")
+            pill.get_style_context().add_class(r["state"])
+            pill.set_valign(Gtk.Align.CENTER)
+            top.pack_end(pill, False, False, 0)
+            box.pack_start(top, False, False, 0)
+            text = Gtk.Label(label=r["text"], xalign=0, wrap=True, max_width_chars=70)
+            text.set_margin_start(42)
+            box.pack_start(text, False, False, 0)
+            if r["actions"]:
+                btns = Gtk.Box(spacing=6)
+                btns.set_margin_start(42)
+                for label, argv in r["actions"]:
+                    b = Gtk.Button(label=label)
+                    if argv[0] == "pkexec":
+                        b.set_tooltip_text("Asks for your password")
+                    if argv[0] in ("@ignore", "@warn"):
+                        b.set_relief(Gtk.ReliefStyle.NONE)
+                        b.connect("clicked", lambda _b, k=r["key"], on=argv[0] == "@ignore":
+                                  set_ignored(k, on) or self.refresh())
+                        btns.pack_end(b, False, False, 0)
+                        continue
+                    b.connect("clicked", lambda _b, a=argv: self.spawn(a, then_refresh=True))
+                    btns.pack_start(b, False, False, 0)
+                box.pack_start(btns, False, False, 0)
+            return box
+
+    class App(Gtk.Application):
+        def __init__(self):
+            super().__init__(application_id="org.firox.SecurityCenter", flags=Gio.ApplicationFlags.FLAGS_NONE)
+            self.win = None
+
+        def do_activate(self):
+            if self.win is None:
+                self.win = Window(self)
+            self.win.present()
+
+    return App().run([sys.argv[0]])
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+    if cmd == "status":
+        return cmd_status()
+    if cmd == "login":
+        return cmd_login()
+    if cmd == "tray":
+        return cmd_tray()
+    if cmd in ("-h", "--help"):
+        print(__doc__.strip())
+        return 0
+    return gui()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

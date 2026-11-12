@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Virus Scan
+Comment=Check your files for viruses and other malware (ClamAV)
+Exec=firox-virusscan %F
+Icon=clamav
+Categories=System;Security;
+Keywords=antivirus;virus;malware;clamav;scan;defender;quarantine;
+StartupNotify=true

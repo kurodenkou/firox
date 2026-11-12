@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Security Center
+Comment=Check the firewall, updates, backups, screen lock and other protections
+Exec=firox-security
+Icon=security-high
+Categories=System;Settings;Security;
+Keywords=wscui;security;firewall;updates;antivirus;protection;encryption;secure boot;selinux;ssh;
+StartupNotify=true

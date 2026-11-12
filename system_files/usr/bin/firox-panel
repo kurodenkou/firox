@@ -27,7 +27,9 @@ Styled by the theme's panel.css (/usr/share/firox/themes/NAME/panel.css),
 reloaded when the theme changes; add your own rules in
 ~/.config/firox/panel.css. Settings (Settings > Taskbar, applied straight
 away): ~/.config/firox/panel.conf with GROUP, AUTOHIDE, QUICKLAUNCH,
-SECONDS and ALL_DISPLAYS (1 or 0). Quick Launch: ~/.config/firox/quicklaunch (see
+SECONDS, ALL_DISPLAYS, BATTERY_PERCENT (the % next to the battery) and
+SECURITY (Security Center's shield) and NIGHTLIGHT (Night Light's moon)
+(1 or 0). Quick Launch: ~/.config/firox/quicklaunch (see
 firox-quicklaunch).
 
 Exits with status 3 if it can't run here (no layer-shell or window list
@@ -80,6 +82,7 @@ FA_MUTED = ""
 FA_BATTERY = ("", "", "", "", "")
 FA_CHARGING = ""
 FA_BELL, FA_BELL_OFF = "", ""
+FA_MOON = ""
 
 QUICK_LAUNCH = os.path.join(CONFIG, "quicklaunch")
 QL_DEFAULTS = ["firox:show-desktop", "org.mozilla.firefox.desktop", "firox:computer"]
@@ -89,7 +92,8 @@ QL_BUILTIN = {
     "firox:computer": ("system-file-manager", ["firox-open", "computer"], "Computer"),
 }
 SETTING_DEFAULTS = {"GROUP": "1", "AUTOHIDE": "0", "QUICKLAUNCH": "1", "SECONDS": "0",
-                    "ALL_DISPLAYS": "1"}
+                    "ALL_DISPLAYS": "1", "BATTERY_PERCENT": "1", "SECURITY": "1",
+                    "NIGHTLIGHT": "1"}
 
 
 # --------------------------------------------------------------- helpers --
@@ -1095,6 +1099,7 @@ class Indicator:
     def __init__(self, name):
         self.name = name
         self.text = ""
+        self.extra = ""           # shown after the text, in the normal font (the battery's %)
         self.icon = None          # a symbolic icon name, shown instead of / before the text
         self.tip = ""
         self.classes = set()
@@ -1111,8 +1116,12 @@ class Indicator:
         btn.firox_image.set_no_show_all(True)
         btn.firox_label = Gtk.Label()
         btn.firox_label.set_no_show_all(True)
+        btn.firox_extra = Gtk.Label()
+        btn.firox_extra.set_name("indicator-extra")
+        btn.firox_extra.set_no_show_all(True)
         box.pack_start(btn.firox_image, False, False, 0)
         box.pack_start(btn.firox_label, False, False, 0)
+        box.pack_start(btn.firox_extra, False, False, 0)
         box.show()
         btn.add(box)
         btn.add_events(Gdk.EventMask.SCROLL_MASK)
@@ -1123,7 +1132,9 @@ class Indicator:
         self.paint(btn)
         return btn
 
-    def set(self, text=None, tip=None, classes=None, visible=None, icon=None):
+    def set(self, text=None, tip=None, classes=None, visible=None, icon=None, extra=None):
+        if extra is not None:
+            self.extra = extra
         if icon is not None:
             self.icon = icon or None
         if text is not None:
@@ -1140,6 +1151,8 @@ class Indicator:
     def paint(self, btn):
         btn.firox_label.set_text(self.text)
         btn.firox_label.set_visible(bool(self.text))
+        btn.firox_extra.set_text(self.extra)
+        btn.firox_extra.set_visible(bool(self.extra))
         if self.icon:
             btn.firox_image.set_from_icon_name(self.icon, Gtk.IconSize.MENU)
             btn.firox_image.set_pixel_size(16)
@@ -1294,7 +1307,8 @@ class Battery(Indicator):
         cls = ["critical"] if pct <= 10 and not plugged else ["warning"] if pct <= 20 and not plugged else []
         glyph = FA_CHARGING if charging else FA_BATTERY[min(4, pct * 5 // 101)]
         self.set(glyph, tip + "\nClick for battery, brightness and power mode",
-                 cls + (["charging"] if charging else []), True)
+                 cls + (["charging"] if charging else []), True,
+                 extra=f"{pct}%" if setting("BATTERY_PERCENT") else "")
 
     def time_left(self, bats, charging):
         now = full = rate = 0
@@ -1504,6 +1518,106 @@ class Updates(Indicator):
 
     def right(self):
         spawn(["firox-updates", "whatsnew"])
+
+
+class Security(Indicator):
+    """Security Center's shield: dim when everything's fine, lit (yellow or
+    red) when something needs your attention. firox-security writes its
+    findings to security-status.json; this checks every 10 minutes."""
+
+    STATUS = os.path.join(STATE, "security-status.json")
+    # One shield, coloured by the theme (#security.ok/.warn/.bad): Papirus'
+    # medium and low shields mark their paths "warning"/"error", which GTK
+    # paints from its own palette instead of the theme's colours
+    ICONS = {"ok": "security-high-symbolic", "warn": "security-high-symbolic",
+             "bad": "security-high-symbolic"}
+
+    def __init__(self):
+        super().__init__("security")
+        self.set(visible=False)
+        self.mtime = 0
+        os.makedirs(STATE, exist_ok=True)
+        self.mon = Gio.File.new_for_path(STATE).monitor_directory(Gio.FileMonitorFlags.NONE, None)
+        self.mon.connect("changed", lambda _m, f, _o, _e: f.get_basename() == "security-status.json"
+                         and self.show())
+        self.show()
+        GLib.timeout_add_seconds(25, lambda: self.check() and False)
+        GLib.timeout_add_seconds(600, lambda: self.check() or True)
+
+    def check(self):
+        if not setting("SECURITY"):
+            self.set(visible=False)
+            return False
+        try:
+            proc = Gio.Subprocess.new(["firox-security", "tray"], Gio.SubprocessFlags.STDOUT_SILENCE
+                                      | Gio.SubprocessFlags.STDERR_SILENCE)
+            proc.wait_async(None, lambda *_a: self.show())
+        except GLib.Error:
+            pass
+        return False
+
+    def show(self):
+        if not setting("SECURITY"):
+            self.set(visible=False)
+            return False
+        try:
+            with open(self.STATUS) as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            return False
+        state = data.get("state", "ok")
+        items = data.get("items") or []
+        if items:
+            tip = "Security Center: " + data.get("headline", "") + "\n" + \
+                  "\n".join(f"• {i}" for i in items) + "\nClick to open Security Center"
+        else:
+            tip = "Security Center: your computer is protected\nClick to open Security Center"
+        self.set(text="", icon=self.ICONS.get(state, self.ICONS["ok"]), tip=tip,
+                 classes=[state if state in self.ICONS else "ok"], visible=True)
+        return False
+
+    def left(self):
+        spawn(["firox-security"])
+
+    right = left
+
+
+class NightLight(Indicator):
+    """Night Light's moon: lit while the screen is warmer. Click to turn it
+    on or off now; right-click for its settings. firox-nightlight writes
+    nightlight-status.json."""
+
+    STATUS = os.path.join(STATE, "nightlight-status.json")
+
+    def __init__(self):
+        super().__init__("nightlight")
+        self.set(visible=False)
+        os.makedirs(STATE, exist_ok=True)
+        self.mon = Gio.File.new_for_path(STATE).monitor_directory(Gio.FileMonitorFlags.NONE, None)
+        self.mon.connect("changed", lambda _m, f, _o, _e: f.get_basename() == "nightlight-status.json"
+                         and self.update())
+        self.update()
+
+    def update(self):
+        if not setting("NIGHTLIGHT") or not GLib.find_program_in_path("wlsunset"):
+            self.set(visible=False)
+            return False
+        try:
+            with open(self.STATUS) as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            data = {"active": False, "tooltip": "Night Light is off"}
+        on = bool(data.get("active"))
+        self.set(FA_MOON, (data.get("tooltip") or "Night Light")
+                 + ("\nClick to turn it off. " if on else "\nClick to turn it on. ")
+                 + "Right-click for Night Light settings.", ["on" if on else "off"], True)
+        return False
+
+    def left(self):
+        spawn(["firox-nightlight", "toggle"])
+
+    def right(self):
+        spawn(["firox-control-panel", "nightlight"])
 
 
 class Bell(Indicator):
@@ -1830,8 +1944,11 @@ class Panel:
             cant_run(str(err))
         self.tray = Tray(self)
         self.clock = Clock(self.settings.get("SECONDS", "0") != "0")
-        self.indicators = [Awake(), Network(), Bluetooth(), Volume(), Battery(), Updates(), Bell(),
-                           self.clock]
+        self.battery = Battery()
+        self.security = Security()
+        self.nightlight = NightLight()
+        self.indicators = [Awake(), self.nightlight, Network(), Bluetooth(), Volume(), self.battery,
+                           self.security, Updates(), Bell(), self.clock]
 
         self.glass = None
         self.glass = GlassBackdrop(lambda: [b.queue_draw() for b in self.bars.values()])
@@ -1884,6 +2001,9 @@ class Panel:
                 self.grouping = grouping
                 self.refresh()
             self.clock.set_seconds(self.settings.get("SECONDS", "0") != "0")
+            self.battery.update()
+            self.security.check()
+            self.nightlight.update()
             for bar in self.bars.values():
                 bar.apply_settings()
             self.schedule_sync()            # ALL_DISPLAYS

@@ -72,6 +72,7 @@ PACKAGES=(
     slurp
     wl-clipboard
     cliphist                     # clipboard history (firox-clipboard, Super+V)
+    wlsunset                     # Night Light (firox-nightlight)
     brightnessctl
     playerctl
     tuned-ppd                    # power profiles (battery popup: Power saver/Balanced/Performance)
@@ -114,6 +115,8 @@ PACKAGES=(
     zenity                       # dialogs for shell scripts (zenity --info, --question, --file-selection...)
     rsync                        # Backup and Restore (firox-backup)
     syncthing                    # Sync between Firox computers (firox-sync)
+    clamav                       # Virus Scan (firox-virusscan): clamscan
+    clamav-freshclam             # ... and its virus definitions, kept up to date
 
     # --- Screen savers (Control Panel > Screen Saver) ---
     asciiquarium
@@ -214,6 +217,10 @@ done
 
 # Power profiles (tuned, with the power-profiles-daemon D-Bus API)
 systemctl enable tuned.service tuned-ppd.service
+
+# Virus definitions for Virus Scan: freshclam downloads them (about 200 MB
+# the first time) and checks for new ones every two hours
+systemctl enable clamav-freshclam.service
 
 ### ---------------------------------------------------------------------------
 ### 5. Branding

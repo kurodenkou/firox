@@ -1,0 +1,447 @@
+#!/usr/bin/python3
+"""
+firox-nightlight: Night Light. Warmer screen colours in the evening, which
+are easier on the eyes at night.
+
+    firox-nightlight daemon     at login: keep the screen's colours right
+                                (runs wlsunset when it's needed)
+    firox-nightlight toggle     on now / off now (the taskbar's moon); the
+                                schedule takes over again at the next sunrise
+                                or morning time
+    firox-nightlight on|off     the same, one way
+    firox-nightlight reload     pick up changed settings
+    firox-nightlight status     print the state (--json for the taskbar)
+
+Settings, ~/.config/firox/nightlight.conf (Settings > Night Light):
+    SCHEDULE=manual|sun|times   manual: only when you turn it on;
+                                sun: from sunset to sunrise;
+                                times: from FROM to TO
+    FROM=21:00  TO=07:00        for SCHEDULE=times
+    TEMP=4000                   warmth in kelvin (6500 is normal; lower is
+                                warmer)
+    LAT=  LON=                  for SCHEDULE=sun; empty: the Weather gadget's
+                                city, or else your time zone's main city
+
+The sunrise and sunset times are worked out on this computer (no internet
+needed). State: ~/.local/state/firox/nightlight.json (an on/off override
+and when it ends) and nightlight-status.json (for the taskbar).
+"""
+
+import datetime as dt
+import json
+import math
+import os
+import signal
+import subprocess
+import sys
+import time
+
+CONFIG = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "firox")
+STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "firox")
+CONF = os.path.join(CONFIG, "nightlight.conf")
+OVERRIDE = os.path.join(STATE_DIR, "nightlight.json")
+STATUS = os.path.join(STATE_DIR, "nightlight-status.json")
+RUNTIME = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
+PIDFILE = os.path.join(RUNTIME, "firox-nightlight.pid")
+DEFAULTS = {"SCHEDULE": "manual", "FROM": "21:00", "TO": "07:00", "TEMP": "4000", "LAT": "", "LON": ""}
+NORMAL = 6500
+FADE = 1800                     # seconds of fading for custom times
+
+
+# ---------------------------------------------------------------- settings --
+
+def kv(path):
+    out = {}
+    try:
+        with open(path) as fh:
+            for line in fh:
+                if "=" in line and not line.lstrip().startswith("#"):
+                    k, v = line.rstrip("\n").split("=", 1)
+                    out[k.strip()] = v.strip()
+    except OSError:
+        pass
+    return out
+
+
+def load_conf():
+    conf = dict(DEFAULTS)
+    conf.update(kv(CONF))
+    return conf
+
+
+def save_conf(conf):
+    os.makedirs(CONFIG, exist_ok=True)
+    tmp = CONF + ".tmp"
+    with open(tmp, "w") as fh:
+        fh.write("# Night Light (firox-nightlight; Settings > Night Light)\n")
+        for k in DEFAULTS:
+            fh.write(f"{k}={conf.get(k, DEFAULTS[k])}\n")
+    os.replace(tmp, CONF)
+
+
+def temp(conf):
+    try:
+        return max(1500, min(6000, int(conf.get("TEMP") or 4000)))
+    except ValueError:
+        return 4000
+
+
+def hhmm(s, default):
+    try:
+        h, m = (int(x) for x in s.split(":"))
+        if 0 <= h < 24 and 0 <= m < 60:
+            return h, m
+    except (ValueError, AttributeError):
+        pass
+    return default
+
+
+def clock(h, m):
+    """9:00 PM"""
+    return f"{(h % 12) or 12}:{m:02d} {'AM' if h < 12 else 'PM'}"
+
+
+def clock_ts(ts):
+    t = time.localtime(ts)
+    return clock(t.tm_hour, t.tm_min)
+
+
+# ---------------------------------------------------------------- location --
+
+def timezone():
+    tz = os.environ.get("TZ", "").lstrip(":")
+    if tz:
+        return tz
+    try:
+        link = os.readlink("/etc/localtime")
+        return link.split("zoneinfo/", 1)[1]
+    except (OSError, IndexError):
+        return ""
+
+
+def tz_coords(tz):
+    """The time zone's main city, from zone1970.tab: (lat, lon) or None."""
+    for tab in ("/usr/share/zoneinfo/zone1970.tab", "/usr/share/zoneinfo/zone.tab"):
+        try:
+            with open(tab) as fh:
+                for line in fh:
+                    parts = line.split("\t")
+                    if len(parts) >= 3 and parts[2].strip() == tz:
+                        return parse_iso6709(parts[1])
+        except OSError:
+            continue
+    return None
+
+
+def parse_iso6709(s):
+    """+4043-07400 or +404251-0740023 -> (40.72, -74.0)"""
+    i = max(s.rfind("+"), s.rfind("-"))
+    if i <= 0:
+        return None
+
+    def part(p, deg_digits):
+        sign = -1 if p[0] == "-" else 1
+        p = p[1:]
+        d = int(p[:deg_digits])
+        m = int(p[deg_digits:deg_digits + 2])
+        sec = int(p[deg_digits + 2:deg_digits + 4] or 0)
+        return sign * (d + m / 60 + sec / 3600)
+    try:
+        return part(s[:i], 2), part(s[i:], 3)
+    except (ValueError, IndexError):
+        return None
+
+
+def location(conf):
+    """(lat, lon, where) for sunset and sunrise."""
+    try:
+        return float(conf["LAT"]), float(conf["LON"]), "your location"
+    except (KeyError, ValueError):
+        pass
+    gadgets = kv(os.path.join(CONFIG, "gadgets.conf"))
+    try:
+        return float(gadgets["LAT"]), float(gadgets["LON"]), gadgets.get("CITY") or "your Weather city"
+    except (KeyError, ValueError):
+        pass
+    tz = timezone()
+    c = tz_coords(tz) if tz else None
+    if c:
+        return c[0], c[1], tz.rsplit("/", 1)[-1].replace("_", " ")
+    return None
+
+
+# -------------------------------------------------------- sunrise / sunset --
+
+def sun_times(day, lat, lon):
+    """Sunrise and sunset on that date, as Unix times (NOAA's equations);
+    None for a polar day or night."""
+    n = day.timetuple().tm_yday
+    gamma = 2 * math.pi / 365 * (n - 1)
+    eqtime = 229.18 * (0.000075 + 0.001868 * math.cos(gamma) - 0.032077 * math.sin(gamma)
+                       - 0.014615 * math.cos(2 * gamma) - 0.040849 * math.sin(2 * gamma))
+    decl = (0.006918 - 0.399912 * math.cos(gamma) + 0.070257 * math.sin(gamma)
+            - 0.006758 * math.cos(2 * gamma) + 0.000907 * math.sin(2 * gamma)
+            - 0.002697 * math.cos(3 * gamma) + 0.00148 * math.sin(3 * gamma))
+    zenith = math.radians(90.833)
+    phi = math.radians(lat)
+    cos_ha = math.cos(zenith) / (math.cos(phi) * math.cos(decl)) - math.tan(phi) * math.tan(decl)
+    if not -1 <= cos_ha <= 1:
+        return None
+    ha = math.degrees(math.acos(cos_ha))
+    midnight = dt.datetime(day.year, day.month, day.day, tzinfo=dt.timezone.utc).timestamp()
+    rise = midnight + (720 - 4 * (lon + ha) - eqtime) * 60
+    sset = midnight + (720 - 4 * (lon - ha) - eqtime) * 60
+    return rise, sset
+
+
+def night_windows(conf, around):
+    """[(start, end)] Unix-time windows when the schedule says night, for the
+    days around `around`."""
+    sched = conf.get("SCHEDULE", "manual")
+    today = dt.date.fromtimestamp(around)
+    days = [today + dt.timedelta(days=d) for d in (-1, 0, 1, 2)]
+    out = []
+    if sched == "sun":
+        loc = location(conf)
+        if not loc:
+            return []
+        lat, lon, _where = loc
+        times = [sun_times(d, lat, lon) for d in days]
+        for a, b in zip(times, times[1:]):
+            if a and b:
+                out.append((a[1], b[0]))       # sunset to next sunrise
+    elif sched == "times":
+        fh, fm = hhmm(conf.get("FROM"), (21, 0))
+        th, tm = hhmm(conf.get("TO"), (7, 0))
+        for d in days:
+            start = dt.datetime(d.year, d.month, d.day, fh, fm).timestamp()
+            end = dt.datetime(d.year, d.month, d.day, th, tm).timestamp()
+            if end <= start:
+                end += 86400
+            out.append((start, end))
+    return out
+
+
+def scheduled_night(conf, now):
+    """(is it night by the schedule, when that changes)"""
+    wins = night_windows(conf, now)
+    for s, e in wins:
+        if s <= now < e:
+            return True, e
+    upcoming = [s for s, _e in wins if s > now]
+    return False, min(upcoming) if upcoming else 0
+
+
+# ----------------------------------------------------------- the decision --
+
+def load_override():
+    try:
+        with open(OVERRIDE) as fh:
+            o = json.load(fh)
+        if o.get("until", 0) and o["until"] <= time.time():
+            return {}
+        return o
+    except (OSError, ValueError):
+        return {}
+
+
+def save_override(state, until):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(OVERRIDE, "w") as fh:
+        json.dump({"state": state, "until": until}, fh)
+
+
+def plan(conf=None, now=None):
+    """(wlsunset arguments or None, warm now, tooltip)"""
+    conf = conf or load_conf()
+    now = now or time.time()
+    t = temp(conf)
+    sched = conf.get("SCHEDULE", "manual")
+    night, change = scheduled_night(conf, now)
+    o = load_override()
+    if o.get("state") == "on":
+        until = o.get("until", 0)
+        return (["wlsunset", "-t", str(t), "-T", str(t + 1)], True,
+                "Night Light is on" + (f" until {clock_ts(until)}" if until else ""))
+    if o.get("state") == "off":
+        until = o.get("until", 0)
+        return None, False, "Night Light is off" + (f" until {clock_ts(until)}" if until else "")
+    if sched == "manual":
+        return None, False, "Night Light is off"
+    if sched == "sun":
+        loc = location(conf)
+        if not loc:
+            return None, False, "Night Light: couldn't work out sunset here (set a location)"
+        lat, lon, _where = loc
+        args = ["wlsunset", "-t", str(t), "-T", str(NORMAL), "-l", f"{lat:.3f}", "-L", f"{lon:.3f}"]
+        what = "sunrise" if night else "sunset"
+    else:
+        fh, fm = hhmm(conf.get("FROM"), (21, 0))
+        th, tm = hhmm(conf.get("TO"), (7, 0))
+        args = ["wlsunset", "-t", str(t), "-T", str(NORMAL), "-s", f"{fh:02d}:{fm:02d}",
+                "-S", f"{th:02d}:{tm:02d}", "-d", str(FADE)]
+        what = "morning" if night else "evening"
+    when = f" ({what} at {clock_ts(change)})" if change else ""
+    return args, night, ("Night Light is on" if night else "Night Light is scheduled") + when
+
+
+def write_status(warm, tip):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = STATUS + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump({"active": warm, "tooltip": tip, "schedule": load_conf().get("SCHEDULE")}, fh)
+    os.replace(tmp, STATUS)
+
+
+# --------------------------------------------------------------- commands --
+
+def poke():
+    """Ask the running daemon to look again; start one if there's none."""
+    try:
+        with open(PIDFILE) as fh:
+            os.kill(int(fh.read().strip()), signal.SIGUSR1)
+            return
+    except (OSError, ValueError):
+        pass
+    subprocess.Popen([sys.argv[0], "daemon"], start_new_session=True,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def toggle(want=None):
+    """Turn it on or off now, until the schedule next changes (or, with no
+    schedule, until it's turned off again)."""
+    conf = load_conf()
+    now = time.time()
+    _args, warm, _tip = plan(conf, now)
+    want = (not warm) if want is None else want
+    night, change = scheduled_night(conf, now)
+    if conf.get("SCHEDULE", "manual") == "manual":
+        if want:
+            save_override("on", 0)
+        else:
+            save_override("", 0)
+    elif want == night:
+        save_override("", 0)             # back to the schedule
+    else:
+        # on during the day: until the end of the coming night;
+        # off during the night: until the morning
+        if want:
+            wins = [w for w in night_windows(conf, now) if w[1] > now]
+            until = wins[0][1] if wins else now + 12 * 3600
+        else:
+            until = change or now + 8 * 3600
+        save_override("on" if want else "off", until)
+    poke()
+    return 0
+
+
+def daemon():
+    if not shutil_which("wlsunset"):
+        print("firox-nightlight: wlsunset isn't installed", file=sys.stderr)
+        write_status(False, "Night Light needs wlsunset")
+        return 1
+    try:                                  # one daemon per session
+        with open(PIDFILE) as fh:
+            other = int(fh.read().strip())
+        if other != os.getpid():
+            os.kill(other, 0)
+            print("firox-nightlight: already running", file=sys.stderr)
+            return 0
+    except (OSError, ValueError):
+        pass
+    with open(PIDFILE, "w") as fh:
+        fh.write(str(os.getpid()))
+    child = {"proc": None, "args": None}
+    failed = {"until": 0, "why": ""}      # wlsunset quit by itself: wait before trying again
+    wake = {"now": False}
+
+    def stop_child():
+        p = child["proc"]
+        if p and p.poll() is None:
+            p.terminate()
+            try:
+                p.wait(5)
+            except subprocess.TimeoutExpired:
+                p.kill()
+        child["proc"], child["args"] = None, None
+
+    def on_signal(signum, _frame):
+        if signum == signal.SIGUSR1:
+            wake["now"] = True
+        else:
+            stop_child()
+            try:
+                os.unlink(PIDFILE)
+            except OSError:
+                pass
+            sys.exit(0)
+    signal.signal(signal.SIGUSR1, on_signal)
+    signal.signal(signal.SIGTERM, on_signal)
+    signal.signal(signal.SIGINT, on_signal)
+    last_status = None
+    while True:
+        args, warm, tip = plan()
+        p = child["proc"]
+        if p is not None and p.poll() is not None and args == child["args"]:
+            why = (p.stderr.read().decode(errors="replace").strip().splitlines() or [""])[-1] if p.stderr else ""
+            print(f"firox-nightlight: wlsunset stopped: {why}", file=sys.stderr)
+            failed["until"], failed["why"] = time.time() + 300, why
+            child["proc"] = None
+        alive = child["proc"] is not None and child["proc"].poll() is None
+        if args and not alive and args == child["args"] and time.time() < failed["until"]:
+            warm = False
+            tip = "Night Light doesn't work with this display" + (f" ({failed['why']})" if failed["why"] else "")
+        elif args != child["args"] or (args and not alive):
+            stop_child()
+            failed["until"] = 0
+            if args:
+                try:
+                    child["proc"] = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                    child["args"] = args
+                except OSError as err:
+                    tip = f"Night Light couldn't start wlsunset: {err}"
+        if (warm, tip) != last_status:
+            write_status(warm, tip)
+            last_status = (warm, tip)
+        for _ in range(30):               # look again every 30 s, or when poked
+            if wake["now"]:
+                break
+            time.sleep(1)
+        wake["now"] = False
+
+
+def shutil_which(cmd):
+    from shutil import which
+    return which(cmd)
+
+
+def status(as_json):
+    args, warm, tip = plan()
+    if as_json:
+        print(json.dumps({"active": warm, "tooltip": tip}))
+    else:
+        print(tip)
+        if args:
+            print("runs:", " ".join(args))
+    return 0
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
+    if cmd == "daemon":
+        return daemon()
+    if cmd == "toggle":
+        return toggle()
+    if cmd in ("on", "off"):
+        return toggle(cmd == "on")
+    if cmd == "reload":
+        poke()
+        return 0
+    if cmd == "status":
+        return status("--json" in sys.argv)
+    print(__doc__.strip())
+    return 0 if cmd in ("-h", "--help") else 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

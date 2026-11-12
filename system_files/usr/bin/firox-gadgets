@@ -13,7 +13,8 @@ screen, on the desktop behind your windows.
 Gadgets: Clock, Calendar, CPU Meter, Weather (Open-Meteo: free, no account),
 Slide Show (your Pictures folder), Notes, Now Playing (any MPRIS music or
 video player), Network Meter, Feed Headlines (RSS/Atom), Timer, Picture
-Puzzle, Currency (ECB rates via frankfurter.app, no account) and Disk Space. Hover over a gadget for its ×;
+Puzzle, Currency (ECB rates via frankfurter.app, no account), Stocks (Yahoo
+Finance's public chart feed, no account; delayed quotes) and Disk Space. Hover over a gadget for its ×;
 right-click for Options, Remove, Add Gadgets and Hide.
 
 Settings: ~/.config/firox/gadgets.conf (also Settings > Taskbar).
@@ -56,7 +57,8 @@ NOTES = os.path.join(CONFIG, "gadget-notes.txt")
 DEFAULTS = {"ENABLED": "1", "GADGETS": "clock,calendar,cpu,weather",
             "CITY": "", "LAT": "", "LON": "", "UNITS": "C", "PICTURES": "",
             "FEED": "https://feeds.bbci.co.uk/news/world/rss.xml", "TIMER_MINUTES": "5",
-            "CURRENCY_FROM": "USD", "CURRENCY_TO": "EUR", "CURRENCY_AMOUNT": "1"}
+            "CURRENCY_FROM": "USD", "CURRENCY_TO": "EUR", "CURRENCY_AMOUNT": "1",
+            "STOCKS": "^GSPC,^DJI,^IXIC,AAPL,MSFT"}
 WIDTH = 170          # Sidebar gadget width
 SIDEBAR = WIDTH + 24
 
@@ -146,6 +148,7 @@ class Gadget(Gtk.EventBox):
     TITLE = ""
     DESCRIPTION = ""
     ICON = "application-x-executable"
+    ICON_FALLBACK = "application-x-executable"   # when the icon theme lacks ICON
     HEIGHT = 150
     INTERVAL = 0              # seconds between redraws (0: none)
 
@@ -1460,6 +1463,234 @@ class Currency(Gadget):
         return True
 
 
+# Quotes from Yahoo Finance's public chart feed (no account; delayed ~15 min)
+YAHOO = os.environ.get("FIROX_YAHOO_FINANCE", "https://query1.finance.yahoo.com").rstrip("/")
+
+
+def right_text(cr, s, x, y, size, rgba=(1, 1, 1, 1), bold=False):
+    """text() ending at x."""
+    import cairo
+    cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL,
+                        cairo.FONT_WEIGHT_BOLD if bold else cairo.FONT_WEIGHT_NORMAL)
+    cr.set_font_size(size)
+    return text(cr, s, x - cr.text_extents(s).x_advance, y, size, rgba, bold)
+
+
+class Stocks(Gadget):
+    KEY, TITLE, ICON = "stocks", "Stocks", "com.bitstower.Markets"   # Papirus: a stock chart
+    ICON_FALLBACK = "office-chart-line"
+    DESCRIPTION = "Prices of the stocks, funds, indexes and cryptocurrencies you follow, with today's chart."
+    ROW = 34
+    MAX = 8
+
+    def __init__(self, sidebar):
+        self.quotes = {}         # symbol -> dict (price, prev, name, points, currency)
+        self.errors = {}         # symbol -> message
+        self.updated = 0
+        self.rows = []           # [(y0, y1, symbol)] for clicks
+        super().__init__(sidebar)
+        self.area.set_size_request(WIDTH, self.height())
+        self.fetch()
+        self.timer = GLib.timeout_add_seconds(300, lambda: self.fetch() or True)
+
+    def symbols(self):
+        raw = self.sidebar.conf.get("STOCKS", DEFAULTS["STOCKS"])
+        out = []
+        for sym in raw.replace(";", ",").replace(" ", ",").split(","):
+            sym = sym.strip().upper()
+            if sym and sym not in out:
+                out.append(sym)
+        return out[:self.MAX]
+
+    def height(self):
+        return 30 + self.ROW * max(1, len(self.symbols())) + 20
+
+    def fetch(self):
+        syms = self.symbols()
+        names = {sym: q["name"] for sym, q in self.quotes.items()}
+        missing = {sym for sym, err in self.errors.items() if err == "Not found"}   # until Options
+
+        def chart(sym):
+            """One symbol's quote, with its name (Yahoo's chart feed)."""
+            data = fetch_json(f"{YAHOO}/v8/finance/chart/{urllib.parse.quote(sym)}?"
+                              + urllib.parse.urlencode({"range": "1d", "interval": "5m"}))
+            res = (data.get("chart") or {}).get("result") or []
+            if not res:
+                raise ValueError("no such symbol")
+            meta = res[0]["meta"]
+            closes = []
+            for q in (res[0].get("indicators") or {}).get("quote") or [{}]:
+                closes = [c for c in (q.get("close") or []) if c is not None]
+            price = meta.get("regularMarketPrice")
+            if price is None and closes:
+                price = closes[-1]
+            if price is None:
+                raise ValueError("no price")
+            return {"price": float(price),
+                    "prev": meta.get("chartPreviousClose") or meta.get("previousClose"),
+                    "name": meta.get("shortName") or meta.get("longName") or sym,
+                    "points": closes}
+
+        def work():
+            quotes, errors = {}, {}
+            # Names come from the chart feed, once per symbol; after that one
+            # "spark" request updates every symbol at once, which keeps well
+            # inside Yahoo's rate limits
+            for sym in syms:
+                if sym in names or sym in missing:
+                    continue
+                try:
+                    quotes[sym] = chart(sym)
+                except Exception as e:  # noqa: BLE001
+                    errors[sym] = "Not found" if "404" in str(e) or "symbol" in str(e) else "Can't update"
+                    print(f"gadgets: stocks: {sym}: {e}", file=sys.stderr)
+            known = [sym for sym in syms if sym in names]
+            if known:
+                try:
+                    data = fetch_json(f"{YAHOO}/v8/finance/spark?" + urllib.parse.urlencode(
+                        {"symbols": ",".join(known), "range": "1d", "interval": "5m"}))
+                    for sym in known:
+                        d = data.get(sym) or {}
+                        closes = [c for c in (d.get("close") or []) if c is not None]
+                        if not closes:
+                            raise ValueError(f"nothing for {sym}")
+                        quotes[sym] = {"price": float(closes[-1]),
+                                       "prev": d.get("chartPreviousClose") or d.get("previousClose"),
+                                       "name": names[sym], "points": closes}
+                except Exception as e:  # noqa: BLE001
+                    for sym in known:
+                        if sym not in quotes:
+                            errors[sym] = "Can't update"
+                    print(f"gadgets: stocks: {e}", file=sys.stderr)
+            GLib.idle_add(self.got, quotes, errors)
+        threading.Thread(target=work, daemon=True).start()
+
+    def got(self, quotes, errors):
+        # Keep the last good quote when an update fails (offline for a moment)
+        for sym, q in quotes.items():
+            self.quotes[sym] = q
+            self.errors.pop(sym, None)
+        for sym, err in errors.items():
+            if sym not in self.quotes or err == "Not found":
+                self.quotes.pop(sym, None)
+                self.errors[sym] = err
+        if quotes:
+            self.updated = time.time()
+        self.area.queue_draw()
+        return False
+
+    @staticmethod
+    def price_text(v):
+        if v >= 10000:
+            return f"{v:,.0f}"
+        if v >= 1:
+            return f"{v:,.2f}"
+        return f"{v:.4f}"
+
+    def sparkline(self, cr, pts, prev, x, y, w, h, rgb):
+        vals = list(pts) + ([prev] if prev else [])
+        lo, hi = min(vals), max(vals)
+        span = (hi - lo) or 1
+        if prev:                      # yesterday's close, dotted
+            py = y + h - (prev - lo) / span * h
+            cr.set_source_rgba(1, 1, 1, 0.3)
+            cr.set_line_width(1)
+            cr.set_dash([2, 2])
+            cr.move_to(x, py)
+            cr.line_to(x + w, py)
+            cr.stroke()
+            cr.set_dash([])
+        n = len(pts)
+        cr.new_path()
+        for i, v in enumerate(pts):
+            px = x + (i / (n - 1) * w if n > 1 else w)
+            cr.line_to(px, y + h - (v - lo) / span * h)
+        cr.set_source_rgb(*rgb)
+        cr.set_line_width(1.3)
+        cr.stroke()
+
+    def draw(self, cr, w, h):
+        h = self.height()
+        glass(cr, 4, 4, w - 8, h - 8, top=(0.16, 0.24, 0.36), bottom=(0.03, 0.06, 0.12))
+        text(cr, "Stocks", 12, 22, 10, bold=True, rgba=(0.9, 0.94, 1, 1))
+        self.rows = []
+        y = 28
+        syms = self.symbols()
+        if not syms:
+            text(cr, "Right-click → Options", w / 2, y + 20, 10, center=True)
+        for sym in syms:
+            q = self.quotes.get(sym)
+            label = q["name"] if q and sym.startswith("^") else sym
+            text(cr, fit_text(cr, label, 10, 62, True), 12, y + 13, 10, bold=True)
+            if q is None:
+                right_text(cr, self.errors.get(sym, "Loading…"), w - 12, y + 13, 9,
+                           rgba=(0.85, 0.88, 0.95, 1))
+            else:
+                prev = q["prev"]
+                change = (q["price"] - prev) / prev * 100 if prev else 0.0
+                up = change >= 0
+                rgb = (0.35, 0.85, 0.4) if up else (1.0, 0.4, 0.35)
+                right_text(cr, self.price_text(q["price"]), w - 12, y + 13, 10, bold=True)
+                ext = right_text(cr, f"{abs(change):.2f}%", w - 12, y + 27, 9, rgba=(*rgb, 1))
+                tx, ty = w - 12 - ext.x_advance - 9, y + 23   # a small ▲ or ▼, drawn
+                cr.new_path()
+                if up:
+                    cr.move_to(tx, ty + 3)
+                    cr.line_to(tx + 6, ty + 3)
+                    cr.line_to(tx + 3, ty - 3)
+                else:
+                    cr.move_to(tx, ty - 3)
+                    cr.line_to(tx + 6, ty - 3)
+                    cr.line_to(tx + 3, ty + 3)
+                cr.close_path()
+                cr.set_source_rgb(*rgb)
+                cr.fill()
+                sub = sym if sym.startswith("^") else q["name"]
+                text(cr, fit_text(cr, sub, 8, 58), 12, y + 26, 8, rgba=(0.75, 0.8, 0.9, 1))
+                if len(q["points"]) > 1:
+                    self.sparkline(cr, q["points"], prev, 74, y + 6, 32, 20, rgb)
+            self.rows.append((y, y + self.ROW, sym))
+            y += self.ROW
+            if sym != syms[-1]:
+                cr.set_source_rgba(1, 1, 1, 0.12)
+                cr.rectangle(12, y - 3, w - 24, 1)
+                cr.fill()
+        foot = "Delayed quotes"
+        if self.updated:
+            t = time.localtime(self.updated)
+            foot += f" · {(t.tm_hour % 12) or 12}:{t.tm_min:02d} {'AM' if t.tm_hour < 12 else 'PM'}"
+        text(cr, foot, w / 2, h - 13, 8, rgba=(0.75, 0.82, 0.95, 1), center=True)
+
+    def clicked_at(self, x, y):
+        for y0, y1, sym in self.rows:
+            if y0 <= y < y1:
+                try:
+                    Gio.AppInfo.launch_default_for_uri(
+                        f"https://finance.yahoo.com/quote/{urllib.parse.quote(sym)}", None)
+                except GLib.Error as err:
+                    print(f"gadgets: {err.message}", file=sys.stderr)
+                return True
+        return True
+
+    def options(self):
+        conf = self.sidebar.conf
+        val = ask_value("Stocks Options", "Symbols to follow, separated by commas:",
+                        ", ".join(self.symbols()),
+                        "Ticker symbols as Yahoo Finance writes them: AAPL, MSFT, VOO; indexes "
+                        "^GSPC (S&amp;P 500), ^DJI (Dow), ^IXIC (Nasdaq); other markets with a suffix, "
+                        "like SHEL.L (London) or 7203.T (Tokyo); crypto like BTC-USD. "
+                        f"Up to {self.MAX}. Click a stock in the gadget to see it on Yahoo Finance.")
+        if val is None:
+            return True
+        conf["STOCKS"] = val
+        save_conf(conf)
+        self.quotes, self.errors, self.updated = {}, {}, 0
+        self.area.set_size_request(WIDTH, self.height())
+        self.area.queue_draw()
+        self.fetch()
+        return True
+
+
 class DiskSpace(Gadget):
     KEY, TITLE, ICON = "disks", "Disk Space", "drive-harddisk"
     DESCRIPTION = "How full your home drive and any plugged-in drives are."
@@ -1537,7 +1768,7 @@ class DiskSpace(Gadget):
 
 
 GADGETS = [Clock, Calendar, CpuMeter, Weather, SlideShow, Notes, NowPlaying, NetworkMeter,
-           Headlines, Timer, PicturePuzzle, Currency, DiskSpace]
+           Headlines, Timer, PicturePuzzle, Currency, Stocks, DiskSpace]
 BY_KEY = {g.KEY: g for g in GADGETS}
 
 
@@ -1750,7 +1981,8 @@ class Sidebar(Gtk.Window):
             tile = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
             tile.set_border_width(6)
             tile.firox_key = cls.KEY
-            img = Gtk.Image.new_from_icon_name(cls.ICON, Gtk.IconSize.DIALOG)
+            icon = cls.ICON if Gtk.IconTheme.get_default().has_icon(cls.ICON) else cls.ICON_FALLBACK
+            img = Gtk.Image.new_from_icon_name(icon, Gtk.IconSize.DIALOG)
             img.set_pixel_size(56)
             tile.pack_start(img, False, False, 0)
             lab = Gtk.Label(label=cls.TITLE)

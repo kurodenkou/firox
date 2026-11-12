@@ -83,8 +83,16 @@ ALIASES = {
     "sysdm.cpl": [["firox-control-panel", "system"]],
     "timedate.cpl": [["firox-control-panel", "datetime"]],
     "diskmgmt.msc": [["gnome-disks"]],
-    "devmgmt.msc": [["firox-control-panel", "system"]],
+    "devmgmt.msc": [["firox-devmgmt"]],
+    "hdwwiz.cpl": [["firox-devmgmt"]],
+    "cleanmgr": [["firox-cleanmgr"]],
+    "windowsdefender:": [["firox-virusscan"]],
+    "antivirus": [["firox-virusscan"]],
     "rstrui": [["firox-restore"]],
+    "eventvwr": [["firox-eventvwr"]],
+    "eventvwr.msc": [["firox-eventvwr"]],
+    "wscui.cpl": [["firox-security"]],
+    "firewall.cpl": [["firox-security"]],
 }
 
 # Programs that only make sense in a terminal window

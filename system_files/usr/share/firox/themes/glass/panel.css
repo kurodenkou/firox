@@ -109,7 +109,7 @@ button.quick-launch:hover {
 #notification-area button:hover { background-color: rgba(255, 255, 255, 0.6); }
 #tray button { padding: 0 3px; }
 #idle_inhibitor label, #pulseaudio label, #battery label,
-#custom-updates label, #custom-notifications label {
+#custom-updates label, #custom-notifications label, #nightlight label {
     font-family: "Font Awesome 6 Free";
     font-weight: 900;
 }
@@ -124,3 +124,17 @@ button.quick-launch:hover {
 
 #custom-notifications.read, #custom-notifications.dnd { color: #6e6e73; }
 #custom-updates.pending { color: #0a64d6; }
+
+/* the battery's percentage: normal text after the icon */
+#battery #indicator-extra { font-family: sans-serif; font-weight: normal; margin-left: 2px; }
+
+/* Security Center's shield (firox-security): dim when everything's fine,
+   lit when something needs your attention */
+#security { padding: 0 4px; }
+#security.ok { color: #8e8e93; }
+#security.warn { color: #b26a00; }
+#security.bad { color: #c41e1e; }
+
+/* Night Light's moon (firox-nightlight): lit while the screen is warmer */
+#nightlight.off { color: #8e8e93; }
+#nightlight.on { color: #c26a00; }

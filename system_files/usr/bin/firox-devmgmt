@@ -1,0 +1,591 @@
+#!/usr/bin/python3
+"""
+firox-devmgmt: Device Manager. Every device in the computer, by type, with
+the driver each one uses and any that have no driver.
+
+    firox-devmgmt           open Device Manager
+    firox-devmgmt list      print the devices (--problems: only those with
+                            a problem)
+
+Where it looks: lspci (PCI cards and chips, with their kernel drivers),
+/sys/bus/usb (USB devices and hubs), /proc/bus/input (keyboards, mice and
+other input), /proc/asound (sound), /sys/block (disks), /sys/class/net
+(network adapters), /sys/class/drm (connected monitors, named from their
+EDID), /proc/cpuinfo, /sys/class/power_supply, /sys/class/bluetooth,
+/sys/class/video4linux and the DMI firmware details.
+
+A device "has a problem" when it's the kind that needs a driver (graphics,
+network, sound, storage, USB, wireless) and none is bound to it; the
+Properties window can copy its hardware ID or search the web for a driver.
+"""
+
+import glob
+import os
+import re
+import socket
+import subprocess
+import sys
+import urllib.parse
+
+SYS = os.environ.get("FIROX_SYSFS", "/sys")
+ICON = "gnome-device-manager"
+PROC = os.environ.get("FIROX_PROCFS", "/proc")
+
+# (title, icon), in Windows' order
+CATEGORIES = {
+    "audio": ("Audio inputs and outputs", "audio-speakers"),
+    "battery": ("Batteries", "battery"),
+    "bluetooth": ("Bluetooth", "bluetooth"),
+    "camera": ("Cameras", "camera-web"),
+    "disk": ("Disk drives", "drive-harddisk"),
+    "display": ("Display adapters", "video-display"),
+    "dvd": ("DVD/CD-ROM drives", "drive-optical"),
+    "firmware": ("Firmware", "application-x-firmware"),
+    "hid": ("Human Interface Devices", "input-tablet"),
+    "keyboard": ("Keyboards", "input-keyboard"),
+    "monitor": ("Monitors", "video-display"),
+    "mouse": ("Mice and other pointing devices", "input-mouse"),
+    "network": ("Network adapters", "network-wired"),
+    "other": ("Other devices", "dialog-warning"),
+    "processor": ("Processors", "cpu"),
+    "sound": ("Sound, video and game controllers", "audio-card"),
+    "storage": ("Storage controllers", "drive-harddisk"),
+    "system": ("System devices", "computer"),
+    "usbctl": ("Universal Serial Bus controllers", "drive-removable-media-usb"),
+    "usb": ("USB devices", "drive-removable-media-usb"),
+}
+
+# PCI class (first two hex digits, or four) -> category
+PCI_CLASS = {"01": "storage", "02": "network", "03": "display", "04": "sound", "0c03": "usbctl",
+             "0d": "network", "0c": "system", "06": "system", "08": "system", "05": "system",
+             "07": "system", "09": "hid", "0a": "system", "0b": "processor", "10": "system",
+             "11": "system", "12": "system", "13": "system"}
+NEEDS_DRIVER = ("01", "02", "03", "04", "0c03", "0d")
+
+
+def read(path):
+    try:
+        with open(path, errors="replace") as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
+def run(argv, timeout=20):
+    try:
+        return subprocess.run(argv, capture_output=True, text=True, timeout=timeout).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def driver_of(path):
+    link = os.path.join(path, "driver")
+    return os.path.basename(os.path.realpath(link)) if os.path.islink(link) else ""
+
+
+def device(cat, name, **kw):
+    d = {"cat": cat, "name": name, "driver": "", "problem": "", "ids": "", "path": "", "maker": "",
+         "location": "", "details": []}
+    d.update(kw)
+    return d
+
+
+def strip_ids(s):
+    """'Intel Corporation [8086]' -> ('Intel Corporation', '8086')"""
+    m = re.match(r"^(.*?)\s*\[([0-9a-fA-F]{4,6})\]$", s or "")
+    return (m.group(1), m.group(2)) if m else (s or "", "")
+
+
+# ----------------------------------------------------------------- sources --
+
+def pci():
+    out = []
+    text = run(["lspci", "-vmm", "-nn", "-k", "-D"])
+    for block in text.split("\n\n"):
+        f = {}
+        for line in block.splitlines():
+            if ":\t" in line:
+                k, v = line.split(":\t", 1)
+                f[k] = v.strip()
+        if "Slot" not in f:
+            continue
+        cls_name, cls = strip_ids(f.get("Class", ""))
+        vendor, vid = strip_ids(f.get("Vendor", ""))
+        dev, did = strip_ids(f.get("Device", ""))
+        sub = cls[:4].lower()
+        cat = PCI_CLASS.get(sub) or PCI_CLASS.get(sub[:2], "system")
+        if sub == "0403":
+            cat = "sound"
+        elif sub[:2] == "04":
+            cat = "camera" if sub == "0400" else "sound"
+        drv = f.get("Driver", "")
+        problem = ""
+        if not drv and (sub in NEEDS_DRIVER or sub[:2] in NEEDS_DRIVER):
+            problem = "No driver is installed for this device."
+            cat = "other"
+        name = dev if dev and dev != "Device" and not dev.startswith("Device ") else f"{cls_name} ({vid}:{did})"
+        out.append(device(cat, name, maker=vendor, driver=drv, problem=problem,
+                          ids=f"PCI\\VEN_{vid.upper()}&DEV_{did.upper()}", vid=vid, did=did, bus="pci",
+                          path=os.path.join(SYS, "bus", "pci", "devices", f["Slot"]),
+                          location=f"PCI slot {f['Slot']}",
+                          details=[("Class", f"{cls_name} [{cls}]"), ("Revision", f.get("Rev", "")),
+                                   ("Subsystem", " ".join(x for x in (f.get("SVendor", ""), f.get("SDevice", ""))
+                                                          if x)),
+                                   ("Kernel modules", f.get("Module", ""))]))
+    return out
+
+
+def usb():
+    out = []
+    for path in sorted(glob.glob(os.path.join(SYS, "bus", "usb", "devices", "*"))):
+        base = os.path.basename(path)
+        if ":" in base or not os.path.exists(os.path.join(path, "idVendor")):
+            continue
+        vid, pid = read(os.path.join(path, "idVendor")), read(os.path.join(path, "idProduct"))
+        product = read(os.path.join(path, "product"))
+        maker = read(os.path.join(path, "manufacturer"))
+        dclass = read(os.path.join(path, "bDeviceClass"))
+        speed = read(os.path.join(path, "speed"))
+        ifaces = sorted(glob.glob(path + ":*"))
+        drivers = sorted({driver_of(i) for i in ifaces} - {""})
+        iclasses = {read(os.path.join(i, "bInterfaceClass")) for i in ifaces}
+        if dclass == "09" or base.startswith("usb"):
+            cat = "usbctl"
+            name = "USB Root Hub" + (f" ({speed} Mb/s)" if speed else "") if base.startswith("usb") else \
+                (product or "Generic USB Hub")
+        else:
+            # cameras and Bluetooth radios go in their own groups
+            cat = "camera" if "0e" in iclasses else "bluetooth" if "e0" in iclasses else "usb"
+            name = product or ("Bluetooth adapter" if cat == "bluetooth" else f"USB device ({vid}:{pid})")
+        out.append(device(cat, name, maker=maker, driver=", ".join(drivers),
+                          ids=f"USB\\VID_{vid.upper()}&PID_{pid.upper()}", vid=vid, did=pid, bus="usb",
+                          path=path, location=f"USB port {base}" + (f", {speed} Mb/s" if speed else ""),
+                          details=[("Interface classes", ", ".join(sorted(iclasses - {""}))),
+                                   ("Serial number", read(os.path.join(path, "serial")))]))
+    return out
+
+
+SYSTEM_INPUTS = re.compile(r"power button|sleep button|lid switch|video bus|pc speaker|hdmi|dp,pcm|"
+                           r"headphone|mic|line out|front|rear|speaker|wmi hotkeys|intel hid", re.I)
+
+
+def inputs():
+    out = []
+    for block in read(os.path.join(PROC, "bus", "input", "devices")).split("\n\n"):
+        name, handlers, phys, sysfs = "", "", "", ""
+        for line in block.splitlines():
+            if line.startswith("N: Name="):
+                name = line.split("=", 1)[1].strip('"')
+            elif line.startswith("H: Handlers="):
+                handlers = line.split("=", 1)[1]
+            elif line.startswith("P: Phys="):
+                phys = line.split("=", 1)[1]
+            elif line.startswith("S: Sysfs="):
+                sysfs = line.split("=", 1)[1]
+        if not name:
+            continue
+        h = handlers.split()
+        if "mouse0" in h or any(x.startswith("mouse") for x in h):
+            cat = "mouse"
+        elif "kbd" in h and not SYSTEM_INPUTS.search(name) and ("leds" in h or "sysrq" in h or
+                                                               "keyboard" in name.lower()):
+            cat = "keyboard"
+        elif SYSTEM_INPUTS.search(name):
+            cat = "system" if re.search(r"button|switch|video bus|speaker|wmi|hid", name, re.I) else "audio"
+            if cat == "audio":
+                continue                     # jack sensors: shown with the sound card
+        else:
+            cat = "hid"
+        path = os.path.join(SYS, sysfs.lstrip("/")) if sysfs else ""
+        out.append(device(cat, name, path=path, location=phys,
+                          driver=driver_of(os.path.join(path, "device")) if path else "",
+                          details=[("Handlers", handlers)]))
+    return out
+
+
+def sound():
+    out = []
+    for line in read(os.path.join(PROC, "asound", "cards")).splitlines():
+        m = re.match(r"\s*(\d+)\s+\[(\S+)\s*\]:\s*(\S+)\s+-\s+(.*)", line)
+        if m:
+            num, cid, drv, name = m.groups()
+            out.append(device("audio", name.strip(), driver=drv, location=f"ALSA card {num} ({cid})",
+                              path=os.path.join(SYS, "class", "sound", f"card{num}")))
+    return out
+
+
+def disks():
+    out = []
+    for path in sorted(glob.glob(os.path.join(SYS, "block", "*"))):
+        name = os.path.basename(path)
+        if re.match(r"(loop|ram|zram|dm-|md|nbd)", name):
+            continue
+        model = read(os.path.join(path, "device", "model")) or read(os.path.join(path, "device", "name"))
+        vendor = read(os.path.join(path, "device", "vendor"))
+        if re.fullmatch(r"0x[0-9a-fA-F]+", vendor):
+            vendor = ""                       # virtio and NVMe give a PCI ID here, not a name
+        if not model and name.startswith("vd"):
+            model = "Virtual disk"
+        try:
+            size = int(read(os.path.join(path, "size")) or 0) * 512
+        except ValueError:
+            size = 0
+        if size == 0 and not name.startswith("sr"):
+            continue
+        removable = read(os.path.join(path, "removable")) == "1"
+        gb = (f"{size / 1e12:.1f} TB" if size >= 1e12 else f"{size / 1e9:.0f} GB" if size >= 1e9
+              else f"{size / 1e6:.0f} MB") if size else ""
+        title = " ".join(x for x in (vendor, model) if x) or f"Disk {name}"
+        if model == "Virtual disk":
+            title = f"Virtual disk {name}"
+        cat = "dvd" if name.startswith("sr") else "disk"
+        out.append(device(cat, title + (f" ({gb})" if gb else ""), path=path,
+                          driver=driver_of(os.path.join(path, "device")),
+                          location=f"/dev/{name}" + (", removable" if removable else ""),
+                          details=[("Rotational", "yes" if read(os.path.join(path, "queue", "rotational")) == "1"
+                                    else "no (SSD)"), ("Firmware", read(os.path.join(path, "device", "rev"))
+                                                       or read(os.path.join(path, "device", "firmware_rev")))]))
+    return out
+
+
+def network(pci_devs):
+    out = []
+    by_slot = {os.path.basename(d["path"]): d for d in pci_devs if d.get("bus") == "pci"}
+    for path in sorted(glob.glob(os.path.join(SYS, "class", "net", "*"))):
+        iface = os.path.basename(path)
+        dev = os.path.join(path, "device")
+        if iface == "lo" or not os.path.exists(dev):
+            continue                          # virtual: bridges, VPNs, containers
+        real = os.path.realpath(dev)
+        slot = os.path.basename(real)
+        if slot in by_slot:
+            by_slot[slot]["details"].append(("Interface", iface))
+            by_slot[slot]["details"].append(("MAC address", read(os.path.join(path, "address"))))
+            continue                          # already listed from PCI
+        wireless = os.path.exists(os.path.join(path, "wireless"))
+        name = read(os.path.join(real, "product")) or read(os.path.join(real, "..", "product")) or \
+            (f"Wireless adapter ({iface})" if wireless else f"Network adapter ({iface})")
+        out.append(device("network", name, path=real, driver=driver_of(dev), location=iface,
+                          details=[("MAC address", read(os.path.join(path, "address")))]))
+    return out
+
+
+def edid_name(blob):
+    for i in range(54, 126, 18):
+        d = blob[i:i + 18]
+        if len(d) == 18 and d[0:3] == b"\0\0\0" and d[3] == 0xFC:
+            return d[5:].split(b"\n")[0].decode("ascii", "replace").strip()
+    if len(blob) >= 10:
+        code = (blob[8] << 8) | blob[9]
+        return "Monitor " + "".join(chr(((code >> s) & 31) + 64) for s in (10, 5, 0))
+    return ""
+
+
+def monitors():
+    out = []
+    for path in sorted(glob.glob(os.path.join(SYS, "class", "drm", "card*-*"))):
+        if read(os.path.join(path, "status")) != "connected":
+            continue
+        try:
+            with open(os.path.join(path, "edid"), "rb") as fh:
+                blob = fh.read()
+        except OSError:
+            blob = b""
+        conn = os.path.basename(path).split("-", 1)[1]
+        name = edid_name(blob) or "Generic monitor"
+        out.append(device("monitor", f"{name} ({conn})", path=path, location=conn,
+                          details=[("Modes", ", ".join(read(os.path.join(path, "modes")).splitlines()[:3]))]))
+    return out
+
+
+def processors():
+    names = re.findall(r"^model name\s*:\s*(.+)$", read(os.path.join(PROC, "cpuinfo")), re.M)
+    return [device("processor", re.sub(r"\s+", " ", n).strip(), driver="", location=f"CPU {i}")
+            for i, n in enumerate(names)]
+
+
+def batteries():
+    out = []
+    for path in sorted(glob.glob(os.path.join(SYS, "class", "power_supply", "*"))):
+        if read(os.path.join(path, "type")) != "Battery" or read(os.path.join(path, "scope")) == "Device":
+            continue
+        name = " ".join(x for x in (read(os.path.join(path, "manufacturer")), read(os.path.join(path, "model_name")))
+                        if x) or os.path.basename(path)
+        out.append(device("battery", f"Battery: {name}", path=path, location=os.path.basename(path),
+                          details=[("Technology", read(os.path.join(path, "technology"))),
+                                   ("Charge", read(os.path.join(path, "capacity")) + "%")]))
+    return out
+
+
+def bluetooth():
+    out = []
+    for path in sorted(glob.glob(os.path.join(SYS, "class", "bluetooth", "hci*"))):
+        if ":" in os.path.basename(path):
+            continue
+        dev = os.path.realpath(os.path.join(path, "device"))
+        if "/usb" in dev:
+            continue                          # listed with the USB devices
+        name = read(os.path.join(dev, "product")) or "Bluetooth adapter"
+        out.append(device("bluetooth", name, path=dev, driver=driver_of(os.path.join(path, "device")),
+                          location=os.path.basename(path)))
+    return out
+
+
+def cameras():
+    out = []
+    seen = set()
+    for path in sorted(glob.glob(os.path.join(SYS, "class", "video4linux", "video*"))):
+        name = read(os.path.join(path, "name"))
+        if not name or name in seen or "/usb" in os.path.realpath(os.path.join(path, "device")):
+            continue                          # USB cameras are listed with the USB devices
+        seen.add(name)
+        out.append(device("camera", name, path=path, driver=driver_of(os.path.join(path, "device")),
+                          location="/dev/" + os.path.basename(path)))
+    return out
+
+
+def firmware():
+    dmi = os.path.join(SYS, "class", "dmi", "id")
+    v = read(os.path.join(dmi, "bios_vendor"))
+    if not v:
+        return []
+    return [device("firmware", f"System firmware ({v})", maker=v,
+                   details=[("Version", read(os.path.join(dmi, "bios_version"))),
+                            ("Date", read(os.path.join(dmi, "bios_date"))),
+                            ("Board", " ".join(x for x in (read(os.path.join(dmi, "board_vendor")),
+                                                          read(os.path.join(dmi, "board_name"))) if x)),
+                            ("UEFI", "yes" if os.path.isdir(os.path.join(SYS, "firmware", "efi")) else "no")])]
+
+
+def all_devices():
+    p = pci()
+    devs = p + usb() + inputs() + sound() + disks() + network(p) + monitors() + processors() + \
+        batteries() + bluetooth() + cameras() + firmware()
+    return devs
+
+
+def driver_info(name):
+    """[(label, value)] about a kernel driver or module."""
+    if not name:
+        return []
+    mod = name.replace("-", "_")
+    rows = []
+    out = run(["modinfo", "-F", "description", mod]).strip()
+    if out:
+        rows.append(("Description", out))
+    ver = read(os.path.join(SYS, "module", mod, "version")) or run(["modinfo", "-F", "version", mod]).strip()
+    rows.append(("Version", ver or "(part of the kernel " + os.uname().release + ")"))
+    path = run(["modinfo", "-n", mod]).strip()
+    rows.append(("File", path or "built into the kernel"))
+    lic = run(["modinfo", "-F", "license", mod]).strip()
+    if lic:
+        rows.append(("License", lic))
+    return rows
+
+
+# --------------------------------------------------------------------- UI --
+
+def gui():
+    import gi
+    gi.require_version("Gtk", "3.0")
+    gi.require_version("Gdk", "3.0")
+    from gi.repository import Gdk, Gio, GLib, Gtk
+
+    class Props(Gtk.Dialog):
+        def __init__(self, parent, d):
+            super().__init__(title=f"{d['name']} Properties", transient_for=parent, modal=True)
+            self.set_default_size(520, 480)
+            self.add_button("_Close", Gtk.ResponseType.CLOSE)
+            nb = Gtk.Notebook()
+            self.get_content_area().pack_start(nb, True, True, 0)
+            cat_title, icon = CATEGORIES.get(d["cat"], ("", "computer"))
+
+            gen = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+            gen.set_border_width(12)
+            top = Gtk.Box(spacing=12)
+            img = Gtk.Image.new_from_icon_name("dialog-warning" if d["problem"] else icon, Gtk.IconSize.DIALOG)
+            top.pack_start(img, False, False, 0)
+            title = Gtk.Label(xalign=0, wrap=True, selectable=True)
+            title.set_markup(f"<b>{GLib.markup_escape_text(d['name'])}</b>")
+            top.pack_start(title, True, True, 0)
+            gen.pack_start(top, False, False, 0)
+            gen.pack_start(self.grid([("Device type", cat_title), ("Manufacturer", d.get("maker") or "—"),
+                                      ("Location", d.get("location") or "—")]), False, False, 0)
+            frame = Gtk.Frame(label="Device status")
+            status = Gtk.Label(xalign=0, yalign=0, wrap=True, selectable=True)
+            for side in ("start", "end", "top", "bottom"):
+                getattr(status, f"set_margin_{side}")(8)
+            status.set_text(d["problem"] + "\n\nIt may need a driver that isn't included in Linux, or "
+                            "firmware from the manufacturer. Search the web for its hardware ID below."
+                            if d["problem"] else "This device is working properly.")
+            frame.add(status)
+            gen.pack_start(frame, True, True, 0)
+            if d.get("ids"):
+                row = Gtk.Box(spacing=6)
+                copy = Gtk.Button(label="Copy hardware ID")
+                copy.connect("clicked", lambda _b: Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).set_text(
+                    f"{d.get('vid', '')}:{d.get('did', '')}", -1))
+                row.pack_start(copy, False, False, 0)
+                if d["problem"]:
+                    web = Gtk.Button(label="Search the web for a driver")
+                    q = urllib.parse.quote_plus(f"linux driver {d.get('vid', '')}:{d.get('did', '')} {d['name']}")
+                    web.connect("clicked", lambda _b: Gio.AppInfo.launch_default_for_uri(
+                        f"https://duckduckgo.com/?q={q}", None))
+                    row.pack_start(web, False, False, 0)
+                gen.pack_start(row, False, False, 0)
+            nb.append_page(gen, Gtk.Label(label="General"))
+
+            drv = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+            drv.set_border_width(12)
+            rows = [("Driver", d["driver"] or "none")] + driver_info(d["driver"].split(",")[0].strip())
+            drv.pack_start(self.grid(rows), False, False, 0)
+            nb.append_page(drv, Gtk.Label(label="Driver"))
+
+            det = [(k, v) for k, v in d.get("details", []) if v]
+            if d.get("ids"):
+                det.insert(0, ("Hardware ID", d["ids"]))
+            if d.get("path"):
+                det.append(("sysfs path", os.path.realpath(d["path"])))
+                for line in run(["udevadm", "info", "-q", "property", "-p", os.path.realpath(d["path"])]).splitlines():
+                    if "=" in line:
+                        k, v = line.split("=", 1)
+                        det.append((k, v))
+            store = Gtk.ListStore(str, str)
+            for k, v in det:
+                store.append([k, v])
+            view = Gtk.TreeView(model=store)
+            view.append_column(Gtk.TreeViewColumn("Property", Gtk.CellRendererText(), text=0))
+            view.append_column(Gtk.TreeViewColumn("Value", Gtk.CellRendererText(), text=1))
+            sw = Gtk.ScrolledWindow()
+            sw.set_border_width(8)
+            sw.add(view)
+            nb.append_page(sw, Gtk.Label(label="Details"))
+            self.show_all()
+
+        @staticmethod
+        def grid(rows):
+            g = Gtk.Grid(column_spacing=14, row_spacing=6)
+            for i, (k, v) in enumerate(rows):
+                g.attach(Gtk.Label(label=k + ":", xalign=0, yalign=0), 0, i, 1, 1)
+                g.attach(Gtk.Label(label=v, xalign=0, wrap=True, selectable=True, max_width_chars=48), 1, i, 1, 1)
+            return g
+
+    class Window(Gtk.ApplicationWindow):
+        def __init__(self, app):
+            super().__init__(application=app, title="Device Manager")
+            self.set_default_size(560, 640)
+            self.set_icon_name(ICON)
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+            self.add(box)
+            bar = Gtk.Box(spacing=6)
+            bar.set_border_width(6)
+            for label, icon, fn in (("Scan for hardware changes", "view-refresh", self.reload),
+                                    ("Properties", "document-properties", self.props)):
+                b = Gtk.Button.new_from_icon_name(icon, Gtk.IconSize.LARGE_TOOLBAR)
+                b.set_tooltip_text(label)
+                b.set_relief(Gtk.ReliefStyle.NONE)
+                b.connect("clicked", lambda _b, f=fn: f())
+                bar.pack_start(b, False, False, 0)
+            box.pack_start(bar, False, False, 0)
+            self.store = Gtk.TreeStore(str, str, int)      # icon, text, device index (-1: category)
+            self.view = Gtk.TreeView(model=self.store, headers_visible=False)
+            col = Gtk.TreeViewColumn("")
+            r = Gtk.CellRendererPixbuf()
+            col.pack_start(r, False)
+            col.add_attribute(r, "icon-name", 0)
+            r = Gtk.CellRendererText()
+            col.pack_start(r, True)
+            col.add_attribute(r, "markup", 1)
+            self.view.append_column(col)
+            self.view.connect("row-activated", self.on_activated)
+            sw = Gtk.ScrolledWindow()
+            sw.add(self.view)
+            box.pack_start(sw, True, True, 0)
+            self.status = Gtk.Label(xalign=0)
+            for side in ("start", "top", "bottom"):
+                getattr(self.status, f"set_margin_{side}")(6)
+            box.pack_start(self.status, False, False, 0)
+            self.devices = []
+            self.show_all()
+            self.reload()
+
+        def reload(self):
+            self.devices = all_devices()
+            self.store.clear()
+            root = self.store.append(None, ["computer", GLib.markup_escape_text(socket.gethostname()), -1])
+            problems = [d for d in self.devices if d["problem"]]
+            order = sorted(CATEGORIES, key=lambda k: CATEGORIES[k][0].lower())
+            expand = []
+            for cat in order:
+                members = [(i, d) for i, d in enumerate(self.devices) if d["cat"] == cat]
+                if not members:
+                    continue
+                title, icon = CATEGORIES[cat]
+                node = self.store.append(root, [icon, GLib.markup_escape_text(title), -1])
+                for i, d in sorted(members, key=lambda x: x[1]["name"].lower()):
+                    text = GLib.markup_escape_text(d["name"])
+                    self.store.append(node, ["dialog-warning" if d["problem"] else icon, text, i])
+                if cat == "other":
+                    expand.append(node)
+            self.view.expand_row(self.store.get_path(root), False)
+            for node in expand:
+                self.view.expand_row(self.store.get_path(node), False)
+            n = len(self.devices)
+            self.status.set_text(f"{n} devices" + (f"; {len(problems)} need a driver (under Other devices)"
+                                                   if problems else "; all have what they need"))
+
+        def selected(self):
+            model, it = self.view.get_selection().get_selected()
+            if it is None or model[it][2] < 0:
+                return None
+            return self.devices[model[it][2]]
+
+        def props(self):
+            d = self.selected()
+            if d:
+                dlg = Props(self, d)
+                dlg.run()
+                dlg.destroy()
+
+        def on_activated(self, view, path, _col):
+            if self.store[path][2] >= 0:
+                self.props()
+            elif view.row_expanded(path):
+                view.collapse_row(path)
+            else:
+                view.expand_row(path, False)
+
+    class App(Gtk.Application):
+        def __init__(self):
+            super().__init__(application_id="org.firox.DeviceManager", flags=Gio.ApplicationFlags.FLAGS_NONE)
+            self.win = None
+
+        def do_activate(self):
+            if self.win is None:
+                self.win = Window(self)
+            self.win.present()
+
+    return App().run([sys.argv[0]])
+
+
+def main():
+    args = sys.argv[1:]
+    if args[:1] == ["list"]:
+        only = "--problems" in args
+        devs = all_devices()
+        for cat in sorted(CATEGORIES, key=lambda k: CATEGORIES[k][0].lower()):
+            members = [d for d in devs if d["cat"] == cat and (d["problem"] or not only)]
+            if members:
+                print(CATEGORIES[cat][0])
+                for d in sorted(members, key=lambda d: d["name"].lower()):
+                    extra = f"  [{d['driver']}]" if d["driver"] else ""
+                    print(f"    {d['name']}{extra}" + (f"  !! {d['problem']}" if d["problem"] else ""))
+        return 0
+    if args[:1] in (["-h"], ["--help"]):
+        print(__doc__.strip())
+        return 0
+    return gui()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

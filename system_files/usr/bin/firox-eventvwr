@@ -1,0 +1,753 @@
+#!/usr/bin/python3
+"""
+firox-eventvwr: Event Viewer. The system's logs (the systemd journal), in a
+readable list you can filter, search and copy into a bug report.
+
+    firox-eventvwr                    open on the Summary
+    firox-eventvwr LOG                open on one log: summary, system,
+                                      apps, security, hardware, boots or
+                                      crashes
+    firox-eventvwr LOG --errors       ... showing only errors
+    firox-eventvwr LOG --find TEXT    ... searching for TEXT
+
+Logs:
+  Summary       problems since the computer started, by program
+  System        everything the system logs (journalctl)
+  Applications  your own session: apps, Firox and your services
+                (journalctl --user)
+  Security      sign-ins, passwords and permissions (auth and authpriv,
+                sudo, polkit, sshd, SELinux denials)
+  Hardware      the kernel: drivers, devices, USB, disks (journalctl -k)
+  Startups      when the computer started and shut down (journalctl
+                --list-boots); pick one to see its events
+  Crashes       programs that crashed (coredumpctl)
+
+Levels follow the journal's priorities: Critical (0-2), Error (3),
+Warning (4), Information (5-6) and Verbose (7).
+
+Members of the wheel group (the first account is) see the whole system's
+events; others see only their own.
+"""
+
+import json
+import os
+import re
+import subprocess
+import sys
+import threading
+import time
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+from gi.repository import Gdk, Gio, GLib, Gtk, Pango  # noqa: E402
+
+LIMIT = 3000                    # events loaded at a time
+
+LEVELS = [  # (name, journal priorities, icon)
+    ("Critical", (0, 1, 2), "dialog-error"),
+    ("Error", (3,), "dialog-error"),
+    ("Warning", (4,), "dialog-warning"),
+    ("Information", (5, 6), "dialog-information"),
+    ("Verbose", (7,), "dialog-information"),
+]
+LEVEL_OF = {p: (name, icon) for name, prios, icon in LEVELS for p in prios}
+
+SHOW = [  # (label, journalctl -p value)
+    ("Errors", "3"),
+    ("Warnings and errors", "4"),
+    ("Information and above", "6"),
+    ("Everything", "7"),
+]
+
+LOGS = [  # (key, label, icon)
+    ("summary", "Summary", "utilities-log-viewer"),
+    ("system", "System", "computer"),
+    ("apps", "Applications", "applications-other"),
+    ("security", "Security", "security-high"),
+    ("hardware", "Hardware", "cpu"),
+    ("boots", "Startups", "system-reboot"),
+    ("crashes", "Crashes", "apport"),
+]
+
+SECURITY_MATCH = ["SYSLOG_FACILITY=4", "+", "SYSLOG_FACILITY=10", "+", "_COMM=sudo", "+",
+                  "_COMM=polkitd", "+", "_COMM=sshd", "+", "_COMM=su", "+", "_TRANSPORT=audit"]
+
+SIGNALS = {4: "SIGILL", 5: "SIGTRAP", 6: "SIGABRT", 7: "SIGBUS", 8: "SIGFPE", 11: "SIGSEGV", 31: "SIGSYS"}
+
+
+def run(argv, timeout=60):
+    try:
+        return subprocess.run(argv, capture_output=True, text=True, timeout=timeout,
+                              errors="replace")
+    except (OSError, subprocess.SubprocessError) as err:
+        return subprocess.CompletedProcess(argv, 1, "", str(err))
+
+
+def us_time(usec, seconds=True):
+    """11/12/2026 3:07:05 PM"""
+    t = time.localtime(usec / 1e6)
+    s = f":{t.tm_sec:02d}" if seconds else ""
+    return (f"{t.tm_mon}/{t.tm_mday}/{t.tm_year} {(t.tm_hour % 12) or 12}:{t.tm_min:02d}{s} "
+            f"{'AM' if t.tm_hour < 12 else 'PM'}")
+
+
+def field(entry, key):
+    """A journal field as text (the journal gives non-UTF-8 values as byte lists)."""
+    v = entry.get(key)
+    if isinstance(v, list):
+        if v and isinstance(v[0], int):
+            return bytes(v).decode("utf-8", "replace")
+        return field({"x": v[0]}, "x") if v else ""
+    return "" if v is None else str(v)
+
+
+def source(entry):
+    s = (field(entry, "SYSLOG_IDENTIFIER") or field(entry, "_COMM")
+         or field(entry, "_SYSTEMD_UNIT") or field(entry, "_SYSTEMD_USER_UNIT"))
+    if not s and field(entry, "_TRANSPORT") == "kernel":
+        s = "kernel"
+    if s.startswith("/"):
+        s = os.path.basename(s)
+    return s or "unknown"
+
+
+def journal(args, user=False, limit=LIMIT):
+    """Journal entries, newest first; (entries, note) where note explains a
+    limited view."""
+    argv = ["journalctl", "--no-pager", "-o", "json", "-r", "-n", str(limit)]
+    argv.append("--user" if user else "--system")
+    r = run(argv + args, timeout=90)
+    entries = []
+    for line in r.stdout.splitlines():
+        try:
+            entries.append(json.loads(line))
+        except ValueError:
+            pass
+    note = ""
+    err = r.stderr or ""
+    if "not seeing messages from other users" in err:
+        note = ("You're seeing only your own events. To see the whole system's, an administrator "
+                "can add you to the wheel group (Settings → User Accounts, as an administrator).")
+    elif r.returncode != 0 and not entries:
+        msg = err.strip().splitlines()[-1] if err.strip() else "journalctl failed"
+        if "No journal files" in err or "-- No entries --" in r.stdout:
+            msg = ""
+        note = msg
+    return entries, note
+
+
+def boots():
+    """[(index, boot_id, first_usec, last_usec)], newest first."""
+    r = run(["journalctl", "--list-boots", "-o", "json", "--no-pager"], timeout=60)
+    out = []
+    try:
+        for b in json.loads(r.stdout or "[]"):
+            out.append((int(b.get("index", 0)), b.get("boot_id", ""),
+                        int(b.get("first_entry") or 0), int(b.get("last_entry") or 0)))
+    except (ValueError, TypeError):
+        for line in r.stdout.splitlines():          # older systemd: text
+            parts = line.split()
+            if len(parts) >= 2 and re.fullmatch(r"-?\d+", parts[0]):
+                out.append((int(parts[0]), parts[1], 0, 0))
+    out.sort(key=lambda b: b[0], reverse=True)
+    return out
+
+
+def crashes():
+    r = run(["coredumpctl", "list", "--json=short", "-r", "--no-pager"], timeout=60)
+    try:
+        data = json.loads(r.stdout or "[]")
+    except ValueError:
+        data = []
+    return data if isinstance(data, list) else []
+
+
+def describe(entry):
+    """The details pane's text for one event."""
+    level = LEVEL_OF.get(int(field(entry, "PRIORITY") or 6), ("Information", ""))[0]
+    rows = [("Level", level), ("Date and time", us_time(int(field(entry, "__REALTIME_TIMESTAMP") or 0))),
+            ("Source", source(entry))]
+    unit = field(entry, "_SYSTEMD_UNIT") or field(entry, "_SYSTEMD_USER_UNIT")
+    if unit:
+        rows.append(("Service", unit))
+    pid, exe = field(entry, "_PID"), field(entry, "_EXE")
+    if pid or exe:
+        rows.append(("Process", f"{pid} ({exe})" if pid and exe else pid or exe))
+    if field(entry, "_UID"):
+        rows.append(("User ID", field(entry, "_UID")))
+    if field(entry, "CODE_FILE"):
+        rows.append(("Code", f"{field(entry, 'CODE_FILE')}:{field(entry, 'CODE_LINE')} "
+                             f"{field(entry, 'CODE_FUNC')}".strip()))
+    if field(entry, "_BOOT_ID"):
+        rows.append(("Boot", field(entry, "_BOOT_ID")))
+    width = max(len(k) for k, _ in rows) + 2
+    return field(entry, "MESSAGE") + "\n\n" + "\n".join(f"{k + ':':<{width}}{v}" for k, v in rows)
+
+
+def all_fields(entry):
+    return "\n".join(f"{k}={field(entry, k)}" for k in sorted(entry) if not k.startswith("__"))
+
+
+class Viewer(Gtk.ApplicationWindow):
+    def __init__(self, app, log="summary", errors=False, find=""):
+        super().__init__(application=app, title="Event Viewer")
+        self.set_default_size(1060, 700)
+        self.set_icon_name("utilities-log-viewer")
+        self.entries = []
+        self.boot_list = []
+        self.boot = ""              # boot id to show ("" = this boot)
+        self.loading = 0            # generation, so stale results are dropped
+        self.only = ""              # show just this source (from the Summary)
+        self.only_ident = ""        # ... and its SYSLOG_IDENTIFIER as logged
+        self.level_before = None    # the Show choice before Security changed it
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.add(outer)
+
+        # ---- toolbar
+        bar = Gtk.Box(spacing=6)
+        bar.set_border_width(6)
+        refresh = Gtk.Button.new_from_icon_name("view-refresh", Gtk.IconSize.BUTTON)
+        refresh.set_tooltip_text("Refresh (F5)")
+        refresh.connect("clicked", lambda _b: self.reload())
+        bar.pack_start(refresh, False, False, 0)
+        bar.pack_start(Gtk.Label(label="Show:"), False, False, 0)
+        self.level = Gtk.ComboBoxText()
+        for label, _p in SHOW:
+            self.level.append_text(label)
+        self.level.set_active(0 if errors else 1)
+        self.level.connect("changed", self.reload_from_combo)
+        bar.pack_start(self.level, False, False, 0)
+        bar.pack_start(Gtk.Label(label="From:"), False, False, 0)
+        self.boot_combo = Gtk.ComboBoxText()
+        self.boot_combo.append("", "This startup")
+        self.boot_combo.append("all", "All startups")
+        self.boot_combo.set_active_id("")
+        self.boot_combo.connect("changed", self.on_boot_combo)
+        bar.pack_start(self.boot_combo, False, False, 0)
+        self.search = Gtk.SearchEntry(placeholder_text="Find (Ctrl+F)", text=find)
+        self.search.set_width_chars(26)
+        self.search.connect("activate", lambda _e: self.reload())
+        self.search.connect("search-changed", self.on_search_changed)
+        bar.pack_start(self.search, False, False, 0)
+        self.only_button = Gtk.Button()
+        self.only_button.set_tooltip_text("Show events from every source")
+        self.only_button.set_no_show_all(True)
+        self.only_button.connect("clicked", lambda _b: self.set_source("") or self.reload())
+        bar.pack_start(self.only_button, False, False, 0)
+        save = Gtk.Button.new_with_mnemonic("_Save Events As…")
+        save.connect("clicked", lambda _b: self.save())
+        bar.pack_end(save, False, False, 0)
+        copy = Gtk.Button.new_with_mnemonic("_Copy")
+        copy.set_tooltip_text("Copy the selected event's details (Ctrl+C)")
+        copy.connect("clicked", lambda _b: self.copy())
+        bar.pack_end(copy, False, False, 0)
+        outer.pack_start(bar, False, False, 0)
+
+        self.note = Gtk.InfoBar(message_type=Gtk.MessageType.INFO)
+        self.note.set_no_show_all(True)
+        self.note_text = Gtk.Label(xalign=0, wrap=True)
+        self.note.get_content_area().add(self.note_text)
+        outer.pack_start(self.note, False, False, 0)
+
+        paned = Gtk.Paned()
+        outer.pack_start(paned, True, True, 0)
+
+        # ---- left: the logs
+        self.logs = Gtk.ListBox()
+        self.logs.set_selection_mode(Gtk.SelectionMode.BROWSE)
+        for key, label, icon in LOGS:
+            row = Gtk.ListBoxRow()
+            row.key = key
+            b = Gtk.Box(spacing=8)
+            b.set_border_width(6)
+            b.pack_start(Gtk.Image.new_from_icon_name(icon, Gtk.IconSize.LARGE_TOOLBAR), False, False, 0)
+            b.pack_start(Gtk.Label(label=label, xalign=0), True, True, 0)
+            row.add(b)
+            self.logs.add(row)
+        sw = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
+        sw.add(self.logs)
+        sw.set_size_request(170, -1)
+        paned.pack1(sw, False, False)
+
+        # ---- right: the summary page, or the events and their details
+        self.stack = Gtk.Stack()
+        paned.pack2(self.stack, True, False)
+
+        self.summary = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        self.summary.set_border_width(14)
+        self.stack.add_named(self.summary, "summary")
+
+        vp = Gtk.Paned(orientation=Gtk.Orientation.VERTICAL)
+        self.stack.add_named(vp, "events")
+        # icon, level, time, source, message, entry index, time sort key
+        self.store = Gtk.ListStore(str, str, str, str, str, int, float)
+        self.view = Gtk.TreeView(model=self.store)
+        self.view.set_enable_search(False)
+        self.view.set_fixed_height_mode(False)
+        col = Gtk.TreeViewColumn("Level")
+        icon_r = Gtk.CellRendererPixbuf()
+        col.pack_start(icon_r, False)
+        col.add_attribute(icon_r, "icon-name", 0)
+        text_r = Gtk.CellRendererText()
+        col.pack_start(text_r, False)
+        col.add_attribute(text_r, "text", 1)
+        col.set_sort_column_id(1)
+        self.view.append_column(col)
+        for title, idx, width, sort in (("Date and Time", 2, 170, 6), ("Source", 3, 150, 3),
+                                        ("Message", 4, -1, 4)):
+            r = Gtk.CellRendererText(ellipsize=Pango.EllipsizeMode.END)
+            c = Gtk.TreeViewColumn(title, r, text=idx)
+            c.set_resizable(True)
+            c.set_sort_column_id(sort)
+            if width > 0:
+                c.set_fixed_width(width)
+                c.set_sizing(Gtk.TreeViewColumnSizing.FIXED)
+            else:
+                c.set_expand(True)
+            self.view.append_column(c)
+        self.view.get_selection().connect("changed", lambda _s: self.show_details())
+        self.view.connect("row-activated", self.on_activated)
+        sw = Gtk.ScrolledWindow()
+        sw.add(self.view)
+        vp.pack1(sw, True, False)
+
+        details = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        details.set_border_width(6)
+        self.detail = Gtk.TextView(editable=False, wrap_mode=Gtk.WrapMode.WORD_CHAR, monospace=True,
+                                   left_margin=6, right_margin=6, top_margin=4, bottom_margin=4)
+        dsw = Gtk.ScrolledWindow()
+        dsw.set_shadow_type(Gtk.ShadowType.IN)
+        dsw.add(self.detail)
+        details.pack_start(dsw, True, True, 0)
+        drow = Gtk.Box(spacing=6)
+        self.all = Gtk.CheckButton.new_with_mnemonic("Show _all details")
+        self.all.connect("toggled", lambda _c: self.show_details())
+        drow.pack_start(self.all, False, False, 0)
+        self.extra = Gtk.Button.new_with_mnemonic("Crash _report…")
+        self.extra.set_no_show_all(True)
+        self.extra.connect("clicked", lambda _b: self.crash_report())
+        drow.pack_start(self.extra, False, False, 0)
+        details.pack_start(drow, False, False, 0)
+        vp.pack2(details, False, False)
+        vp.set_position(400)
+
+        self.status = Gtk.Label(xalign=0)
+        self.status.set_margin_start(6)
+        self.status.set_margin_top(3)
+        self.status.set_margin_bottom(3)
+        outer.pack_start(self.status, False, False, 0)
+
+        accel = Gtk.AccelGroup()
+        self.add_accel_group(accel)
+        accel.connect(Gdk.KEY_F5, 0, 0, lambda *_: self.reload() or True)
+        accel.connect(Gdk.KEY_f, Gdk.ModifierType.CONTROL_MASK, 0, lambda *_: self.search.grab_focus() or True)
+        accel.connect(Gdk.KEY_c, Gdk.ModifierType.CONTROL_MASK, 0, self.on_ctrl_c)
+
+        self.logs.connect("row-selected", lambda _l, _r: self.reload())
+        self.logs.connect("row-activated", lambda _l, _r: self.set_source("") or self.reload())
+        self.show_all()
+        threading.Thread(target=self.load_boots, daemon=True).start()
+        self.select_log(log)
+
+    # ------------------------------------------------------------ helpers --
+    def current_log(self):
+        row = self.logs.get_selected_row()
+        return row.key if row else "summary"
+
+    def select_log(self, key):
+        for row in self.logs.get_children():
+            if row.key == key:
+                self.logs.select_row(row)
+                return
+
+    def set_note(self, text):
+        self.note_text.set_text(text)
+        self.note.set_visible(bool(text))
+        self.note_text.set_visible(bool(text))
+
+    def set_source(self, src, ident=""):
+        self.only, self.only_ident = src, ident
+        self.only_button.set_label(f"Only {src}  ✕")
+        self.only_button.set_visible(bool(src))
+
+    def load_boots(self):
+        bl = boots()
+        GLib.idle_add(self.got_boots, bl)
+
+    def got_boots(self, bl):
+        self.boot_list = bl
+        active = self.boot_combo.get_active_id()
+        for i, (idx, bid, first, last) in enumerate(bl[1:21], 1):
+            label = f"Startup of {us_time(first, False)}" if first else f"Startup {idx}"
+            self.boot_combo.append(bid, label)
+        self.boot_combo.set_active_id(active or "")
+        return False
+
+    def reload_from_combo(self, _combo):
+        self.reload()
+
+    def on_boot_combo(self, combo):
+        self.boot = combo.get_active_id() or ""
+        self.reload()
+
+    def on_search_changed(self, entry):
+        if not entry.get_text():
+            self.reload()
+
+    def on_ctrl_c(self, *_):
+        focus = self.get_focus()
+        if isinstance(focus, (Gtk.Entry, Gtk.TextView)):
+            return False
+        self.copy()
+        return True
+
+    def journal_args(self):
+        args = []
+        if self.boot == "all":
+            pass
+        elif self.boot:
+            args += ["-b", self.boot]
+        else:
+            args += ["-b"]
+        args += ["-p", SHOW[max(0, self.level.get_active())][1]]
+        q = self.search.get_text().strip()
+        if q:
+            args += ["--grep", q, "--case-sensitive=false"]
+        return args
+
+    # ------------------------------------------------------------ loading --
+    def reload(self):
+        log = self.current_log()
+        self.loading += 1
+        gen = self.loading
+        self.set_note("")
+        self.extra.hide()
+        if log == "summary":
+            self.stack.set_visible_child_name("summary")
+            self.status.set_text("Loading…")
+            threading.Thread(target=self.load_summary, args=(gen,), daemon=True).start()
+            return
+        self.stack.set_visible_child_name("events")
+        # Sign-ins are logged as information: Security shows it, and the other
+        # logs go back to what you had
+        want = None
+        if log == "security" and self.level_before is None and self.level.get_active() < 2:
+            self.level_before, want = self.level.get_active(), 2
+        elif log != "security" and self.level_before is not None:
+            if self.level.get_active() == 2:
+                want = self.level_before
+            self.level_before = None
+        if want is not None:
+            self.level.handler_block_by_func(self.reload_from_combo)
+            self.level.set_active(want)
+            self.level.handler_unblock_by_func(self.reload_from_combo)
+        listed = log in ("boots", "crashes")
+        self.level.set_sensitive(not listed)
+        self.boot_combo.set_sensitive(not listed)
+        if listed and self.only:
+            self.set_source("")
+        self.store.clear()
+        self.entries = []
+        self.status.set_text("Loading…")
+        threading.Thread(target=self.load_events, args=(gen, log, self.journal_args(), self.only,
+                                                        self.only_ident),
+                         daemon=True).start()
+
+    def load_events(self, gen, log, args, only="", ident=""):
+        note = ""
+        if ident and log in ("system", "apps"):
+            args = args + [f"SYSLOG_IDENTIFIER={ident}"]
+        if log == "system":
+            entries, note = journal(args)
+        elif log == "apps":
+            entries, note = journal(args, user=True)
+        elif log == "security":
+            entries, note = journal(args + SECURITY_MATCH)
+        elif log == "hardware":
+            entries, note = journal(args + ["_TRANSPORT=kernel"])
+        elif log == "boots":
+            entries = []
+            for idx, bid, first, last in boots():
+                if not first:
+                    continue
+                dur = max(0, last - first) / 1e6
+                hours, mins = int(dur // 3600), int(dur % 3600 // 60)
+                span = f"{hours} h {mins} min" if hours else f"{mins} min"
+                msg = (f"Started {us_time(first)}" + ("; still running" if idx == 0 else
+                                                       f", last event {us_time(last)} (ran {span})"))
+                entries.append({"PRIORITY": "6", "__REALTIME_TIMESTAMP": str(first),
+                                "SYSLOG_IDENTIFIER": "This startup" if idx == 0 else f"Startup {idx}",
+                                "MESSAGE": msg, "_BOOT_ID": bid, "_firox_boot": bid})
+        else:   # crashes
+            entries = []
+            for c in crashes():
+                exe = c.get("exe") or ""
+                sig = c.get("sig")
+                name = os.path.basename(exe) or "A program"
+                signame = SIGNALS.get(sig, f"signal {sig}") if sig else ""
+                entries.append({"PRIORITY": "3", "__REALTIME_TIMESTAMP": str(c.get("time") or 0),
+                                "SYSLOG_IDENTIFIER": name, "_EXE": exe, "_PID": str(c.get("pid") or ""),
+                                "_UID": str(c.get("uid") if c.get("uid") is not None else ""),
+                                "MESSAGE": f"{name} crashed" + (f" ({signame})" if signame else "")
+                                + ("" if c.get("corefile") in ("present", "journal") else
+                                   "; no crash report was kept" if c.get("corefile") else ""),
+                                "_firox_crash": str(c.get("pid") or "")})
+            q = self.search.get_text().strip().lower()
+            if q:
+                entries = [e for e in entries if q in (e["MESSAGE"] + e["_EXE"]).lower()]
+        if only:
+            entries = [e for e in entries if source(e) == only]
+        GLib.idle_add(self.got_events, gen, entries, note)
+
+    def got_events(self, gen, entries, note):
+        if gen != self.loading:
+            return False
+        self.entries = entries
+        self.store.clear()
+        for i, e in enumerate(entries):
+            prio = int(field(e, "PRIORITY") or 6)
+            name, icon = LEVEL_OF.get(prio, ("Information", "dialog-information"))
+            usec = int(field(e, "__REALTIME_TIMESTAMP") or 0)
+            msg = field(e, "MESSAGE").strip().splitlines()
+            self.store.append([icon, name, us_time(usec) if usec else "", source(e),
+                               msg[0] if msg else "", i, float(usec)])
+        self.set_note(note)
+        n = len(entries)
+        more = f" (the newest {LIMIT:,})" if n >= LIMIT else ""
+        if n == 0:
+            self.status.set_text("No events match." if not note else "")
+            self.detail.get_buffer().set_text("")
+        else:
+            self.status.set_text(f"{n:,} event{'' if n == 1 else 's'}{more}, newest first.")
+            self.view.get_selection().select_path(Gtk.TreePath.new_first())
+        return False
+
+    # ------------------------------------------------------------ summary --
+    def load_summary(self, gen):
+        prob, note = journal(["-b", "-p", "4"], limit=5000)
+        mine, _ = journal(["-b", "-p", "4"], user=True, limit=2000)
+        seen = {e.get("__CURSOR") for e in prob}
+        mine = [e for e in mine if e.get("__CURSOR") not in seen]
+        dumps = crashes()
+        bl = boots()
+        GLib.idle_add(self.got_summary, gen, prob, mine, dumps, bl, note)
+
+    def got_summary(self, gen, prob, mine, dumps, bl, note):
+        if gen != self.loading:
+            return False
+        for child in self.summary.get_children():
+            child.destroy()
+        self.set_note(note)
+        started = bl[0][2] if bl and bl[0][2] else 0
+        head = Gtk.Label(xalign=0, wrap=True)
+        head.set_markup("<span size='large'><b>Summary of events</b></span>\n"
+                        + (f"Since this startup, {GLib.markup_escape_text(us_time(started, False))}."
+                           if started else "Since this startup."))
+        self.summary.pack_start(head, False, False, 0)
+
+        def count(entries, prios):
+            return sum(1 for e in entries if int(field(e, "PRIORITY") or 6) in prios)
+        since = (started / 1e6) if started else time.time() - 86400
+        boot_crashes = [c for c in dumps if (c.get("time") or 0) / 1e6 >= since]
+        grid = Gtk.Grid(column_spacing=24, row_spacing=6)
+        hdr = ["", "Critical", "Errors", "Warnings"]
+        for c, h in enumerate(hdr):
+            lab = Gtk.Label(xalign=0)
+            lab.set_markup(f"<b>{h}</b>")
+            grid.attach(lab, c, 0, 1, 1)
+        for r, (label, entries) in enumerate((("System", prob), ("Applications", mine)), 1):
+            grid.attach(Gtk.Label(label=label, xalign=0), 0, r, 1, 1)
+            for c, prios in enumerate(((0, 1, 2), (3,), (4,)), 1):
+                n = count(entries, prios)
+                grid.attach(Gtk.Label(label=f"{n:,}", xalign=0), c, r, 1, 1)
+        grid.attach(Gtk.Label(label="Crashes", xalign=0), 0, 3, 1, 1)
+        grid.attach(Gtk.Label(label=f"{len(boot_crashes):,}", xalign=0), 2, 3, 1, 1)
+        self.summary.pack_start(grid, False, False, 0)
+
+        lab = Gtk.Label(xalign=0, wrap=True)
+        lab.set_markup("<b>Programs with the most problems</b>  "
+                       "<small>(double-click one to see its events)</small>")
+        self.summary.pack_start(lab, False, False, 6)
+        tally = {}
+        for log, entries in (("system", prob), ("apps", mine)):
+            for e in entries:
+                key = (source(e), log)
+                n, worst, last, ident = tally.get(key, (0, 7, "", ""))
+                prio = int(field(e, "PRIORITY") or 6)
+                msg = field(e, "MESSAGE").strip()
+                tally[key] = (n + 1, min(worst, prio), last or (msg.splitlines()[0] if msg else ""),
+                              ident or field(e, "SYSLOG_IDENTIFIER"))
+        # icon, source, count, latest, log, SYSLOG_IDENTIFIER
+        store = Gtk.ListStore(str, str, str, str, str, str)
+        # errors first, then the most frequent
+        for (src, log), (n, worst, last, ident) in sorted(
+                tally.items(), key=lambda kv: (kv[1][1] > 3, -kv[1][0], kv[0]))[:40]:
+            icon = LEVEL_OF.get(worst, ("Warning", "dialog-warning"))[1]
+            store.append([icon, src, f"{n:,}", last, log, ident])
+        view = Gtk.TreeView(model=store)
+        col = Gtk.TreeViewColumn("Source")
+        r = Gtk.CellRendererPixbuf()
+        col.pack_start(r, False)
+        col.add_attribute(r, "icon-name", 0)
+        r = Gtk.CellRendererText()
+        col.pack_start(r, False)
+        col.add_attribute(r, "text", 1)
+        col.set_fixed_width(200)
+        col.set_sizing(Gtk.TreeViewColumnSizing.FIXED)
+        view.append_column(col)
+        view.append_column(Gtk.TreeViewColumn("Events", Gtk.CellRendererText(xalign=1), text=2))
+        c = Gtk.TreeViewColumn("Latest", Gtk.CellRendererText(ellipsize=Pango.EllipsizeMode.END), text=3)
+        c.set_expand(True)
+        view.append_column(c)
+
+        def jump(_v, path, _c):
+            row = store[path]
+            self.search.set_text("")
+            self.set_source(row[1], row[5])
+            self.select_log(row[4])
+        view.connect("row-activated", jump)
+        sw = Gtk.ScrolledWindow()
+        sw.set_shadow_type(Gtk.ShadowType.IN)
+        sw.add(view)
+        self.summary.pack_start(sw, True, True, 0)
+        if not tally:
+            self.summary.pack_start(Gtk.Label(label="No warnings or errors since this startup.", xalign=0),
+                                    False, False, 0)
+        self.summary.show_all()
+        self.status.set_text(f"{len(prob) + len(mine):,} warnings and errors since this startup.")
+        return False
+
+    # ------------------------------------------------------------ details --
+    def selected(self):
+        model, it = self.view.get_selection().get_selected()
+        if it is None:
+            return None
+        idx = model[it][5]
+        return self.entries[idx] if 0 <= idx < len(self.entries) else None
+
+    def show_details(self):
+        e = self.selected()
+        buf = self.detail.get_buffer()
+        if e is None:
+            buf.set_text("")
+            self.extra.hide()
+            return
+        text = describe(e)
+        if self.all.get_active():
+            text += "\n\n" + all_fields(e)
+        buf.set_text(text)
+        self.extra.set_visible(bool(e.get("_firox_crash")))
+
+    def on_activated(self, _v, _path, _col):
+        e = self.selected()
+        if e and e.get("_firox_boot"):
+            bid = e["_firox_boot"]
+            if self.boot_list and bid == self.boot_list[0][1]:
+                bid = ""
+            elif bid not in [r[1] for r in self.boot_combo.get_model()]:
+                self.boot_combo.append(bid, e["MESSAGE"].split(";")[0].split(",")[0])
+            self.boot_combo.set_active_id(bid)
+            self.select_log("system")
+        elif e and e.get("_firox_crash"):
+            self.crash_report()
+
+    def crash_report(self):
+        e = self.selected()
+        if not e or not e.get("_firox_crash"):
+            return
+        r = run(["coredumpctl", "info", "--no-pager", e["_firox_crash"]], timeout=60)
+        text = (r.stdout or r.stderr or "No report.").strip()
+        dlg = Gtk.Dialog(title=f"Crash report: {source(e)}", transient_for=self, modal=True)
+        dlg.set_default_size(760, 520)
+        dlg.add_button("_Copy", 1)
+        dlg.add_button("_Close", Gtk.ResponseType.CLOSE)
+        tv = Gtk.TextView(editable=False, monospace=True, wrap_mode=Gtk.WrapMode.NONE)
+        tv.get_buffer().set_text(text)
+        sw = Gtk.ScrolledWindow()
+        sw.add(tv)
+        dlg.get_content_area().pack_start(sw, True, True, 0)
+        dlg.show_all()
+        while dlg.run() == 1:
+            Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).set_text(text, -1)
+        dlg.destroy()
+
+    def copy(self):
+        e = self.selected()
+        if e is None:
+            return
+        text = describe(e) + ("\n\n" + all_fields(e) if self.all.get_active() else "")
+        Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).set_text(text, -1)
+        self.status.set_text("Copied the event's details.")
+
+    def save(self):
+        if not self.entries:
+            return
+        dlg = Gtk.FileChooserDialog(title="Save Events As", transient_for=self,
+                                    action=Gtk.FileChooserAction.SAVE)
+        dlg.add_buttons("_Cancel", Gtk.ResponseType.CANCEL, "_Save", Gtk.ResponseType.ACCEPT)
+        dlg.set_do_overwrite_confirmation(True)
+        label = dict((k, lab) for k, lab, _i in LOGS).get(self.current_log(), "Events")
+        dlg.set_current_name(f"{label} events {time.strftime('%Y-%m-%d')}.txt")
+        docs = GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_DOCUMENTS)
+        if docs:
+            dlg.set_current_folder(docs)
+        if dlg.run() == Gtk.ResponseType.ACCEPT:
+            path = dlg.get_filename()
+            try:
+                with open(path, "w") as fh:
+                    fh.write(f"Firox Event Viewer: {label}, {self.level.get_active_text()}, "
+                             f"{self.boot_combo.get_active_text()}"
+                             + (f", matching “{self.search.get_text()}”" if self.search.get_text() else "")
+                             + f"\nSaved {us_time(time.time() * 1e6)}\n\n")
+                    for e in reversed(self.entries):          # oldest first, like a log
+                        prio = int(field(e, "PRIORITY") or 6)
+                        usec = int(field(e, "__REALTIME_TIMESTAMP") or 0)
+                        fh.write(f"{us_time(usec)}  {LEVEL_OF.get(prio, ('Information',))[0]:<11}  "
+                                 f"{source(e)}: {field(e, 'MESSAGE')}\n")
+                self.status.set_text(f"Saved {len(self.entries):,} events to {path}.")
+            except OSError as err:
+                self.status.set_text(f"Couldn't save: {err.strerror}")
+        dlg.destroy()
+
+
+class App(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id="org.firox.EventViewer",
+                         flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE)
+        self.win = None
+
+    def do_command_line(self, cmdline):
+        args = cmdline.get_arguments()[1:]
+        log, errors, find = "summary", False, ""
+        keys = {k for k, _l, _i in LOGS} | {"applications"}
+        i = 0
+        while i < len(args):
+            a = args[i]
+            if a == "--errors":
+                errors = True
+            elif a == "--find" and i + 1 < len(args):
+                find = args[i + 1]
+                i += 1
+            elif a in ("-h", "--help"):
+                print(__doc__.strip())
+                return 0
+            elif a in keys:
+                log = "apps" if a == "applications" else a
+            i += 1
+        if self.win is None:
+            self.win = Viewer(self, log, errors, find)
+        else:
+            if find:
+                self.win.search.set_text(find)
+            if errors:
+                self.win.level.set_active(0)
+            self.win.select_log(log)
+        self.win.present()
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(App().run(sys.argv))

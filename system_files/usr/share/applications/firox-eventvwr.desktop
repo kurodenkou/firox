@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Event Viewer
+Comment=See what the system and your apps have logged: errors, warnings, sign-ins and crashes
+Exec=firox-eventvwr
+Icon=utilities-log-viewer
+Categories=System;Monitor;
+Keywords=eventvwr;logs;journal;journalctl;errors;warnings;crashes;events;troubleshoot;
+StartupNotify=true
