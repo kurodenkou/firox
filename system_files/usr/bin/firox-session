@@ -39,6 +39,15 @@ done
 if [ -f "$CFG/labwc/rc.xml" ]; then
     sed -i 's|<name>FirefoxOS</name>|<name>Firox</name>|' "$CFG/labwc/rc.xml"
 fi
+# The firefoxos-* commands are gone: point keybindings, menus, autostart
+# entries, launchers and Quick Launch that still use them at firox-*
+for f in "$CFG"/labwc/rc.xml "$CFG"/labwc/menu.xml "$CFG"/labwc/autostart "$CFG"/labwc/environment \
+         "$CFG"/waybar/config "$CFG"/waybar/config.jsonc "$CFG"/autostart/*.desktop \
+         "$DATA"/applications/*.desktop "$CFG/firox/quicklaunch"; do
+    if [ -f "$f" ] && grep -qs 'firefoxos-' "$f"; then
+        sed -i 's/firefoxos-/firox-/g' "$f"
+    fi
+done
 
 # Mouse, touchpad and keyboard settings (Settings > Mouse / Keyboard):
 # firox-input writes labwc config with them into a folder that labwc checks
