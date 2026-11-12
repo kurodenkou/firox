@@ -50,6 +50,8 @@
   <a href="#terminal">Command Prompt</a>
   <a href="#hud">Gaming HUD</a>
   <a href="#sysinfo">System Information</a>
+  <a href="#security">Security Center</a>
+  <a href="#events">Event Viewer</a>
   <a href="#display">Screen resolution</a>
   <a href="#keys">Keyboard shortcuts</a>
   <a href="#customize">Customizing</a>
@@ -178,6 +180,12 @@
 
 <h2 id="sysinfo">System Information</h2>
 <p>Start → <b>System Information</b> (or <b>System Information…</b> in System Properties) shows everything about this computer: the processor, memory, graphics, disks, network, battery, devices, software and any problems. Type in the search box to find something in every category at once. <b>Save Report…</b> writes it all to a text file you can attach when you ask for help; it includes serial numbers and network addresses, so read it before you share it.</p>
+
+<h2 id="security">Security Center</h2>
+<p>Start → <b>Security Center</b> (or Settings → <b>Security Center</b>, or <code>wscui.cpl</code> in Run) shows whether this computer's protections are on: the <b>firewall</b>, <b>automatic updates</b>, <b>backup</b>, the <b>screen lock</b>, <b>remote login</b> (the SSH server), <b>disk encryption</b>, <b>Secure Boot</b> and <b>SELinux</b>. Green is fine, yellow could be safer, and red needs fixing. Most items have a button to fix them, such as <b>Turn on</b>, which asks for your password. If you've decided a yellow item is fine (for example, you use SSH), click <b>Don't warn me</b>; <b>Warn me again</b> undoes it. If the firewall, automatic updates or SELinux are off, a notification tells you after you log in, once for each new problem.</p>
+
+<h2 id="events">Event Viewer</h2>
+<p>When something goes wrong, Start → <b>Event Viewer</b> (or <code>eventvwr</code> in Run) shows what the system logged. <b>Summary</b> lists the programs with problems since the computer started, errors first: double-click one to see its events. The other logs are <b>System</b>, <b>Applications</b> (your own apps and Firox), <b>Security</b> (sign-ins and password prompts), <b>Hardware</b> (drivers and devices), <b>Startups</b> (double-click one to see what happened that time) and <b>Crashes</b> (with a <b>Crash report</b> for each). Choose <b>Show</b> and <b>From</b> to filter, or type in the search box. <b>Copy</b> copies the selected event, and <b>Save Events As…</b> saves the list to a text file to send with a bug report.</p>
 
 <h2 id="terminal">Command Prompt</h2>
 <p>Press <kbd>Super</kbd>+<kbd>Enter</kbd> for the Command Prompt (Firox Terminal). <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>T</kbd> opens another tab in the same folder, <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>W</kbd> closes one, and <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>F</kbd> finds text. To connect to another computer with SSH, click the server button at the top right and choose <b>Connect to a Server</b>: tick <b>Save this connection</b> to find it in that list next time. Your password is typed in the tab when the server asks for it; it isn't saved. When a connection drops, click <b>Reconnect</b>.</p>

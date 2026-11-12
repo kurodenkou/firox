@@ -96,6 +96,10 @@ firox-gadgets start >/dev/null 2>&1 &
 # "Firox Linux was updated" once after an update was applied
 ( sleep 20; firox-updates login ) >/dev/null 2>&1 &
 
+# Security Center: a notification if the firewall, updates or SELinux are
+# off (once for each new problem)
+( sleep 45; firox-security login ) >/dev/null 2>&1 &
+
 # Your startup programs (Settings > Startup Programs, ~/.config/autostart),
 # once the taskbar's notification area is up for their icons
 ( sleep 4; firox-startup run ) >/dev/null 2>&1 &

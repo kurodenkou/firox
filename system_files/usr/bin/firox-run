@@ -85,6 +85,10 @@ ALIASES = {
     "diskmgmt.msc": [["gnome-disks"]],
     "devmgmt.msc": [["firox-control-panel", "system"]],
     "rstrui": [["firox-restore"]],
+    "eventvwr": [["firox-eventvwr"]],
+    "eventvwr.msc": [["firox-eventvwr"]],
+    "wscui.cpl": [["firox-security"]],
+    "firewall.cpl": [["firox-security"]],
 }
 
 # Programs that only make sense in a terminal window

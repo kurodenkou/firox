@@ -378,6 +378,16 @@
 </ul>
     <p class="tech">firox-sysinfo</p>
 </div>
+<div class="card">
+    <h3>Event Viewer</h3>
+    <p>What the system logged, in a list you can read (Start → Event Viewer, or <code>eventvwr</code>):</p>
+<ul>
+    <li><b>Summary:</b> the programs with errors and warnings since the computer started, errors first.</li>
+    <li><b>Logs:</b> System, Applications, Security (sign-ins), Hardware, Startups and Crashes, with a crash report for each crash.</li>
+    <li><b>Filter</b> by level and startup, search, copy an event, or save the list for a bug report.</li>
+</ul>
+    <p class="tech">firox-eventvwr (journalctl, coredumpctl)</p>
+</div>
 </div>
 
 <h2 id="safe">Updates, restore and backup</h2>
@@ -444,6 +454,22 @@
     </div>
     <figure>
     <img src="screenshots/sync.png" alt="Sync window and the PIN on the other computer" loading="lazy">
+</figure>
+</div>
+
+<div class="feature">
+    <div class="feature-text">
+        <h3>Security Center</h3>
+        <p>One page that shows whether your computer's protections are on, like the Security Center in Windows XP.</p>
+<ul>
+    <li><b>Checks:</b> firewall, automatic updates, backup, screen lock, remote login, disk encryption, Secure Boot and SELinux.</li>
+    <li><b>Fixing:</b> a button next to each problem, such as <b>Turn on</b> for the firewall.</li>
+    <li><b>Warnings:</b> a notification after you log in if something important is off. <b>Don't warn me</b> quiets one you've decided is fine.</li>
+</ul>
+        <p class="tech">firox-security</p>
+    </div>
+    <figure>
+    <img src="screenshots/security-center.png" alt="Security Center: backup and remote login need attention; firewall, updates and screen lock are on" loading="lazy">
 </figure>
 </div>
 
