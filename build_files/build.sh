@@ -219,6 +219,10 @@ done
 # Power profiles (tuned, with the power-profiles-daemon D-Bus API)
 systemctl enable tuned.service tuned-ppd.service
 
+# No SSH server unless you turn it on (Security Center > Remote login); see
+# /usr/lib/systemd/system-preset/20-firox.preset
+systemctl disable sshd.service
+
 # Virus definitions for Virus Scan: freshclam downloads them (about 200 MB
 # the first time) and checks for new ones every two hours
 systemctl enable clamav-freshclam.service
