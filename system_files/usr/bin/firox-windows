@@ -1,0 +1,223 @@
+#!/usr/bin/python3
+"""
+firox-windows: run Windows programs (.exe, .msi, .bat) with Proton-GE.
+
+    firox-windows PROGRAM.exe [ARGS...]   run it (double-click in Firox
+                                          Explorer or on the desktop, or
+                                          ./PROGRAM.exe in a terminal)
+    firox-windows --c-drive               open the C: drive in Firox Explorer
+    firox-windows --winecfg               Wine's settings for the C: drive
+    firox-windows --winetricks VERB...    install Windows components (fonts,
+                                          runtimes) into the C: drive
+    firox-windows --status                print the Proton-GE and C: drive state
+
+It runs the program with umu-launcher, which runs Proton outside Steam
+inside the Steam Linux Runtime, the same way Steam does. PROTONPATH is
+"GE-Proton": umu checks for the newest Proton-GE release each time and
+downloads it when there's a new one (about 500 MB). The first run also
+downloads the Steam Linux Runtime, so it takes a few minutes.
+
+All programs share one Windows "C: drive" (a Wine prefix) in
+~/.local/share/firox/windows. You can change any of this with the usual
+variables: WINEPREFIX (another C: drive), PROTONPATH (a Proton folder, or
+GE-Proton / UMU-Proton), GAMEID (a umu game ID, for its game fixes; default
+umu-default).
+
+When run from a terminal, the program's output stays in the terminal.
+Otherwise it goes to ~/.local/state/firox/programs/NAME.log, and if the
+program fails within two minutes you're shown its last lines. The kernel
+also runs Windows programs marked runnable through this
+(/usr/lib/binfmt.d/firox-windows.conf).
+"""
+
+import glob
+import os
+import shutil
+import subprocess
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+DATA = os.environ.get("XDG_DATA_HOME") or os.path.join(HOME, ".local", "share")
+STATE = os.environ.get("XDG_STATE_HOME") or os.path.join(HOME, ".local", "state")
+PREFIX = os.path.join(DATA, "firox", "windows")
+PROTONS = os.path.join(DATA, "Steam", "compatibilitytools.d")     # where umu puts GE-Proton
+RUNTIME = os.path.join(DATA, "umu")
+LOGS = os.path.join(STATE, "firox", "programs")
+UMU = os.environ.get("FIROX_UMU_RUN") or "umu-run"
+
+
+def environment():
+    env = dict(os.environ)
+    env.setdefault("WINEPREFIX", PREFIX)
+    env.setdefault("PROTONPATH", "GE-Proton")
+    env.setdefault("GAMEID", "umu-default")
+    return env
+
+
+def ge_versions():
+    """Installed GE-Proton folders, newest first."""
+    def key(path):
+        import re
+        nums = re.findall(r"\d+", os.path.basename(path))
+        return [int(n) for n in nums]
+    return sorted(glob.glob(os.path.join(PROTONS, "GE-Proton*")), key=key, reverse=True)
+
+
+def first_run():
+    return not ge_versions() or not glob.glob(os.path.join(RUNTIME, "steamrt*"))
+
+
+def tty():
+    return sys.stdin.isatty() and sys.stderr.isatty()
+
+
+def dialog(kind, title, text, ok="OK"):
+    """A GTK dialog ("question" returns True for ok; "error", "info"). With
+    no display, it's printed instead (and a question counts as no)."""
+    if not (os.environ.get("WAYLAND_DISPLAY") or os.environ.get("DISPLAY")):
+        print(f"{title}: {text}", file=sys.stderr)
+        return kind != "question"
+    try:
+        import gi
+        gi.require_version("Gtk", "3.0")
+        from gi.repository import Gtk
+    except (ImportError, ValueError):
+        print(f"{title}: {text}", file=sys.stderr)
+        return kind != "question"
+    mtype = {"question": Gtk.MessageType.QUESTION, "error": Gtk.MessageType.ERROR}.get(kind, Gtk.MessageType.INFO)
+    dlg = Gtk.MessageDialog(message_type=mtype, buttons=Gtk.ButtonsType.NONE, text=title)
+    dlg.set_title("Windows programs")
+    dlg.set_icon_name("wine-launcher")
+    dlg.format_secondary_text(text)
+    for label in dlg.get_message_area().get_children():
+        if isinstance(label, Gtk.Label):
+            label.set_selectable(kind == "error")
+            label.set_max_width_chars(70)
+    if kind == "question":
+        dlg.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        dlg.add_button(ok, Gtk.ResponseType.OK)
+        dlg.set_default_response(Gtk.ResponseType.CANCEL)
+    else:
+        dlg.add_button("OK", Gtk.ResponseType.OK)
+    answer = dlg.run() == Gtk.ResponseType.OK
+    dlg.destroy()
+    return answer
+
+
+def notify(title, text):
+    subprocess.Popen(["notify-send", "-a", "Windows programs", "-i", "wine-launcher", title, text],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def command(path, args):
+    """What to ask umu to run for this file."""
+    low = path.lower()
+    if low.endswith(".msi"):
+        return ["msiexec", "/i", path] + args
+    if low.endswith((".bat", ".cmd")):
+        return ["cmd", "/c", path] + args
+    return [path] + args
+
+
+def run(path, args):
+    if not shutil.which(UMU):
+        dialog("error", "Can't run Windows programs",
+               "umu-launcher isn't installed, so Windows programs can't run with Proton-GE.")
+        return 127
+    path = os.path.abspath(path)
+    name = os.path.basename(path)
+    if not os.path.isfile(path):
+        dialog("error", "Can't run it", f"“{path}” doesn't exist.")
+        return 2
+    # Downloads aren't allowed to run until you say so, like other programs
+    if not os.access(path, os.X_OK) and not tty():
+        if not dialog("question", f"Run “{name}”?",
+                      f"“{name}” is a Windows program. It runs with Proton-GE, which can do anything "
+                      "you can: only run programs from people you trust.", ok="Run"):
+            return 1
+        try:
+            mode = os.stat(path).st_mode
+            os.chmod(path, mode | 0o100 | ((mode & 0o044) >> 2))
+        except OSError:
+            pass                                  # read-only place: run it anyway
+    env = environment()
+    argv = [UMU] + command(path, args)
+    cwd = os.path.dirname(path)
+    if tty():
+        os.chdir(cwd)
+        os.execvpe(UMU, argv, env)
+    if first_run():
+        notify("Getting Windows programs ready",
+               f"“{name}” will start in a few minutes: Proton-GE and the Steam Linux Runtime are "
+               "downloading (about 1 GB). This only happens once.")
+    os.makedirs(LOGS, exist_ok=True)
+    log = os.path.join(LOGS, name + ".log")
+    with open(log, "w") as out:
+        out.write(f"firox-windows: {' '.join(argv)}\n  WINEPREFIX={env['WINEPREFIX']} "
+                  f"PROTONPATH={env['PROTONPATH']} GAMEID={env['GAMEID']}\n\n")
+        out.flush()
+        started = time.time()
+        downloading = first_run()
+        try:
+            code = subprocess.run(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=out,
+                                  stderr=subprocess.STDOUT).returncode
+        except OSError as err:
+            code, msg = 127, str(err)
+            out.write(msg + "\n")
+    took = time.time() - started
+    # Failed quickly (not counting a first-run download): say why
+    if code not in (0, None) and (took < 120 or downloading):
+        try:
+            with open(log, errors="replace") as fh:
+                tail = fh.read()[-1800:].strip()
+        except OSError:
+            tail = ""
+        dialog("error", f"“{name}” didn't start",
+               f"It stopped with code {code}. The last lines it wrote:\n\n{tail}\n\nThe whole log: {log}")
+    return code or 0
+
+
+def tool(args):
+    """umu-run's own tools: winetricks, winecfg."""
+    if not shutil.which(UMU):
+        print("umu-launcher isn't installed", file=sys.stderr)
+        return 127
+    return subprocess.run([UMU] + args, env=environment()).returncode
+
+
+def status():
+    env = environment()
+    gev = ge_versions()
+    print(f"Proton: {env['PROTONPATH']}" + (f" (installed: {', '.join(os.path.basename(g) for g in gev)})"
+                                             if gev else " (not downloaded yet)"))
+    print(f"Steam Linux Runtime: {'downloaded' if glob.glob(os.path.join(RUNTIME, 'steamrt*')) else 'not yet'}")
+    drive = os.path.join(env["WINEPREFIX"], "drive_c")
+    print(f"C: drive: {drive}" + ("" if os.path.isdir(drive) else " (made on the first run)"))
+    print(f"umu-launcher: {shutil.which(UMU) or 'not installed'}")
+    return 0
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        return 0 if args else 2
+    if args[0] == "--status":
+        return status()
+    if args[0] == "--c-drive":
+        drive = os.path.join(environment()["WINEPREFIX"], "drive_c")
+        if not os.path.isdir(drive):
+            dialog("info", "No C: drive yet", "It's made the first time you run a Windows program.")
+            return 1
+        subprocess.Popen(["firox-explorer", drive], start_new_session=True)
+        return 0
+    if args[0] == "--winecfg":
+        return tool(["winecfg"])
+    if args[0] == "--winetricks":
+        return tool(["winetricks"] + args[1:])
+    return run(args[0], args[1:])
+
+
+if __name__ == "__main__":
+    sys.exit(main())

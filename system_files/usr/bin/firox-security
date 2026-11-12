@@ -221,7 +221,10 @@ def c_remote():
                      "The SSH server is on: anyone on the network who knows a password on this computer can "
                      "sign in to it. Turn it off unless you use it.",
                      [("Turn off", ["pkexec", "systemctl", "disable", "--now", "sshd"])])
-    return check("remote", title, icon, OK, "Off", "Nobody can sign in to this computer over the network.")
+    return check("remote", title, icon, OK, "Off",
+                 "Nobody can sign in to this computer over the network. To reach it from another computer "
+                 "with SSH, turn the SSH server on.",
+                 [("Turn on", ["pkexec", "systemctl", "enable", "--now", "sshd"])])
 
 
 def is_laptop():

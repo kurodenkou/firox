@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Windows Program Runner
+GenericName=Run Windows programs
+Comment=Run Windows programs (.exe, .msi) with Proton-GE
+Exec=firox-windows %f
+Icon=wine-launcher
+Categories=System;Emulator;
+MimeType=application/x-msdownload;application/x-ms-dos-executable;application/vnd.microsoft.portable-executable;application/x-msi;application/x-ms-shortcut;application/x-bat;
+NoDisplay=true
+StartupNotify=false

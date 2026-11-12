@@ -16,6 +16,9 @@ Your files:
   Other program caches   the rest of ~/.cache and Flatpak apps' caches
   Downloads              everything in your Downloads folder (off unless
                          you tick it)
+  Older Proton-GE        GE-Proton versions but the newest in
+                         ~/.local/share/Steam/compatibilitytools.d (off
+                         unless you tick it)
 System (asks for your password):
   Unused app runtimes    Flatpak runtimes no installed app needs
                          (flatpak uninstall --unused)
@@ -136,6 +139,15 @@ def parse_size(s):
 
 
 # ------------------------------------------------------------------ items --
+
+def old_protons():
+    """Proton-GE versions older than the newest, which Windows programs
+    (firox-windows, through umu) leave behind as new ones arrive."""
+    import re
+    found = glob.glob(os.path.join(DATA, "Steam", "compatibilitytools.d", "GE-Proton*"))
+    found.sort(key=lambda p: [int(n) for n in re.findall(r"\d+", os.path.basename(p))], reverse=True)
+    return [p for p in found[1:] if os.path.isdir(p) and not os.path.islink(p)]
+
 
 def firefox_caches():
     return (glob.glob(os.path.join(CACHE, "mozilla", "firefox", "*", "cache2"))
@@ -272,6 +284,11 @@ def items():
         Item("downloads", "Downloads", f"Everything in your Downloads folder ({dl}). Only tick this if you've "
              "kept what you need from it.", "folder-downloads", default=False,
              measure=lambda: du(dl), clean=lambda: remove_contents(dl)),
+        Item("protons", "Older Proton-GE versions", "Proton-GE versions older than the newest one, left "
+             "behind as new ones download for Windows programs. A Steam game set to use one of them by name "
+             "would need it again.", "wine-launcher", default=False,
+             measure=lambda: sum(du(p) for p in old_protons()),
+             clean=lambda: sum(du(p) - (shutil.rmtree(p, ignore_errors=True) or 0) for p in old_protons())),
         Item("runtimes", "Unused app runtimes", "Parts of Flatpak apps that no installed app needs any more, "
              "usually left behind by updates.", "application-x-addon", system=True,
              measure=lambda: sum(size for _r, _i, size in unused_runtimes())),

@@ -1,0 +1,5 @@
+# Firox Linux: the SSH server is off unless you turn it on (Security Center >
+# Remote login > Turn on, or `sudo systemctl enable --now sshd`). Fedora's
+# 90-default.preset enables it; the first matching preset wins, so this one,
+# sorting first, keeps a new install's first boot from turning it on.
+disable sshd.service

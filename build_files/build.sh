@@ -92,6 +92,8 @@ PACKAGES=(
     gvfs-mtp
     gvfs-smb
     gvfs-fuse                    # network places as folders for every program
+    fuse-libs                    # libfuse.so.2: AppImages mount themselves with it
+    python3-xlib                 # umu-launcher (Windows programs with Proton-GE; see below)
     rclone                       # Firox Explorer: S3 and Backblaze B2
     xdg-user-dirs
     xdg-utils
@@ -178,7 +180,11 @@ done
 
 cp -avf /ctx/system_files/. /
 
-chmod 0755 /usr/bin/firox-*
+chmod 0755 /usr/bin/firox-* /usr/bin/umu-run
+
+# Our .desktop files' file types (Windows programs open with firox-windows,
+# folders with Firox Explorer): GIO only sees what mimeinfo.cache lists
+update-desktop-database -q /usr/share/applications
 
 # Compile dconf defaults (GTK4/libadwaita apps read these)
 dconf update || true
@@ -217,6 +223,27 @@ done
 
 # Power profiles (tuned, with the power-profiles-daemon D-Bus API)
 systemctl enable tuned.service tuned-ppd.service
+
+# No SSH server unless you turn it on (Security Center > Remote login); see
+# /usr/lib/systemd/system-preset/20-firox.preset
+systemctl disable sshd.service
+
+# umu-launcher: runs Windows programs with Proton(-GE) outside Steam, inside
+# the Steam Linux Runtime (firox-windows uses it; /usr/bin/umu-run starts it).
+# Fedora doesn't package it, so this takes its source at the 1.4.4 release's
+# commit; it needs only python3-xlib and python3-urllib3 from Fedora.
+UMU_VERSION=1.4.4
+UMU_COMMIT=cf3d1b107147480c447ffbfb3f789dc74335074c
+curl -fsSL --retry 3 -o /tmp/umu.tar.gz \
+    "https://github.com/Open-Wine-Components/umu-launcher/archive/${UMU_COMMIT}.tar.gz"
+tar -xzf /tmp/umu.tar.gz -C /tmp
+grep -q "__version__ = \"${UMU_VERSION}\"" "/tmp/umu-launcher-${UMU_COMMIT}/umu/__init__.py"
+mkdir -p /usr/lib/umu-launcher /usr/share/licenses/umu-launcher
+cp -a "/tmp/umu-launcher-${UMU_COMMIT}/umu" /usr/lib/umu-launcher/
+rm -f /usr/lib/umu-launcher/umu/umu_test*.py /usr/lib/umu-launcher/umu/umu-run.in
+cp "/tmp/umu-launcher-${UMU_COMMIT}/LICENSE" /usr/share/licenses/umu-launcher/
+rm -rf /tmp/umu.tar.gz "/tmp/umu-launcher-${UMU_COMMIT}"
+python3 -c "import sys; sys.path.insert(0, '/usr/lib/umu-launcher'); import umu.umu_run"
 
 # Virus definitions for Virus Scan: freshclam downloads them (about 200 MB
 # the first time) and checks for new ones every two hours
