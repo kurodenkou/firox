@@ -4,9 +4,9 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Install · Firox Linux</title>
-<meta name="description" content="How to install Firox Linux: switch from Fedora Atomic, build an installer ISO, the NVIDIA image, a test VM, and upgrading from FirefoxOS.">
+<meta name="description" content="How to install Firox Linux: switch from Fedora Atomic, build an installer ISO, the NVIDIA image and a test VM.">
 <meta property="og:title" content="Install · Firox Linux">
-<meta property="og:description" content="How to install Firox Linux: switch from Fedora Atomic, build an installer ISO, the NVIDIA image, a test VM, and upgrading from FirefoxOS.">
+<meta property="og:description" content="How to install Firox Linux: switch from Fedora Atomic, build an installer ISO, the NVIDIA image and a test VM.">
 <meta property="og:image" content="screenshots/glass.png">
 <link rel="icon" href="assets/firox-orb.svg" type="image/svg+xml">
 <link rel="stylesheet" href="assets/style.css">
@@ -39,7 +39,6 @@
     <li><a href="#iso">Fresh install from an ISO</a></li>
     <li><a href="#nvidia">NVIDIA graphics</a></li>
     <li><a href="#vm">Try it in a VM</a></li>
-    <li><a href="#upgrading-from-firefoxos">Upgrading from FirefoxOS</a></li>
     <li><a href="#first-login">After your first login</a></li>
 </ul>
 
@@ -77,15 +76,6 @@
 <div class="code"><pre><code>just build-qcow2</code></pre></div>
 <div class="code"><pre><code>just run-vm-qcow2</code></pre></div>
 <p>The VM image has a test user <code>xp</code> with password <code>firox</code> (set in <code>disk_config/disk.toml</code>).</p>
-
-<h2 id="upgrading-from-firefoxos">Upgrading from FirefoxOS</h2>
-<p>This distribution was briefly called FirefoxOS, until it was determined that the name was already used, and was quickly renamed Firox Linux. FirefoxOS machines track the old image, which no longer gets updates. Switch each one once, then restart:</p>
-<div class="code"><pre><code>sudo bootc switch ghcr.io/kurodenkou/firox:latest</code></pre></div>
-<ul>
-    <li><b>Updates:</b> from then on it updates normally (<code>ujust update</code>).</li>
-    <li><b>Your settings:</b> on your first login afterwards, your look, Start menu history and desktop settings move to their new places automatically.</li>
-    <li><b>Old commands:</b> the <code>firefoxos-*</code> commands are now called <code>firox-*</code>. Keybindings, menus, startup programs and shortcuts that used the old names are updated at login; scripts of your own need the new names.</li>
-</ul>
 
 <h2 id="first-login">After your first login</h2>
 <div class="grid three">

@@ -25,7 +25,7 @@ sudo bootc switch ghcr.io/kurodenkou/firox:latest
 systemctl reboot
 ```
 
-For a fresh install from an ISO, NVIDIA graphics (`ghcr.io/kurodenkou/firox-nvidia-open`), trying it in a VM or upgrading from FirefoxOS, see **[Install](https://kurodenkou.github.io/firox/install.html)**.
+For a fresh install from an ISO, NVIDIA graphics (`ghcr.io/kurodenkou/firox-nvidia-open`), or trying it in a VM, see **[Install](https://kurodenkou.github.io/firox/install.html)**.
 
 ## Documentation
 

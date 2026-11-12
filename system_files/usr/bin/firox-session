@@ -7,19 +7,9 @@ export XDG_SESSION_TYPE=wayland
 export XDG_SESSION_DESKTOP=Firox
 export XDG_CURRENT_DESKTOP=labwc:wlroots
 
-# One-time move of per-user settings from the FirefoxOS name (renamed to
-# Firox Linux): theme choice, Start menu history, desktop/wallpaper profile.
 CFG="${XDG_CONFIG_HOME:-$HOME/.config}"
 STATE="${XDG_STATE_HOME:-$HOME/.local/state}"
 DATA="${XDG_DATA_HOME:-$HOME/.local/share}"
-migrate() { if [ -e "$1" ] && [ ! -e "$2" ]; then mkdir -p "$(dirname "$2")" && mv "$1" "$2"; fi; }
-migrate "$CFG/firefoxos" "$CFG/firox"
-migrate "$STATE/firefoxos" "$STATE/firox"
-migrate "$CFG/pcmanfm-qt/firefoxos" "$CFG/pcmanfm-qt/firox"
-if [ -f "$CFG/pcmanfm-qt/firox/settings.conf" ]; then
-    sed -i 's|/usr/share/backgrounds/firefoxos/|/usr/share/backgrounds/firox/|' "$CFG/pcmanfm-qt/firox/settings.conf"
-fi
-[ -L "$DATA/themes/FirefoxOS" ] && rm -f "$DATA/themes/FirefoxOS"
 # Firox Explorer replaced pcmanfm-qt: drop the preview add-on's Start menu
 # entry, and a folder default that still names the removed pcmanfm-qt
 if grep -qs 'Firox Explorer (preview)' "$DATA/applications/firox-explorer.desktop"; then
@@ -35,20 +25,6 @@ for f in "$CFG/firox/quicklaunch" "$STATE/firox/startmenu.json"; do
         sed -i 's/xfce4-terminal\.desktop/firox-terminal.desktop/g' "$f"
     fi
 done
-# A personal rc.xml copied from the old defaults names the old window theme
-if [ -f "$CFG/labwc/rc.xml" ]; then
-    sed -i 's|<name>FirefoxOS</name>|<name>Firox</name>|' "$CFG/labwc/rc.xml"
-fi
-# The firefoxos-* commands are gone: point keybindings, menus, autostart
-# entries, launchers and Quick Launch that still use them at firox-*
-for f in "$CFG"/labwc/rc.xml "$CFG"/labwc/menu.xml "$CFG"/labwc/autostart "$CFG"/labwc/environment \
-         "$CFG"/waybar/config "$CFG"/waybar/config.jsonc "$CFG"/autostart/*.desktop \
-         "$DATA"/applications/*.desktop "$CFG/firox/quicklaunch"; do
-    if [ -f "$f" ] && grep -qs 'firefoxos-' "$f"; then
-        sed -i 's/firefoxos-/firox-/g' "$f"
-    fi
-done
-
 # Mouse, touchpad and keyboard settings (Settings > Mouse / Keyboard):
 # firox-input writes labwc config with them into a folder that labwc checks
 # after ~/.config/labwc and before /etc/xdg/labwc

@@ -98,15 +98,14 @@ switch_wallpaper() {
     [ "$cur" = "$new" ] || write_wallpaper "$new"
 }
 
-# Before the desktop starts (login): the same, also moving people off the
-# old FirefoxOS wallpapers
+# Before the desktop starts (login): the same
 seed_wallpaper() {
     local new cur
     new="$(setting "$1" WALLPAPER)"
     [ -n "$new" ] || return 0
     cur="$(sed -n 's/^Wallpaper=//p' "$CONF/pcmanfm-qt/firox/settings.conf" 2>/dev/null | head -n1)"
     case "$cur" in
-        ""|/usr/share/backgrounds/firox/*|/usr/share/backgrounds/firefoxos/*) ;;
+        ""|/usr/share/backgrounds/firox/*) ;;
         *) return 0 ;;
     esac
     [ "$cur" = "$new" ] || write_wallpaper "$new"
