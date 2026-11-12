@@ -21,7 +21,8 @@ All programs share one Windows "C: drive" (a Wine prefix) in
 ~/.local/share/firox/windows. You can change any of this with the usual
 variables: WINEPREFIX (another C: drive), PROTONPATH (a Proton folder, or
 GE-Proton / UMU-Proton), GAMEID (a umu game ID, for its game fixes; default
-umu-default).
+umu-default), PROTON_ENABLE_WAYLAND (1 by default: Wine's native Wayland
+driver instead of XWayland; 0 for XWayland).
 
 When run from a terminal, the program's output stays in the terminal.
 Otherwise it goes to ~/.local/state/firox/programs/NAME.log, and if the
@@ -52,6 +53,9 @@ def environment():
     env.setdefault("WINEPREFIX", PREFIX)
     env.setdefault("PROTONPATH", "GE-Proton")
     env.setdefault("GAMEID", "umu-default")
+    # Wine's native Wayland driver rather than XWayland (Proton-GE only uses
+    # it when WAYLAND_DISPLAY is set); PROTON_ENABLE_WAYLAND=0 turns it off
+    env.setdefault("PROTON_ENABLE_WAYLAND", "1")
     return env
 
 
@@ -155,7 +159,8 @@ def run(path, args):
     log = os.path.join(LOGS, name + ".log")
     with open(log, "w") as out:
         out.write(f"firox-windows: {' '.join(argv)}\n  WINEPREFIX={env['WINEPREFIX']} "
-                  f"PROTONPATH={env['PROTONPATH']} GAMEID={env['GAMEID']}\n\n")
+                  f"PROTONPATH={env['PROTONPATH']} GAMEID={env['GAMEID']} "
+                  f"PROTON_ENABLE_WAYLAND={env['PROTON_ENABLE_WAYLAND']}\n\n")
         out.flush()
         started = time.time()
         downloading = first_run()
@@ -194,6 +199,7 @@ def status():
     print(f"Steam Linux Runtime: {'downloaded' if glob.glob(os.path.join(RUNTIME, 'steamrt*')) else 'not yet'}")
     drive = os.path.join(env["WINEPREFIX"], "drive_c")
     print(f"C: drive: {drive}" + ("" if os.path.isdir(drive) else " (made on the first run)"))
+    print(f"Wine's Wayland driver: {'on' if env['PROTON_ENABLE_WAYLAND'] not in ('', '0') else 'off (XWayland)'}")
     print(f"umu-launcher: {shutil.which(UMU) or 'not installed'}")
     return 0
 
