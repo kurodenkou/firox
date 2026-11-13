@@ -85,7 +85,8 @@ def dialog(kind, title, text, ok="OK"):
     try:
         import gi
         gi.require_version("Gtk", "3.0")
-        from gi.repository import Gtk
+        gi.require_version("Gdk", "3.0")
+        from gi.repository import Gdk, Gtk
     except (ImportError, ValueError):
         print(f"{title}: {text}", file=sys.stderr)
         return kind != "question"
@@ -106,6 +107,13 @@ def dialog(kind, title, text, ok="OK"):
         dlg.add_button("OK", Gtk.ResponseType.OK)
     answer = dlg.run() == Gtk.ResponseType.OK
     dlg.destroy()
+    # Let GTK take the window off the screen now: otherwise it stays up
+    # until this process ends, which is when the Windows program closes
+    while Gtk.events_pending():
+        Gtk.main_iteration_do(False)
+    display = Gdk.Display.get_default()
+    if display is not None:
+        display.sync()
     return answer
 
 

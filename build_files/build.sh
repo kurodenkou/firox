@@ -94,6 +94,7 @@ PACKAGES=(
     gvfs-fuse                    # network places as folders for every program
     fuse-libs                    # libfuse.so.2: AppImages mount themselves with it
     python3-xlib                 # umu-launcher (Windows programs with Proton-GE; see below)
+    icoutils                     # wrestool/icotool: .exe icons for desktop launchers
     rclone                       # Firox Explorer: S3 and Backblaze B2
     xdg-user-dirs
     xdg-utils
