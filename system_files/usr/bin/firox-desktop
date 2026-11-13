@@ -13,7 +13,8 @@ them is remembered in ~/.config/firox/desktop-icons.json) or onto a folder,
 the Recycle Bin or another program; drop files from other programs onto the
 desktop to copy them here (hold Shift to move). Right-click an icon for Open,
 Open With, Cut, Copy, Rename, Move to Recycle Bin and Properties; right-click
-the desktop for Arrange Icons By, Refresh, Paste, New Folder / Text Document,
+the desktop for Arrange Icons By, Refresh, Paste, New Folder / Text Document /
+Launcher (a shortcut to a program; Windows programs run with Proton-GE),
 Display and Desktop Background settings. Keys: Delete, Shift+Delete, F2, F5,
 Enter, Ctrl+A, Ctrl+C, Ctrl+X, Ctrl+V, Escape.
 
@@ -1171,6 +1172,19 @@ class Desktop:
             self.select([item])
             self.rename(item)
 
+    def new_launcher(self, at=None, program=None):
+        """New > Launcher...: a shortcut to a program (Windows programs run
+        with Proton-GE, with their own icon)."""
+        import firox_launcher
+        paths = firox_launcher.LauncherDialog(None, self.folder, program).run_and_create()
+        here = [os.path.basename(p) for p in paths if os.path.dirname(p) == self.folder]
+        if here:
+            self.place_new(here, at)
+            self.reload()
+            item = next((i for i in self.items if i.id == f"file:{here[0]}"), None)
+            if item is not None:
+                self.select([item])
+
     def rename(self, item):
         """An edit box over the icon's label, like Windows: Enter or clicking
         elsewhere renames, Escape cancels."""
@@ -1409,6 +1423,8 @@ class Desktop:
             new = Gtk.Menu()
             self.add(new, "_Folder", lambda: self.new_item("folder", at))
             self.add(new, "_Text Document", lambda: self.new_item("text", at))
+            new.append(Gtk.SeparatorMenuItem())
+            self.add(new, "_Launcher…", lambda: self.new_launcher(at))
             sub = Gtk.MenuItem.new_with_mnemonic("Ne_w")
             sub.set_submenu(new)
             menu.append(sub)

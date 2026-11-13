@@ -1674,6 +1674,12 @@ class Explorer(Gtk.ApplicationWindow):
                     pass
             error_box(self, f"Couldn't open {name}", err.message)
 
+    def desktop_shortcut(self, program):
+        """A launcher on the desktop for this program (firox_launcher)."""
+        import firox_launcher
+        desktop = GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_DESKTOP) or os.path.expanduser("~/Desktop")
+        firox_launcher.LauncherDialog(self, desktop, program).run_and_create()
+
     def open_with(self, gfile):
         dlg = Gtk.AppChooserDialog.new(self, Gtk.DialogFlags.MODAL, gfile)
         if dlg.run() == Gtk.ResponseType.OK and dlg.get_app_info():
@@ -2393,6 +2399,11 @@ class Explorer(Gtk.ApplicationWindow):
                 self.menu_item(menu, "Rena_me", self.rename if one is not None else None)
                 self.menu_item(menu, "Move to Recycle _Bin", self.trash)
                 local = [local_path(Gio.File.new_for_uri(r[C_URI])) for r in rows]
+                if one is not None and not one[C_DIR] and local[0]:
+                    import firox_launcher
+                    if firox_launcher.kind_of(local[0]):
+                        self.menu_item(menu, "Create Desktop _Shortcut…",
+                                       lambda p=local[0]: self.desktop_shortcut(p))
                 if all(local) and GLib.find_program_in_path("firox-virusscan") and \
                         GLib.find_program_in_path("clamscan"):
                     menu.append(Gtk.SeparatorMenuItem())

@@ -568,6 +568,8 @@ class StartMenu(Gtk.Window):
         if app_id.startswith("waydroid.") or app_id == "Waydroid.desktop":
             return "Android Apps"
         cats = (info.get_categories() or "").split(";")
+        if "X-Firox-Windows" in cats:
+            return "Windows Programs"            # launchers made for .exe files
         for key, label, _ in CATEGORIES:
             if key in cats:
                 return label
@@ -597,8 +599,9 @@ class StartMenu(Gtk.Window):
         groups = {}
         for info in apps:
             groups.setdefault(self._group_of(info), []).append(info)
-        order = ["Web Apps", "Android Apps"] + [c[1] for c in CATEGORIES] + ["Other"]
-        icons = {"Web Apps": "applications-internet", "Android Apps": "waydroid", "Other": "applications-other"}
+        order = ["Web Apps", "Android Apps", "Windows Programs"] + [c[1] for c in CATEGORIES] + ["Other"]
+        icons = {"Web Apps": "applications-internet", "Android Apps": "waydroid", "Windows Programs": "wine-launcher",
+                 "Other": "applications-other"}
         icons.update({label: icon for _, label, icon in CATEGORIES})
         for name in order:
             members = groups.get(name)
