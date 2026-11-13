@@ -78,23 +78,16 @@ jobs:
             just build ${IMAGE_NAME} ${DEFAULT_TAG}
           fi
 
-      # This is optional, this provides smaller delta updates
-      - name: Rechunk with rpm-ostree
+      # Smaller updates for installed systems. Chunkah (https://github.com/coreos/chunkah),
+      # like scripts/nightly-build.sh: both push the same tags, so they must
+      # split the image the same way or machines download it all again.
+      # (`just ostree-rechunk` is the older rpm-ostree way.)
+      - name: Rechunk with Chunkah
         id: rechunk
         run: |
-          just ostree-rechunk \
+          just rechunk \
             ${IMAGE_NAME} \
             ${DEFAULT_TAG}
-
-      # If you are feeling adventurous, use the new distro agnostic rechunker
-      # https://github.com/coreos/chunkah
-      # You can delete the Rechunk with rpm-ostree portion then if you use this
-      #- name: Rechunk with Chunkah
-      #  id: rechunk
-      #  run: |
-      #    just rechunk \
-      #      ${IMAGE_NAME} \
-      #      ${DEFAULT_TAG}
 
       - name: Generate Build Tags
         id: gen-build-tags
