@@ -78,6 +78,24 @@ def ge_versions():
     return sorted(glob.glob(os.path.join(PROTONS, "GE-Proton*")), key=key, reverse=True)
 
 
+def shared_container(env):
+    """Is an earlier program already running the shared container for this
+    C: drive? umu names its launcher service com.steampowered.App + the md5
+    of the prefix's path, on the session bus."""
+    import hashlib
+    from pathlib import Path
+    pfx = str(Path(env["WINEPREFIX"]).expanduser().resolve(strict=False))
+    name = "com.steampowered.App" + hashlib.md5(pfx.encode()).hexdigest()
+    try:
+        r = subprocess.run(["gdbus", "call", "--session", "--dest", "org.freedesktop.DBus",
+                            "--object-path", "/org/freedesktop/DBus",
+                            "--method", "org.freedesktop.DBus.NameHasOwner", name],
+                           capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return "true" in r.stdout
+
+
 def first_run():
     return not ge_versions() or not glob.glob(os.path.join(RUNTIME, "steamrt*"))
 
@@ -167,6 +185,15 @@ def run(path, args):
     argv = [UMU] + command(path, args)
     cwd = os.path.dirname(path)
     if tty():
+        if env.get("UMU_CONTAINER_NSENTER") == "1":
+            if shared_container(env):
+                print(f"firox-windows: {name} runs inside the shared container of the Windows "
+                      "programs already running.", file=sys.stderr)
+            else:
+                print(f"firox-windows: {name} starts the shared container that Windows programs opened "
+                      "after it will run in.\n  This terminal keeps going until all of them have closed, "
+                      "even after this program does;\n  Ctrl+C or closing the terminal stops them all.",
+                      file=sys.stderr)
         os.chdir(cwd)
         os.execvpe(UMU, argv, env)
     if first_run():
@@ -218,6 +245,8 @@ def status():
     drive = os.path.join(env["WINEPREFIX"], "drive_c")
     print(f"C: drive: {drive}" + ("" if os.path.isdir(drive) else " (made on the first run)"))
     print(f"Wine's Wayland driver: {'on' if env['PROTON_ENABLE_WAYLAND'] not in ('', '0') else 'off (XWayland)'}")
+    if env.get("UMU_CONTAINER_NSENTER") == "1":
+        print(f"Shared container: {'running (new programs join it)' if shared_container(env) else 'not running'}")
     print(f"umu-launcher: {shutil.which(UMU) or 'not installed'}")
     return 0
 
