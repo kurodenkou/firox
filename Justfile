@@ -183,11 +183,16 @@ build-nvidia $target_image=(image_name + "-nvidia-open") $tag=default_tag:
     echo "Akmods: ${AKMODS_IMAGE}"
     just build "${target_image}" "${tag}"
 
-# Split the image for smaller updates (New)!
+# Split the image for smaller updates, with chunkah (what the nightly build
+# and the GitHub workflow use). It compresses layers on every core;
+# CHUNKAH_THREADS=N limits that (0 = all cores), and CHUNKAH_COMPRESSION=1..9
+# trades size for speed (default 6; 1 is much faster, layers a bit bigger).
 rechunk $target_image=image_name $tag=default_tag:
     #!/usr/bin/env bash
 
     set -xeuo pipefail
+    threads="${CHUNKAH_THREADS:-0}"
+    level="${CHUNKAH_COMPRESSION:-6}"
 
     # TODO: pin chunkah image to hash once mature enough
     # You may run into space issues on github runners as we are making a
@@ -197,7 +202,7 @@ rechunk $target_image=image_name $tag=default_tag:
 
     # You may omit the current directory here if you are confident that you
     # won't run out of space on /tmp for your image
-    CHUNKAH_OUTPUT_DIR="$(mktemp -d ./"${target_image}"_chunkah_XXXXXX)"
+    CHUNKAH_OUTPUT_DIR="$(mktemp -d ./"${target_image//\//_}"_chunkah_XXXXXX)"
 
     trap 'rm -f "${CHUNKAH_CONFIG_FILE}"; rm -rf "${CHUNKAH_OUTPUT_DIR}"' EXIT
     podman inspect "${target_image}:${tag}" > "${CHUNKAH_CONFIG_FILE}"
@@ -210,6 +215,8 @@ rechunk $target_image=image_name $tag=default_tag:
       build \
       --verbose \
       --compressed \
+      --compression-level "${level}" \
+      --threads "${threads}" \
       --max-layers 128 \
       --prune /sysroot/ \
       --label ostree.commit- --label ostree.final-diffid- \

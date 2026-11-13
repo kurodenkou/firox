@@ -13,6 +13,12 @@ VARIANTS="main nvidia"
 
 # Rechunk like the GitHub build does (smaller downloads for installed systems)
 RECHUNK=1
+# Which rechunker: chunkah compresses on every core; rpm-ostree (the old one)
+# uses one. Switching changes how the image is split, so installed machines
+# download the whole image once after the first build with the other one.
+RECHUNKER="chunkah"
+CHUNKAH_THREADS=0                # cores to use, 0 = all
+CHUNKAH_COMPRESSION=6            # gzip level: 1 is much faster, layers a bit bigger
 
 # --- Publishing to ghcr.io -------------------------------------------------
 # A GitHub personal access token (classic) with the write:packages scope,

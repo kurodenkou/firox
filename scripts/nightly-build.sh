@@ -33,6 +33,9 @@ REPO_DIR="$HOME/firox-build"     # a checkout used only by this script (reset ea
 BRANCH="main"
 VARIANTS="main nvidia"           # main = firox, nvidia = firox-nvidia-open
 RECHUNK=1                        # smaller updates for installed systems, like CI
+RECHUNKER="chunkah"              # chunkah (all cores) or rpm-ostree (one core, the old way)
+CHUNKAH_THREADS=0                # chunkah: cores to use, 0 = all
+CHUNKAH_COMPRESSION=6            # chunkah: gzip level 1 (fast, bigger) to 9 (slow, smaller)
 PUSH_GHCR=1                      # push to ghcr.io/$GHCR_OWNER
 GHCR_OWNER="kurodenkou"
 GHCR_USER="kurodenkou"
@@ -193,8 +196,15 @@ for variant in $VARIANTS; do
     fi
 
     if [ "$RECHUNK" = 1 ]; then
-        say "[$variant] rechunking"
-        run just ostree-rechunk "$img" "$TAG" || { fail "$img: rechunk"; continue; }
+        say "[$variant] rechunking with $RECHUNKER"
+        started=$SECONDS
+        if [ "$RECHUNKER" = rpm-ostree ]; then
+            run just ostree-rechunk "$img" "$TAG" || { fail "$img: rechunk"; continue; }
+        else
+            CHUNKAH_THREADS="$CHUNKAH_THREADS" CHUNKAH_COMPRESSION="$CHUNKAH_COMPRESSION" \
+                run just rechunk "$img" "$TAG" || { fail "$img: rechunk"; continue; }
+        fi
+        say "[$variant] rechunked in $(( (SECONDS - started) / 60 ))m $(( (SECONDS - started) % 60 ))s"
     fi
 
     tags="$(just generate-build-tags "$img" "$TAG" 2>/dev/null | tail -n1)"
