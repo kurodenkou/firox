@@ -205,7 +205,17 @@ rechunk $target_image=image_name $tag=default_tag:
     CHUNKAH_OUTPUT_DIR="$(mktemp -d ./"${target_image//\//_}"_chunkah_XXXXXX)"
 
     trap 'rm -f "${CHUNKAH_CONFIG_FILE}"; rm -rf "${CHUNKAH_OUTPUT_DIR}"' EXIT
-    podman inspect "${target_image}:${tag}" > "${CHUNKAH_CONFIG_FILE}"
+    # The image inherits the base image's manifest annotations (podman
+    # inspect shows them as Annotations), and chunkah copies them across.
+    # Drop the ones that describe the base, not this build: its ostree commit
+    # and its creation time. rpm-ostree takes the update's date from
+    # org.opencontainers.image.created and refuses an "older" one as a
+    # downgrade, so stamp it with now.
+    podman inspect "${target_image}:${tag}" | jq '.[0].Annotations |= with_entries(select(
+        (.key | startswith("ostree.") | not) and
+        .key != "org.opencontainers.image.created" and
+        .key != "org.opencontainers.image.version"))' > "${CHUNKAH_CONFIG_FILE}"
+    now="$(date +%s)"
 
     podman run --rm \
       --mount=type=image,src="${target_image}:${tag}",target=/chunkah \
@@ -220,6 +230,8 @@ rechunk $target_image=image_name $tag=default_tag:
       --max-layers 128 \
       --prune /sysroot/ \
       --label ostree.commit- --label ostree.final-diffid- \
+      --source-date-epoch "${now}" \
+      --annotation "org.opencontainers.image.created=$(date -u -d "@${now}" +%Y-%m-%dT%H:%M:%SZ)" \
       --config /chunkah-config.json \
       --output oci:/run/out/chunked
 
