@@ -3,13 +3,22 @@
 # (/etc/xdg/xdg-desktop-portal-wlr/config). Prints "Monitor: NAME".
 #
 # One monitor: share it straight away, so apps that capture the screen
-# unattended (Sunshine at login, for example) don't wait for a click.
-# Several: pick one from a list (fuzzel), or click one if that isn't
-# available (slurp, xdg-desktop-portal-wlr's default).
+# unattended (Firox Stream, for example) don't wait for a click.
+# Several: the one Firox Stream asked for (it writes the name to a file just
+# before asking, for the next minute), or pick one from a list (fuzzel), or
+# click one if that isn't available (slurp, xdg-desktop-portal-wlr's default).
 mapfile -t outputs < <(wlr-randr 2>/dev/null | awk '
     /^[^ ]/ { name = $1 }
     /^  Enabled: yes/ { print name }')
-if [ "${#outputs[@]}" -eq 1 ]; then
+hint="${XDG_STATE_HOME:-$HOME/.local/state}/firox/screencast-output"
+wanted=""
+if [ -n "$(find "$hint" -mmin -1 2>/dev/null)" ]; then
+    wanted="$(head -n1 "$hint")"
+    rm -f "$hint"
+fi
+if [ -n "$wanted" ] && printf '%s\n' "${outputs[@]}" | grep -qxF -- "$wanted"; then
+    echo "Monitor: $wanted"
+elif [ "${#outputs[@]}" -eq 1 ]; then
     echo "Monitor: ${outputs[0]}"
 elif [ "${#outputs[@]}" -gt 1 ] && command -v fuzzel >/dev/null; then
     cfg=()

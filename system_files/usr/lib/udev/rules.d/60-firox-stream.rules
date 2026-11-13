@@ -1,0 +1,5 @@
+# Firox Stream: the logged-in user may create virtual input devices, so a
+# computer streaming this one can type and click (firox-stream's Injector).
+# static_node: /dev/uinput exists before the module loads, and opening it
+# loads the module.
+KERNEL=="uinput", SUBSYSTEM=="misc", OPTIONS+="static_node=uinput", TAG+="uaccess"

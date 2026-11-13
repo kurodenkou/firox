@@ -89,6 +89,8 @@ firox-power battery-watch >/dev/null 2>&1 &
 firox-backup watch >/dev/null 2>&1 &
 # Sync between Firox computers, if it's on (firox-sync)
 firox-sync daemon >/dev/null 2>&1 &
+# Let paired computers stream this one, if it's on (firox-stream)
+firox-stream daemon >/dev/null 2>&1 &
 
 # Night Light: warmer colours in the evening (firox-nightlight; Settings >
 # Night Light, or the moon on the taskbar)

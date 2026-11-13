@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Firox Stream
+GenericName=Game and Desktop Streaming
+Comment=Play another Firox computer's games and desktop from this one
+Exec=firox-stream
+Icon=preferences-desktop-remote-desktop
+Categories=Network;RemoteAccess;Game;
+Keywords=stream;streaming;remote;desktop;moonlight;sunshine;game;play;
+StartupNotify=false
