@@ -246,6 +246,16 @@ cp "/tmp/umu-launcher-${UMU_COMMIT}/LICENSE" /usr/share/licenses/umu-launcher/
 rm -rf /tmp/umu.tar.gz "/tmp/umu-launcher-${UMU_COMMIT}"
 python3 -c "import sys; sys.path.insert(0, '/usr/lib/umu-launcher'); import umu.umu_run"
 
+# firox-sleep.exe: the windowless Windows program that keeps the shared
+# container running, so several Windows programs can run and close in any
+# order (firox-windows --host). Built from build_files/firox-sleep.c with
+# Fedora's MinGW cross-compiler, which is removed again afterwards.
+dnf5 install -y --setopt=install_weak_deps=False mingw64-gcc
+mkdir -p /usr/lib/firox/windows
+x86_64-w64-mingw32-gcc -O2 -s -mwindows -o /usr/lib/firox/windows/firox-sleep.exe /ctx/firox-sleep.c
+dnf5 remove -y mingw64-gcc          # takes the rest of the toolchain with it
+test -s /usr/lib/firox/windows/firox-sleep.exe
+
 # Virus definitions for Virus Scan: freshclam downloads them (about 200 MB
 # the first time) and checks for new ones every two hours
 systemctl enable clamav-freshclam.service
