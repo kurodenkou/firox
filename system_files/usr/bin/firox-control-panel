@@ -80,6 +80,7 @@ APPLETS = [
     ("document-revert", "System Restore", "Go back to the version you used before an update", ["firox-restore"]),
     ("drive-harddisk", "Backup and Restore", "Back up your files to a USB drive or network folder", ["firox-backup"]),
     ("emblem-synchronizing", "Sync", "Keep folders the same on your Firox computers", ["firox-sync"]),
+    ("preferences-desktop-remote-desktop", "Firox Stream", "Play another computer here, or let others stream this one", ["firox-stream"]),
     ("preferences-system-time", "Date and Time", "Time zone and clock synchronisation", ["@datetime"]),
     ("system-users", "User Accounts", "Change your picture or password", ["@accounts"]),
     ("utilities-system-monitor", "Task Manager", "Running programs and performance", ["firox-open", "task-manager"]),

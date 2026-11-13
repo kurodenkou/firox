@@ -118,6 +118,13 @@ PACKAGES=(
     zenity                       # dialogs for shell scripts (zenity --info, --question, --file-selection...)
     rsync                        # Backup and Restore (firox-backup)
     syncthing                    # Sync between Firox computers (firox-sync)
+    # Firox Stream (firox-stream): stream another computer's screen and sound
+    gstreamer1-plugins-bad       # full build (fedora-multimedia): VA-API/NVENC/QSV H.264 encoders, h264parse
+    gstreamer1-plugins-ugly      # x264enc, when the graphics card can't encode
+    gstreamer1-plugins-good-gtk  # gtksink/gtkglsink: the picture in a GTK window
+    pipewire-gstreamer           # pipewiresrc: the shared screen
+    python3-evdev                # the host's virtual keyboard and mouse (uinput)
+    avahi-tools                  # finding computers on the network
     clamav                       # Virus Scan (firox-virusscan): clamscan
     clamav-freshclam             # ... and its virus definitions, kept up to date
 
@@ -212,6 +219,12 @@ systemctl enable waydroid-container.service
 for zone in public home FedoraWorkstation; do
     firewall-offline-cmd --zone="${zone}" --add-service=mdns --add-service=syncthing \
         --add-port=22100/tcp >/dev/null 2>&1 || true
+done
+
+# Firox Stream: other Firox computers connect here to stream this one.
+# Nothing listens unless streaming is turned on (firox-stream on).
+for zone in public home FedoraWorkstation; do
+    firewall-offline-cmd --zone="${zone}" --add-port=48300/tcp >/dev/null 2>&1 || true
 done
 
 # Network in the file manager: let the answers in when it looks for Windows

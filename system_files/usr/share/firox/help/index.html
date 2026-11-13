@@ -45,6 +45,7 @@
   <a href="#gadgets">Desktop Gadgets</a>
   <a href="#backup">Backing up</a>
   <a href="#sync">Sync</a>
+  <a href="#stream">Firox Stream</a>
   <a href="#restore">System Restore</a>
   <a href="#taskmgr">Task Manager</a>
   <a href="#terminal">Command Prompt</a>
@@ -173,6 +174,10 @@
 <h2 id="sync">Syncing folders between your computers</h2>
 <p>Turn on <b>Settings &rarr; Sync</b> on each Firox computer at home. They find each other on the network; click <b>Pair&hellip;</b> next to the other computer and type the PIN it shows. Tick the folders to keep the same (Documents, Pictures and so on): a file you save on one appears on the others within moments. Syncing happens directly between your computers on your own network, never through the internet. If another computer deletes or replaces a file, the old one is kept for 30 days in a hidden <code>.stversions</code> folder.</p>
 <p>Sync isn't a backup: deleting a file deletes it everywhere. Use Backup and Restore as well.</p>
+
+<h2 id="stream">Playing another computer (Firox Stream)</h2>
+<p>Firox Stream shows another Firox computer's screen here, plays its sound, and sends it your keyboard and mouse: play the games on your desktop PC from a laptop, for example. On the computer you want to stream, open <b>Firox Stream</b> from the Start menu and tick <b>Let other computers stream this one</b>. On this computer, open Firox Stream, pick the other one from the list (or type its address) and click <b>Connect</b>. The first time, the other computer shows a 4-digit PIN: type it here. After that they connect without one.</p>
+<p>While streaming, <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>F</kbd> switches full screen on and off and <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>Q</kbd> stops. It works best over a wired network. <b>Forget Paired Computers</b> makes every computer need a PIN again. If the picture never arrives, the other computer's log is <code>~/.local/state/firox/stream.log</code>.</p>
 
 <h2 id="restore">Going back after an update (System Restore)</h2>
 <p>Each update installs a complete new version of Firox Linux and keeps the one you used before. If something stopped working after an update, open <b>Settings &rarr; System Restore</b>, pick <b>Previous version</b> and click <b>Restore this version</b>; it starts the next time you restart (<b>Undo</b> changes your mind). Your files, settings and apps aren't touched.</p>

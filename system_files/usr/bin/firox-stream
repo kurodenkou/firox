@@ -1,0 +1,1685 @@
+#!/usr/bin/python3
+"""
+firox-stream: play another Firox computer's games and desktop from this one.
+
+    firox-stream                  open Firox Stream (pick a computer to stream)
+    firox-stream connect ADDRESS  stream that computer (ADDRESS[:PORT])
+    firox-stream daemon           at login, when streaming is on: let paired
+                                  computers stream this one
+    firox-stream on|off           let other computers stream this one, or not
+    firox-stream unpair           forget every computer paired with this one
+    firox-stream status           print whether it's on and what's paired
+
+The computer being streamed (the host) captures its main display through the
+desktop portal (screen sharing), encodes it as H.264 with GStreamer (the
+graphics card's encoder when there is one, x264 otherwise) and its sound as
+Opus, and sends both to the other computer over one TLS connection (TCP port
+48300). The other computer plays them and sends its keyboard and mouse back;
+the host types and clicks them through virtual devices (uinput).
+
+Computers on the network that allow streaming announce themselves with Avahi
+as _firox-stream._tcp. The first time, pairing takes a 4-digit PIN shown on
+the host: whoever connects must be able to see the host's screen. Both sides
+then remember each other, the host by a token, the other computer by the
+host's certificate.
+
+While streaming:  Ctrl+Alt+Shift+F  full screen      Ctrl+Alt+Shift+Q  stop
+
+Settings: ~/.config/firox/stream.json (host: on/off, bitrate, sound, paired
+computers) and ~/.config/firox/stream-hosts.json (the computers this one has
+streamed). Host log: ~/.local/state/firox/stream.log
+"""
+
+import collections
+import hashlib
+import hmac
+import json
+import os
+import queue
+import random
+import secrets
+import select
+import socket
+import ssl
+import struct
+import subprocess
+import sys
+import threading
+import time
+
+sys.path.insert(0, "/usr/lib/firox/python")
+
+CONFIG = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "firox")
+STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "firox")
+CONF = os.path.join(CONFIG, "stream.json")
+HOSTS = os.path.join(CONFIG, "stream-hosts.json")
+CERT_DIR = os.path.join(CONFIG, "stream")
+LOG = os.path.join(STATE_DIR, "stream.log")
+# Read by /usr/libexec/firox/screencast-chooser: which monitor to share
+CHOOSER_HINT = os.path.join(STATE_DIR, "screencast-output")
+PORT = 48300
+SERVICE = "_firox-stream._tcp"
+MAX_MESSAGE = 32 << 20
+BACKLOG_LIMIT = 6 << 20         # bytes queued for a slow network before frames are skipped
+
+
+def log(*args):
+    print(time.strftime("%H:%M:%S"), *args, file=sys.stderr, flush=True)
+
+
+# ----------------------------------------------------------------- config --
+
+def _load(path, default):
+    try:
+        with open(path) as fh:
+            data = json.load(fh)
+        if isinstance(data, dict):
+            default.update(data)
+    except (OSError, ValueError):
+        pass
+    return default
+
+
+def _save(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)     # holds tokens
+    with os.fdopen(fd, "w") as fh:
+        json.dump(data, fh, indent=1)
+    os.replace(tmp, path)
+
+
+def load_conf():
+    return _load(CONF, {"enabled": False, "port": PORT, "bitrate": 20000, "fps": 60,
+                        "audio": True, "encoder": "auto", "clients": {}})
+
+
+def save_conf(conf):
+    _save(CONF, conf)
+
+
+def load_hosts():
+    """Computers this one has paired with, by certificate fingerprint."""
+    return _load(HOSTS, {})
+
+
+def save_hosts(hosts):
+    _save(HOSTS, hosts)
+
+
+def computer_name():
+    try:
+        pretty = subprocess.run(["hostnamectl", "--pretty"], capture_output=True, text=True,
+                                timeout=5).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        pretty = ""
+    user = os.environ.get("USER", "")
+    host = pretty or socket.gethostname().split(".")[0]
+    return f"{user} on {host}" if user else host
+
+
+def proof(pin, fingerprint, name):
+    """What a computer sends to show it typed the PIN. It covers the host's
+    certificate as the computer saw it, so a PIN typed into a go-between
+    doesn't work on the real host."""
+    return hmac.new(pin.encode(), f"firox-stream|{fingerprint}|{name}".encode(),
+                    hashlib.sha256).hexdigest()
+
+
+def token_key(token):
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+def split_address(text):
+    text = text.strip()
+    if text.count(":") == 1:
+        host, _, port = text.partition(":")
+        if port.isdigit():
+            return host, int(port)
+    if text.startswith("[") and "]:" in text:                     # [IPv6]:port
+        host, _, port = text[1:].partition("]:")
+        if port.isdigit():
+            return host, int(port)
+    return text.strip("[]"), PORT
+
+
+def discover(timeout=5):
+    """Computers on the network that allow streaming: [{name, address, port}]."""
+    try:
+        out = subprocess.run(["avahi-browse", "-p", "-r", "-t", SERVICE], capture_output=True, text=True,
+                             timeout=timeout + 4).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    found = {}
+    for line in out.splitlines():
+        parts = line.split(";")
+        if not parts or parts[0] != "=" or len(parts) < 9 or parts[2] != "IPv4":
+            continue
+        name = parts[3].replace("\\032", " ")
+        found[(parts[7], parts[8])] = {"name": name, "address": parts[7], "port": int(parts[8] or PORT)}
+    return sorted(found.values(), key=lambda f: f["name"].lower())
+
+
+# ---------------------------------------------------------------- network --
+
+def keepalive(sock):
+    """Notice within about 25 seconds that the other computer went away."""
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    for opt, val in (("TCP_KEEPIDLE", 10), ("TCP_KEEPINTVL", 5), ("TCP_KEEPCNT", 3)):
+        if hasattr(socket, opt):
+            sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, opt), val)
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+
+def frame(kind, payload=b""):
+    if isinstance(payload, (dict, list)):
+        payload = json.dumps(payload).encode()
+    return kind.encode() + struct.pack(">I", len(payload)) + payload
+
+
+def recv_exact(sock, n):
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise EOFError("connection closed")
+        buf += chunk
+    return bytes(buf)
+
+
+def recv_message(sock):
+    """One message, on a blocking socket (the handshake): (kind, payload)."""
+    head = recv_exact(sock, 5)
+    n = struct.unpack(">I", head[1:])[0]
+    if n > 65536:
+        raise ValueError("message too long")
+    return chr(head[0]), recv_exact(sock, n)
+
+
+def recv_json(sock):
+    kind, payload = recv_message(sock)
+    try:
+        return kind, json.loads(payload or b"{}")
+    except ValueError:
+        raise ValueError("bad message") from None
+
+
+class Channel:
+    """Messages both ways over one TLS connection, from a single thread: an
+    SSL connection mustn't be read and written by two threads at once.
+    send() can be called from any thread."""
+
+    def __init__(self, sock, on_message, on_close=None):
+        self.sock = sock
+        self.on_message = on_message
+        self.on_close = on_close
+        self.lock = threading.Lock()
+        self.out = collections.deque()
+        self.queued = 0
+        self.cur = b""
+        self.inbuf = bytearray()
+        self.closed = False
+        self.reason = ""
+        self.wake_r, self.wake_w = os.pipe()
+        os.set_blocking(self.wake_r, False)
+        os.set_blocking(self.wake_w, False)
+
+    def backlog(self):
+        return self.queued
+
+    def _wake(self):
+        try:
+            os.write(self.wake_w, b"x")
+        except OSError:
+            pass
+
+    def send(self, kind, payload=b""):
+        data = frame(kind, payload)
+        with self.lock:
+            if self.closed:
+                return False
+            self.out.append(data)
+            self.queued += len(data)
+        self._wake()
+        return True
+
+    def close(self, reason=""):
+        with self.lock:
+            if not self.reason:
+                self.reason = reason
+            self.closed = True
+        self._wake()
+
+    def run(self):
+        self.sock.setblocking(False)
+        stalled_since = None
+        try:
+            while True:
+                with self.lock:
+                    if self.closed:
+                        break
+                    want_write = bool(self.cur) or bool(self.out)
+                if self.sock.pending():
+                    self._read()
+                r, w, _ = select.select([self.sock, self.wake_r], [self.sock] if want_write else [], [], 5)
+                if self.wake_r in r:
+                    try:
+                        os.read(self.wake_r, 4096)
+                    except BlockingIOError:
+                        pass
+                if self.sock in r:
+                    self._read()
+                if want_write:
+                    before = self.queued
+                    if self.sock in w:
+                        self._write()
+                    if self.queued < before or not (self.cur or self.out):
+                        stalled_since = None
+                    elif stalled_since is None:
+                        stalled_since = time.monotonic()
+                    elif time.monotonic() - stalled_since > 20:
+                        raise OSError("the other computer stopped answering")
+        except EOFError:
+            self.close("disconnected")
+        except (OSError, ValueError) as e:
+            self.close(str(e) or e.__class__.__name__)
+        finally:
+            with self.lock:
+                self.closed = True
+            for fd in (self.wake_r, self.wake_w):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+            if self.on_close:
+                self.on_close(self.reason)
+
+    def _read(self):
+        # (TLS may already hold decrypted bytes that select() can't see)
+        while True:
+            try:
+                data = self.sock.recv(262144)
+            except (ssl.SSLWantReadError, ssl.SSLWantWriteError, BlockingIOError):
+                break
+            if not data:
+                raise EOFError
+            self.inbuf += data
+        while len(self.inbuf) >= 5:
+            n = struct.unpack(">I", self.inbuf[1:5])[0]
+            if n > MAX_MESSAGE:
+                raise ValueError("message too long")
+            if len(self.inbuf) < 5 + n:
+                break
+            kind = chr(self.inbuf[0])
+            payload = bytes(self.inbuf[5:5 + n])
+            del self.inbuf[:5 + n]
+            self.on_message(kind, payload)
+
+    def _write(self):
+        while True:
+            if not self.cur:
+                with self.lock:
+                    if not self.out:
+                        return
+                    parts, size = [], 0
+                    while self.out and size < 262144:
+                        part = self.out.popleft()
+                        parts.append(part)
+                        size += len(part)
+                self.cur = memoryview(b"".join(parts))
+            try:
+                n = self.sock.send(self.cur)
+            except (ssl.SSLWantWriteError, ssl.SSLWantReadError, BlockingIOError):
+                return
+            with self.lock:
+                self.queued -= n
+            self.cur = self.cur[n:]
+
+
+# ------------------------------------------------------------------- host --
+
+def ensure_cert():
+    """This computer's streaming certificate (made the first time)."""
+    cert, key = os.path.join(CERT_DIR, "cert.pem"), os.path.join(CERT_DIR, "key.pem")
+    if not (os.path.exists(cert) and os.path.exists(key)):
+        os.makedirs(CERT_DIR, mode=0o700, exist_ok=True)
+        subprocess.run(["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1",
+                        "-nodes", "-days", "36500", "-subj", "/CN=Firox Stream", "-keyout", key, "-out", cert],
+                       check=True, capture_output=True)
+        os.chmod(key, 0o600)
+    with open(cert) as fh:
+        der = ssl.PEM_cert_to_DER_cert(fh.read())
+    return cert, key, hashlib.sha256(der).hexdigest()
+
+
+class PortalError(Exception):
+    pass
+
+
+class ScreenCast:
+    """A screen-sharing session through xdg-desktop-portal. The portal's
+    answers arrive as D-Bus signals on the main loop (the daemon runs
+    Gtk.main), so these calls are made from a connection's own thread."""
+
+    def __init__(self):
+        from gi.repository import Gio
+        self.Gio = Gio
+        self.bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        self.sender = self.bus.get_unique_name()[1:].replace(".", "_")
+        self.session = None
+
+    def _call(self, method, signature, args, reply="(o)", fds=False):
+        from gi.repository import GLib
+        params = GLib.Variant(signature, args)
+        if fds:
+            return self.bus.call_with_unix_fd_list_sync(
+                "org.freedesktop.portal.Desktop", "/org/freedesktop/portal/desktop",
+                "org.freedesktop.portal.ScreenCast", method, params, GLib.VariantType(reply),
+                self.Gio.DBusCallFlags.NONE, 30000, None, None)
+        return self.bus.call_sync(
+            "org.freedesktop.portal.Desktop", "/org/freedesktop/portal/desktop",
+            "org.freedesktop.portal.ScreenCast", method, params, GLib.VariantType(reply),
+            self.Gio.DBusCallFlags.NONE, 30000, None)
+
+    def _request(self, method, signature, make_args, timeout=90):
+        from gi.repository import GLib
+        token = "firox" + secrets.token_hex(6)
+        path = f"/org/freedesktop/portal/desktop/request/{self.sender}/{token}"
+        done, result = threading.Event(), {}
+
+        def on_response(_conn, _sender, _path, _iface, _signal, params, _data):
+            result["code"], result["results"] = params.unpack()
+            done.set()
+
+        sub = self.bus.signal_subscribe("org.freedesktop.portal.Desktop", "org.freedesktop.portal.Request",
+                                        "Response", path, None, self.Gio.DBusSignalFlags.NONE,
+                                        on_response, None)
+        try:
+            self._call(method, signature, make_args({"handle_token": GLib.Variant("s", token)}))
+            if not done.wait(timeout):
+                raise PortalError(f"the screen-sharing portal didn't answer ({method})")
+        finally:
+            self.bus.signal_unsubscribe(sub)
+        if result["code"] != 0:
+            raise PortalError("screen sharing was cancelled" if result["code"] == 1
+                              else f"screen sharing failed ({method})")
+        return result["results"]
+
+    def cursor_modes(self):
+        from gi.repository import GLib
+        try:
+            out = self.bus.call_sync("org.freedesktop.portal.Desktop", "/org/freedesktop/portal/desktop",
+                                     "org.freedesktop.DBus.Properties", "Get",
+                                     GLib.Variant("(ss)", ("org.freedesktop.portal.ScreenCast",
+                                                           "AvailableCursorModes")),
+                                     GLib.VariantType("(v)"), self.Gio.DBusCallFlags.NONE, 5000, None)
+            return out.unpack()[0]
+        except GLib.Error:
+            return 0
+
+    def start(self, cursor=True):
+        """Share one monitor. Returns (pipewire fd, node id, cursor shown)."""
+        from gi.repository import GLib
+        res = self._request("CreateSession", "(a{sv})", lambda o: (dict(
+            o, session_handle_token=GLib.Variant("s", "firox" + secrets.token_hex(6))),))
+        self.session = res["session_handle"]
+        embedded = cursor and bool(self.cursor_modes() & 2)
+        opts = {"types": GLib.Variant("u", 1), "multiple": GLib.Variant("b", False)}
+        if embedded:
+            opts["cursor_mode"] = GLib.Variant("u", 2)
+        self._request("SelectSources", "(oa{sv})", lambda o: (self.session, dict(o, **opts)))
+        res = self._request("Start", "(osa{sv})", lambda o: (self.session, "", o), timeout=300)
+        streams = res.get("streams") or []
+        if not streams:
+            raise PortalError("no screen was shared")
+        node = streams[0][0]
+        out, fdlist = self._call("OpenPipeWireRemote", "(oa{sv})", (self.session, {}), reply="(h)", fds=True)
+        fd = fdlist.get(out.unpack()[0])
+        return fd, node, embedded
+
+    def close(self):
+        if self.session:
+            from gi.repository import GLib
+            try:
+                self.bus.call_sync("org.freedesktop.portal.Desktop", self.session,
+                                   "org.freedesktop.portal.Session", "Close", None, None,
+                                   self.Gio.DBusCallFlags.NONE, 5000, None)
+            except GLib.Error:
+                pass
+            self.session = None
+
+
+class Injector:
+    """Types and clicks what the other computer sends, through a virtual
+    keyboard and an absolute mouse (like a tablet: it puts the pointer where
+    the other computer's pointer is on the picture)."""
+
+    BUTTONS = (0x110, 0x111, 0x112, 0x113, 0x114)          # left, right, middle, side, extra
+
+    def __init__(self, output):
+        from evdev import AbsInfo, UInput
+        from evdev import ecodes as e
+        self.e = e
+        self.kb = UInput({e.EV_KEY: list(range(1, 249))}, name="Firox Stream Keyboard")
+        self.mouse = UInput({
+            e.EV_KEY: list(self.BUTTONS),
+            e.EV_ABS: [(e.ABS_X, AbsInfo(0, 0, 65535, 0, 0, 0)), (e.ABS_Y, AbsInfo(0, 0, 65535, 0, 0, 0))],
+            e.EV_REL: [e.REL_WHEEL, e.REL_HWHEEL, e.REL_WHEEL_HI_RES, e.REL_HWHEEL_HI_RES],
+        }, name="Firox Stream Mouse")
+        self.down_keys, self.down_buttons = set(), set()
+        self.wheel = [0.0, 0.0]
+        self.geometry(output)
+
+    def geometry(self, output):
+        """Where the shared monitor sits in the desktop: the virtual mouse's
+        range covers every monitor, as the compositor lays them out."""
+        import firox_monitors
+        outs = [o for o in firox_monitors.outputs() if o["enabled"] and o["width"]]
+        self.map = (0.0, 0.0, 1.0, 1.0)
+        if not outs:
+            return
+        x0 = min(o["x"] for o in outs)
+        y0 = min(o["y"] for o in outs)
+        bw = max(o["x"] + o["width"] for o in outs) - x0
+        bh = max(o["y"] + o["height"] for o in outs) - y0
+        o = next((o for o in outs if o["name"] == output), outs[0])
+        self.map = ((o["x"] - x0) / bw, (o["y"] - y0) / bh, o["width"] / bw, o["height"] / bh)
+
+    def handle(self, ev):
+        e = self.e
+        kind = ev[0]
+        if kind == "m":
+            u = min(max(float(ev[1]), 0.0), 0.9999)
+            v = min(max(float(ev[2]), 0.0), 0.9999)
+            mx, my, mw, mh = self.map
+            self.mouse.write(e.EV_ABS, e.ABS_X, int((mx + u * mw) * 65535))
+            self.mouse.write(e.EV_ABS, e.ABS_Y, int((my + v * mh) * 65535))
+            self.mouse.syn()
+        elif kind == "b":
+            code, down = int(ev[1]), bool(ev[2])
+            if code in self.BUTTONS and (down != (code in self.down_buttons)):
+                (self.down_buttons.add if down else self.down_buttons.discard)(code)
+                self.mouse.write(e.EV_KEY, code, int(down))
+                self.mouse.syn()
+        elif kind == "k":
+            code, down = int(ev[1]), bool(ev[2])
+            # The host repeats held keys itself, so the other side's repeats are dropped
+            if 1 <= code <= 248 and (down != (code in self.down_keys)):
+                (self.down_keys.add if down else self.down_keys.discard)(code)
+                self.kb.write(e.EV_KEY, code, int(down))
+                self.kb.syn()
+        elif kind == "s":
+            # Wheel turns (1.0 = one notch); the other side's y grows downwards
+            for i, (delta, hires, lores) in enumerate(((float(ev[1]), e.REL_HWHEEL_HI_RES, e.REL_HWHEEL),
+                                                       (-float(ev[2]), e.REL_WHEEL_HI_RES, e.REL_WHEEL))):
+                if not delta:
+                    continue
+                units = int(round(delta * 120))
+                self.mouse.write(e.EV_REL, hires, units)
+                self.wheel[i] += units
+                notches = int(self.wheel[i] / 120)
+                if notches:
+                    self.mouse.write(e.EV_REL, lores, notches)
+                    self.wheel[i] -= notches * 120
+            self.mouse.syn()
+        elif kind == "r":
+            self.release_all()
+
+    def release_all(self):
+        e = self.e
+        for code in list(self.down_keys):
+            self.kb.write(e.EV_KEY, code, 0)
+        self.kb.syn()
+        for code in list(self.down_buttons):
+            self.mouse.write(e.EV_KEY, code, 0)
+        self.mouse.syn()
+        self.down_keys.clear()
+        self.down_buttons.clear()
+
+    def close(self):
+        try:
+            self.release_all()
+        finally:
+            self.kb.close()
+            self.mouse.close()
+
+
+def video_encoders(kbps, fps):
+    """H.264 encoders to try, best first: (element, [(factory, properties)]).
+    Hardware encoders only appear when the graphics card has one."""
+    gop = fps * 5
+    nv12 = ("capsfilter", {"caps": "video/x-raw,format=NV12"})
+    i420 = ("capsfilter", {"caps": "video/x-raw,format=I420"})
+    va = [("vapostproc", {}), ("capsfilter", {"caps": "video/x-raw(memory:VAMemory),format=NV12"})]
+    va_props = {"bitrate": kbps, "key-int-max": gop, "b-frames": 0, "rate-control": "cbr", "target-usage": 6}
+    return [
+        ("vah264lpenc", va + [("vah264lpenc", va_props)]),
+        ("vah264enc", va + [("vah264enc", va_props)]),
+        ("nvh264enc", [("videoconvert", {}), nv12,
+                       ("nvh264enc", {"bitrate": kbps, "gop-size": gop, "bframes": 0, "rc-mode": "cbr",
+                                      "zerolatency": True, "preset": "low-latency-hq"})]),
+        ("qsvh264enc", [("videoconvert", {}), nv12,
+                        ("qsvh264enc", {"bitrate": kbps, "gop-size": gop, "b-frames": 0,
+                                        "rate-control": "cbr", "low-latency": True})]),
+        ("x264enc", [("videoconvert", {"n-threads": 0}), i420,
+                     ("x264enc", {"tune": "zerolatency", "speed-preset": "superfast", "bitrate": kbps,
+                                  "key-int-max": gop, "threads": 0})]),
+        ("openh264enc", [("videoconvert", {"n-threads": 0}), i420,
+                         ("openh264enc", {"bitrate": kbps * 1000, "gop-size": gop, "complexity": "low",
+                                          "rate-control": "bitrate"})]),
+    ]
+
+
+def make_element(factory, props, name=None):
+    from gi.repository import Gst
+    el = Gst.ElementFactory.make(factory, name)
+    if el is None:
+        raise RuntimeError(f"GStreamer element {factory} is missing")
+    for key, value in props.items():
+        if el.find_property(key) is None:
+            continue
+        try:
+            if key == "caps":
+                el.set_property(key, Gst.Caps.from_string(value))
+            elif isinstance(value, str):
+                Gst.util_set_object_arg(el, key, value)
+            else:
+                el.set_property(key, value)
+        except (TypeError, ValueError):
+            log(f"{factory}: couldn't set {key}={value}")
+    return el
+
+
+def chain(pipeline, elements):
+    for el in elements:
+        pipeline.add(el)
+    for a, b in zip(elements, elements[1:]):
+        if not a.link(b):
+            raise RuntimeError(f"couldn't link {a.get_name()} to {b.get_name()}")
+
+
+class Capture:
+    """The host's GStreamer pipelines for one connection: the shared screen
+    (and the sound) out to the channel."""
+
+    def __init__(self, conf, channel, source=None):
+        import gi
+        gi.require_version("Gst", "1.0")
+        gi.require_version("GstVideo", "1.0")
+        from gi.repository import Gst, GstVideo
+        Gst.init(None)
+        self.Gst, self.GstVideo = Gst, GstVideo
+        self.conf = conf
+        self.channel = channel
+        self.source = source            # (pipewire fd, node) or None for a test picture
+        self.video = self.audio = None
+        self.sent_caps = set()
+        self.need_key = False
+        self.key_asked = 0.0
+        self.first = threading.Event()
+        self.broken = threading.Event()     # the video stopped (any time)
+        self.failed = None
+        self.encoder = None
+
+    # video
+    _encoder = {}                       # the setting -> the encoder that worked (tried once per daemon)
+
+    def pick_encoder(self, kbps, fps):
+        """The first encoder that encodes a few frames of a test picture.
+        Trying them on the shared screen itself isn't safe: a second
+        capture of the same portal stream can upset the portal."""
+        Gst = self.Gst
+        wanted = self.conf.get("encoder") or "auto"
+        if wanted in Capture._encoder:
+            return Capture._encoder[wanted]
+        candidates = [c for c in video_encoders(kbps, fps)
+                      if wanted in ("auto", c[0]) and Gst.ElementFactory.find(c[0])]
+        for name, elements in candidates:
+            pipeline = Gst.Pipeline.new("probe")
+            try:
+                src = make_element("videotestsrc", {"num-buffers": 5})
+                caps = make_element("capsfilter", {"caps": "video/x-raw,format=BGRx,width=640,height=360,framerate=30/1"})
+                parse = make_element("h264parse", {})
+                sink = make_element("fakesink", {"sync": False})
+                chain(pipeline, [src, caps] + [make_element(f, dict(p)) for f, p in elements] + [parse, sink])
+            except RuntimeError as e:
+                log(f"{name}: {e}")
+                continue
+            pipeline.set_state(Gst.State.PLAYING)
+            msg = pipeline.get_bus().timed_pop_filtered(10 * Gst.SECOND, Gst.MessageType.EOS | Gst.MessageType.ERROR)
+            pipeline.set_state(Gst.State.NULL)
+            if msg is not None and msg.type == Gst.MessageType.EOS:
+                Capture._encoder[wanted] = (name, elements)
+                return name, elements
+            log(f"{name}: " + (msg.parse_error()[0].message if msg is not None else "no picture after 10 seconds"))
+        raise RuntimeError("no H.264 encoder works on this computer" if wanted == "auto"
+                           else f"the {wanted} encoder isn't available")
+
+    def start_video(self):
+        Gst = self.Gst
+        kbps, fps = int(self.conf.get("bitrate") or 20000), int(self.conf.get("fps") or 60)
+        name, elements = self.pick_encoder(kbps, fps)
+        self.video = self._video_pipeline(elements, fps)
+        self.video.set_state(Gst.State.PLAYING)
+        if not self.first.wait(8) or self.failed:
+            reason = self.failed or "no picture from the screen after 8 seconds"
+            self.stop()
+            raise RuntimeError(reason)
+        self.encoder = name
+        log(f"video: {name}, {kbps} kbit/s")
+        return name
+
+    def _video_pipeline(self, encoder, fps):
+        Gst = self.Gst
+        pipeline = Gst.Pipeline.new("video")
+        if self.source:
+            fd, node = self.source
+            src = [make_element("pipewiresrc", {"fd": os.dup(fd), "path": str(node), "do-timestamp": True,
+                                                "keepalive-time": 1000, "always-copy": True})]
+        else:
+            src = [make_element("videotestsrc", {"is-live": True, "pattern": "ball"}),
+                   make_element("capsfilter", {"caps": f"video/x-raw,width=1280,height=720,framerate={fps}/1"})]
+        # A frame the encoder can't keep up with is skipped before encoding
+        # (skipping encoded frames would spoil the picture until the next key frame)
+        leak = make_element("queue", {"leaky": "downstream", "max-size-buffers": 1,
+                                      "max-size-bytes": 0, "max-size-time": 0})
+        enc = [make_element(f, dict(p)) for f, p in encoder]
+        parse = make_element("h264parse", {"config-interval": -1})
+        caps = make_element("capsfilter", {"caps": "video/x-h264,stream-format=byte-stream,alignment=au"})
+        sink = make_element("appsink", {"emit-signals": True, "sync": False, "max-buffers": 8}, "sink")
+        chain(pipeline, src + [leak] + enc + [parse, caps, sink])
+        sink.connect("new-sample", self._on_video)
+        pipeline.get_bus().set_sync_handler(self._on_bus, "video")
+        return pipeline
+
+    def _on_bus(self, _bus, msg, which):
+        Gst = self.Gst
+        if msg.type == Gst.MessageType.ERROR:
+            err, debug = msg.parse_error()
+            log(f"{which} error from {msg.src.get_name()}: {err.message} ({debug})")
+            if which == "video":
+                self.failed = self.failed or err.message
+                self.first.set()
+                self.broken.set()
+            else:
+                log("sound off for this stream")
+        return Gst.BusSyncReply.DROP
+
+    def _send_caps(self, kind, sample):
+        if kind not in self.sent_caps:
+            self.sent_caps.add(kind)
+            self.channel.send("K", {"kind": kind, "caps": sample.get_caps().to_string()})
+
+    def _on_video(self, sink):
+        Gst = self.Gst
+        sample = sink.emit("pull-sample")
+        if sample is None:
+            return Gst.FlowReturn.EOS
+        buf = sample.get_buffer()
+        self.first.set()
+        if self.failed:
+            return Gst.FlowReturn.OK
+        delta = buf.has_flags(Gst.BufferFlags.DELTA_UNIT)
+        if self.channel.backlog() > BACKLOG_LIMIT:
+            self.need_key = True                    # the network is behind: skip to a key frame
+        if self.need_key:
+            if not delta and self.channel.backlog() <= BACKLOG_LIMIT:
+                self.need_key = False
+            else:
+                if time.monotonic() - self.key_asked > 1:
+                    self.key_asked = time.monotonic()
+                    sink.send_event(self.GstVideo.video_event_new_upstream_force_key_unit(
+                        Gst.CLOCK_TIME_NONE, True, 0))
+                return Gst.FlowReturn.OK
+        ok, info = buf.map(Gst.MapFlags.READ)
+        if ok:
+            data = bytes(info.data)
+            buf.unmap(info)
+            self._send_caps("video", sample)
+            self.channel.send("V", data)
+        return Gst.FlowReturn.OK
+
+    # sound
+    def start_audio(self):
+        Gst = self.Gst
+        if not self.conf.get("audio", True) or not Gst.ElementFactory.find("opusenc"):
+            return False
+        try:
+            pipeline = Gst.Pipeline.new("audio")
+            if self.source:
+                src = make_element("pulsesrc", {"device": "@DEFAULT_MONITOR@", "buffer-time": 40000,
+                                                "latency-time": 10000, "do-timestamp": True})
+            else:
+                src = make_element("audiotestsrc", {"is-live": True, "wave": "ticks"})
+            caps = make_element("capsfilter", {"caps": "audio/x-raw,rate=48000,channels=2"})
+            enc = make_element("opusenc", {"bitrate": 128000, "frame-size": 10,
+                                           "audio-type": "restricted-lowdelay"})
+            sink = make_element("appsink", {"emit-signals": True, "sync": False, "max-buffers": 50}, "sink")
+            chain(pipeline, [src, make_element("audioconvert", {}), make_element("audioresample", {}),
+                             caps, enc, sink])
+        except RuntimeError as e:
+            log(f"sound: {e}")
+            return False
+        sink.connect("new-sample", self._on_audio)
+        pipeline.get_bus().set_sync_handler(self._on_bus, "audio")
+        self.audio = pipeline
+        pipeline.set_state(Gst.State.PLAYING)
+        return True
+
+    def _on_audio(self, sink):
+        Gst = self.Gst
+        sample = sink.emit("pull-sample")
+        if sample is None:
+            return Gst.FlowReturn.EOS
+        if self.channel.backlog() > BACKLOG_LIMIT:
+            return Gst.FlowReturn.OK
+        buf = sample.get_buffer()
+        ok, info = buf.map(Gst.MapFlags.READ)
+        if ok:
+            data = bytes(info.data)
+            buf.unmap(info)
+            self._send_caps("audio", sample)
+            self.channel.send("A", data)
+        return Gst.FlowReturn.OK
+
+    def stop(self):
+        for p in (self.video, self.audio):
+            if p is not None:
+                p.set_state(self.Gst.State.NULL)
+        self.video = self.audio = None
+
+
+class Host:
+    """`firox-stream daemon`: answers computers that want to stream this one."""
+
+    def __init__(self):
+        import gi
+        gi.require_version("Gtk", "3.0")
+        from gi.repository import GLib, Gtk
+        self.GLib, self.Gtk = GLib, Gtk
+        self.conf = load_conf()
+        self.port = int(os.environ.get("FIROX_STREAM_PORT") or self.conf.get("port") or PORT)
+        cert, key, self.fingerprint = ensure_cert()
+        self.tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        self.tls.minimum_version = ssl.TLSVersion.TLSv1_2
+        self.tls.load_cert_chain(cert, key)
+        self.server = socket.create_server(("", self.port), family=socket.AF_INET6, dualstack_ipv6=True) \
+            if socket.has_dualstack_ipv6() else socket.create_server(("0.0.0.0", self.port))
+        self.busy = threading.Lock()
+        self.pin_dialog = None
+        self.publisher = None
+        self.name = computer_name()
+        threading.Thread(target=self.accept_loop, daemon=True).start()
+        self.publish()
+        GLib.timeout_add_seconds(30, self.watchdog)
+        log(f"listening on port {self.port}")
+
+    def publish(self):
+        try:
+            self.publisher = subprocess.Popen(["avahi-publish-service", self.name, SERVICE, str(self.port), "v=1"],
+                                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError:
+            self.publisher = None
+
+    def watchdog(self):
+        if self.publisher is not None and self.publisher.poll() is not None:
+            self.publish()
+        return True
+
+    def accept_loop(self):
+        while True:
+            try:
+                raw, addr = self.server.accept()
+            except OSError:
+                time.sleep(1)
+                continue
+            threading.Thread(target=self.serve, args=(raw, addr[0]), daemon=True).start()
+
+    # -- one connection
+    def serve(self, raw, address):
+        if address.startswith("::ffff:"):
+            address = address[7:]
+        try:
+            raw.settimeout(15)
+            keepalive(raw)
+            sock = self.tls.wrap_socket(raw, server_side=True)
+        except (OSError, ssl.SSLError) as e:
+            log(f"{address}: TLS failed: {e}")
+            raw.close()
+            return
+        try:
+            client = self.handshake(sock, address)
+        except (OSError, ValueError, EOFError) as e:
+            log(f"{address}: {e}")
+            client = None
+        if client is None:
+            sock.close()
+            return
+        if not self.busy.acquire(blocking=False):
+            self._refuse(sock, "Someone else is streaming this computer right now.")
+            return
+        try:
+            self.stream(sock, client, address)
+        finally:
+            self.busy.release()
+
+    def _refuse(self, sock, text):
+        try:
+            sock.sendall(frame("E", {"error": text}))
+        except OSError:
+            pass
+        sock.close()
+
+    def handshake(self, sock, address):
+        kind, hello = recv_json(sock)
+        if kind != "H" or not isinstance(hello, dict):
+            raise ValueError("not a Firox Stream client")
+        name = str(hello.get("name") or address)[:60]
+        self.conf = load_conf()
+        if not self.conf.get("enabled"):
+            self._refuse(sock, "Streaming is turned off on that computer.")
+            return None
+        token = str(hello.get("token") or "")
+        known = self.conf.get("clients", {}).get(token_key(token)) if token else None
+        if known:
+            return known.get("name") or name
+        # Pairing: a PIN on this screen, which the other computer's user types
+        pin = f"{random.SystemRandom().randrange(10000):04d}"
+        cancelled = threading.Event()
+        self.GLib.idle_add(self._show_pin, name, pin, cancelled, sock)
+        sock.sendall(frame("N", {"name": self.name}))
+        sock.settimeout(180)
+        try:
+            for tries_left in (2, 1, 0):
+                kind, msg = recv_json(sock)
+                if cancelled.is_set():
+                    self._refuse(sock, "Pairing was cancelled on that computer.")
+                    return None
+                if kind != "P":
+                    return None
+                if hmac.compare_digest(proof(pin, self.fingerprint, name), str(msg.get("proof", ""))):
+                    break
+                if not tries_left:
+                    self._refuse(sock, "Wrong PIN. Start again to get a new one.")
+                    return None
+                sock.sendall(frame("W", {"left": tries_left}))
+        finally:
+            self.GLib.idle_add(self._hide_pin)
+        if sock.fileno() < 0:
+            return None
+        sock.settimeout(15)
+        token = secrets.token_hex(32)
+        self.conf = load_conf()
+        self.conf.setdefault("clients", {})[token_key(token)] = {"name": name, "paired": time.time()}
+        save_conf(self.conf)
+        log(f"paired with {name} ({address})")
+        sock.sendall(frame("T", {"token": token}))
+        return name
+
+    def open_capture(self, conf, channel, output):
+        """Share the screen and start encoding it: (capture, portal session,
+        cursor drawn in). xdg-desktop-portal-wlr sometimes drops a capture
+        as it starts (it asks the compositor for a second frame while one is
+        still out, and is disconnected); it comes straight back, so this
+        tries a new screen-sharing session a few times."""
+        test = os.environ.get("FIROX_STREAM_SOURCE") == "test"
+        for attempt in range(1, 6):
+            cast = source = capture = None
+            cursor = False
+            try:
+                if not test:
+                    cast = ScreenCast()
+                    if output:
+                        os.makedirs(STATE_DIR, exist_ok=True)
+                        with open(CHOOSER_HINT, "w") as fh:
+                            fh.write(output + "\n")
+                    fd, node, cursor = cast.start()
+                    source = (fd, node)
+                capture = Capture(conf, channel, source)
+                capture.start_video()
+                # the portal's slip comes in the first moments
+                if capture.broken.wait(2):
+                    raise RuntimeError(capture.failed or "the screen capture stopped")
+                return capture, cast, cursor
+            except (RuntimeError, PortalError) as e:
+                if capture:
+                    capture.stop()
+                if cast:
+                    cast.close()
+                if source:
+                    os.close(source[0])
+                if attempt == 5 or isinstance(e, PortalError) or "encoder" in str(e) or channel.closed:
+                    raise
+                log(f"capture attempt {attempt} failed ({e}); trying again")
+                time.sleep(1)
+
+    @staticmethod
+    def close_capture(capture, cast):
+        if capture:
+            capture.stop()
+            if capture.source:
+                os.close(capture.source[0])
+        if cast:
+            cast.close()
+
+    def stream(self, sock, client, address):
+        conf = load_conf()
+        log(f"{client} ({address}) connected")
+        notify(f"{client} is streaming this computer",
+               "To stop it, turn streaming off in Firox Stream.")
+        injector = None
+        channel = Channel(sock, None)
+        state = {"capture": None, "cast": None}
+        try:
+            import firox_monitors
+            output = firox_monitors.main_name()
+            state["capture"], state["cast"], cursor = self.open_capture(conf, channel, output)
+            try:
+                injector = Injector(output)
+            except Exception as e:              # no /dev/uinput access: the picture only
+                log(f"keyboard and mouse unavailable: {e}")
+            audio = state["capture"].start_audio()
+            sock.sendall(frame("O", {"name": self.name, "input": injector is not None,
+                                     "cursor": cursor, "audio": audio, "encoder": state["capture"].encoder}))
+        except Exception as e:
+            log(f"couldn't start: {e}")
+            self.close_capture(state["capture"], state["cast"])
+            if injector:
+                injector.close()
+            self._refuse(sock, f"That computer couldn't share its screen: {e}")
+            return
+
+        def on_message(kind, payload):
+            if kind == "I" and injector is not None:
+                try:
+                    for ev in json.loads(payload):
+                        injector.handle(ev)
+                except (ValueError, TypeError, IndexError, OSError) as e:
+                    log(f"input: {e}")
+            elif kind == "Q":
+                channel.close("stopped")
+
+        def supervise():
+            """Start the capture again when it stops in the middle (the
+            other computer gets a fresh key frame and carries on)."""
+            restarts = collections.deque()
+            while not channel.closed:
+                if not state["capture"].broken.wait(1) or channel.closed:
+                    continue
+                now = time.monotonic()
+                while restarts and now - restarts[0] > 60:
+                    restarts.popleft()
+                reason = state["capture"].failed or "the screen capture stopped"
+                self.close_capture(state["capture"], state["cast"])
+                state["capture"] = state["cast"] = None
+                if len(restarts) >= 5:
+                    channel.close(f"the screen capture keeps stopping: {reason}")
+                    return
+                restarts.append(now)
+                log(f"capture stopped ({reason}); starting it again")
+                try:
+                    state["capture"], state["cast"], _c = self.open_capture(conf, channel, output)
+                    state["capture"].start_audio()
+                except Exception as e:
+                    channel.close(f"the screen capture stopped: {e}")
+                    return
+
+        channel.on_message = on_message
+        watcher = threading.Thread(target=supervise, daemon=True)
+        watcher.start()
+        channel.run()
+        log(f"{client} disconnected: {channel.reason}")
+        watcher.join(30)
+        self.close_capture(state["capture"], state["cast"])
+        if injector:
+            injector.close()
+        try:
+            os.unlink(CHOOSER_HINT)
+        except OSError:
+            pass
+        notify(f"{client} stopped streaming this computer", "")
+
+    # -- the PIN window
+    def _show_pin(self, name, pin, cancelled, sock):
+        Gtk = self.Gtk
+        self._hide_pin()
+        dlg = Gtk.MessageDialog(message_type=Gtk.MessageType.INFO, buttons=Gtk.ButtonsType.CANCEL,
+                                text=f"{name} wants to stream this computer")
+        dlg.set_title("Firox Stream")
+        dlg.format_secondary_markup(
+            "It will see this screen and use its keyboard and mouse. To allow it, type this PIN on "
+            f"that computer:\n\n<span size='xx-large' font_family='monospace' weight='bold'>{pin}</span>"
+            "\n\nIf you didn't start this, click Cancel.")
+        def cancel(d, _r):
+            cancelled.set()
+            d.destroy()
+            self.pin_dialog = None
+            try:
+                sock.shutdown(socket.SHUT_RDWR)     # the other computer stops waiting for a PIN
+            except OSError:
+                pass
+        dlg.connect("response", cancel)
+        dlg.set_keep_above(True)
+        dlg.show_all()
+        self.pin_dialog = dlg
+        return False
+
+    def _hide_pin(self):
+        if self.pin_dialog is not None:
+            try:
+                self.pin_dialog.destroy()
+            except Exception:
+                pass
+            self.pin_dialog = None
+        return False
+
+
+def notify(summary, body):
+    try:
+        subprocess.Popen(["notify-send", "-a", "Firox Stream", "-i", "preferences-desktop-remote-desktop",
+                          summary, body], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        pass
+
+
+def run_daemon():
+    if not load_conf().get("enabled") and os.environ.get("FIROX_STREAM_FORCE") != "1":
+        return 0
+    os.makedirs(STATE_DIR, exist_ok=True)
+    logfh = open(LOG, "w", buffering=1)
+    os.dup2(logfh.fileno(), 2)
+    try:
+        Host()
+    except OSError as e:
+        log(f"couldn't start: {e}")          # most likely already running
+        return 1
+    from gi.repository import Gtk
+    Gtk.main()
+    return 0
+
+
+def set_enabled(on):
+    conf = load_conf()
+    conf["enabled"] = bool(on)
+    save_conf(conf)
+    subprocess.run(["pkill", "-u", str(os.getuid()), "-f", "firox-stream daemon"],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if on:
+        time.sleep(0.3)
+        subprocess.Popen([sys.argv[0], "daemon"], start_new_session=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def daemon_running():
+    return subprocess.run(["pgrep", "-u", str(os.getuid()), "-f", "firox-stream daemon"],
+                          stdout=subprocess.DEVNULL).returncode == 0
+
+
+# ----------------------------------------------------------------- client --
+
+# GTK's mouse buttons to the host's (left, middle, right, back, forward)
+GDK_BUTTONS = {1: 0x110, 2: 0x112, 3: 0x111, 8: 0x113, 9: 0x114}
+
+
+def connect(address, ask_pin):
+    """Connect and pair if needed (blocking; call from a thread). Returns
+    (TLS socket, host info). ask_pin(host name, note) -> PIN or None."""
+    host, port = split_address(address)
+    raw = socket.create_connection((host, port), timeout=10)
+    keepalive(raw)
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE         # checked below, against the paired certificate
+    sock = ctx.wrap_socket(raw)
+    try:
+        fingerprint = hashlib.sha256(sock.getpeercert(binary_form=True)).hexdigest()
+        hosts = load_hosts()
+        known = hosts.get(fingerprint, {})
+        name = computer_name()
+        sock.sendall(frame("H", {"v": 1, "name": name, "token": known.get("token", "")}))
+        note = ""
+        while True:
+            kind, msg = recv_json(sock)
+            if kind == "E":
+                raise ConnectionError(msg.get("error") or "The other computer refused.")
+            if kind in ("N", "W"):
+                if kind == "W":
+                    note = f"Wrong PIN. {msg.get('left')} {'try' if msg.get('left') == 1 else 'tries'} left."
+                host_name = msg.get("name") or known.get("name") or host
+                sock.settimeout(None)
+                pin = ask_pin(host_name if kind == "N" else known.get("name", host_name), note)
+                sock.settimeout(30)
+                if not pin:
+                    raise ConnectionError("")
+                known["name"] = host_name
+                sock.sendall(frame("P", {"proof": proof(pin.strip(), fingerprint, name)}))
+            elif kind == "T":
+                known["token"] = msg.get("token", "")
+                hosts = load_hosts()
+                hosts[fingerprint] = dict(known, address=address, paired=time.time())
+                save_hosts(hosts)
+            elif kind == "O":
+                hosts = load_hosts()
+                if fingerprint in hosts:
+                    hosts[fingerprint].update(address=address, name=msg.get("name") or hosts[fingerprint].get("name"),
+                                              last=time.time())
+                    save_hosts(hosts)
+                return sock, msg
+            else:
+                raise ConnectionError("The other computer answered something unexpected.")
+    except BaseException:
+        sock.close()
+        raise
+
+
+def client_ui(address=None):
+    import gi
+    gi.require_version("Gtk", "3.0")
+    gi.require_version("Gdk", "3.0")
+    gi.require_version("Gst", "1.0")
+    from gi.repository import Gdk, Gio, GLib, Gst, Gtk
+    Gst.init(None)
+
+    def ask_pin_dialog(parent, host_name, note):
+        dlg = Gtk.Dialog(title="Firox Stream", transient_for=parent, modal=True)
+        dlg.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Pair", Gtk.ResponseType.OK)
+        dlg.set_default_response(Gtk.ResponseType.OK)
+        box = dlg.get_content_area()
+        box.set_spacing(8)
+        for side in ("start", "end", "top", "bottom"):
+            getattr(box, f"set_margin_{side}")(14)
+        lbl = Gtk.Label(xalign=0, wrap=True, max_width_chars=44)
+        lbl.set_markup(f"<b>Pair with {GLib.markup_escape_text(host_name)}</b>\n\n"
+                       "A PIN is showing on that computer's screen. Type it here:"
+                       + (f"\n\n<span foreground='#c01c28'>{GLib.markup_escape_text(note)}</span>" if note else ""))
+        entry = Gtk.Entry(activates_default=True, max_length=8, width_chars=8, input_purpose=Gtk.InputPurpose.DIGITS)
+        entry.set_halign(Gtk.Align.START)
+        box.add(lbl)
+        box.add(entry)
+        dlg.show_all()
+        pin = entry.get_text() if dlg.run() == Gtk.ResponseType.OK else None
+        dlg.destroy()
+        return pin
+
+    def error(parent, text, secondary=""):
+        dlg = Gtk.MessageDialog(transient_for=parent, modal=True, message_type=Gtk.MessageType.ERROR,
+                                buttons=Gtk.ButtonsType.OK, text=text)
+        if secondary:
+            dlg.format_secondary_text(secondary)
+        dlg.set_title("Firox Stream")
+        dlg.run()
+        dlg.destroy()
+
+    class StreamWindow(Gtk.Window):
+        """Plays the host's screen and sound; sends keyboard and mouse back."""
+
+        def __init__(self, app, sock, info, address):
+            super().__init__(application=app, title=f"{info.get('name') or address} – Firox Stream")
+            self.set_default_size(1280, 760)
+            self.set_icon_name("preferences-desktop-remote-desktop")
+            self.info = info
+            self.vsize = None
+            self.fullscreened = False
+            self.down_keys, self.down_buttons = set(), set()
+            self.stopping = False
+            self.ended = False
+            self.overlay = Gtk.Overlay()
+            self.add(self.overlay)
+            self.area = Gtk.EventBox(can_focus=True)
+            css = Gtk.CssProvider()
+            css.load_from_data(b"eventbox { background-color: black; }")
+            self.area.get_style_context().add_provider(css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+            self.overlay.add(self.area)
+            hint = "Ctrl+Alt+Shift+F full screen · Ctrl+Alt+Shift+Q stop"
+            if not info.get("input"):
+                hint = "View only: that computer can't use this keyboard and mouse · " + hint
+            self.hint = Gtk.Label(label=hint, halign=Gtk.Align.CENTER, valign=Gtk.Align.START)
+            self.hint.get_style_context().add_class("osd")
+            self.hint.set_margin_top(10)
+            for side in ("start", "end"):
+                getattr(self.hint, f"set_margin_{side}")(12)
+            self.overlay.add_overlay(self.hint)
+            GLib.timeout_add_seconds(5, lambda: self.hint.hide() or False)
+            self.build_video(os.environ.get("FIROX_STREAM_SINK") or
+                             ("gtkglsink" if Gst.ElementFactory.find("gtkglsink") else "gtksink"))
+            self.build_audio()
+            self.area.add_events(Gdk.EventMask.POINTER_MOTION_MASK | Gdk.EventMask.BUTTON_PRESS_MASK |
+                                 Gdk.EventMask.BUTTON_RELEASE_MASK | Gdk.EventMask.SCROLL_MASK |
+                                 Gdk.EventMask.SMOOTH_SCROLL_MASK)
+            self.area.connect("motion-notify-event", self.on_motion)
+            self.area.connect("button-press-event", self.on_button, True)
+            self.area.connect("button-release-event", self.on_button, False)
+            self.area.connect("scroll-event", self.on_scroll)
+            self.area.connect("realize", self.on_realize)
+            self.connect("key-press-event", self.on_key, True)
+            self.connect("key-release-event", self.on_key, False)
+            self.connect("focus-out-event", lambda *_a: self.release_all())
+            self.connect("delete-event", lambda *_a: self.stop() or False)
+            self.channel = Channel(sock, self.on_message, self.on_closed)
+            threading.Thread(target=self.channel.run, daemon=True).start()
+            self.show_all()
+            self.area.grab_focus()
+
+        # -- playing
+        def build_video(self, sink_name):
+            pipeline = Gst.Pipeline.new("video")
+            self.vsrc = make_element("appsrc", {"is-live": True, "format": "time", "do-timestamp": True,
+                                                "max-bytes": 64 << 20})
+            parse = make_element("h264parse", {})
+            if Gst.ElementFactory.find("vah264dec"):
+                dec = [make_element("vah264dec", {})]
+            elif Gst.ElementFactory.find("avdec_h264"):
+                # threads on slices, not frames: frame threads hold frames back
+                dec = [make_element("avdec_h264", {"thread-type": "slice"})]
+            else:
+                dec = [make_element("openh264dec", {})]
+            if sink_name == "gtkglsink":
+                gl = make_element("gtkglsink", {"sync": False})
+                sink = make_element("glsinkbin", {"sync": False})
+                sink.set_property("sink", gl)
+                widget = gl.get_property("widget")
+                tail = [sink]
+            else:
+                sink = make_element("gtksink", {"sync": False})
+                widget = sink.get_property("widget")
+                tail = [make_element("videoconvert", {}), sink]
+            chain(pipeline, [self.vsrc, parse] + dec + tail)
+            bus = pipeline.get_bus()
+            bus.add_signal_watch()
+            bus.connect("message::error", self.on_video_error, sink_name)
+            child = self.area.get_child()
+            if child:
+                self.area.remove(child)
+            self.area.add(widget)
+            widget.show()
+            self.sink_name = sink_name
+            self.video = pipeline
+            pipeline.set_state(Gst.State.PLAYING)
+
+        def on_video_error(self, _bus, msg, sink_name):
+            err, debug = msg.parse_error()
+            print(f"firox-stream: video: {err.message} ({debug})", file=sys.stderr)
+            if sink_name == "gtkglsink" and self.sink_name == "gtkglsink":
+                # No OpenGL here: draw it the plain way. The host sends a key
+                # frame when asked, so the picture comes straight back
+                old, caps = self.video, self.vsrc.get_property("caps")
+                old.set_state(Gst.State.NULL)
+                self.build_video("gtksink")
+                if caps:
+                    self.vsrc.set_property("caps", caps)
+                self.channel.send("I", [["r"]])
+
+        def build_audio(self):
+            self.asrc = self.audio = None
+            if not self.info.get("audio"):
+                return
+            try:
+                pipeline = Gst.Pipeline.new("audio")
+                self.asrc = make_element("appsrc", {"is-live": True, "format": "time", "do-timestamp": True})
+                out = make_element("pulsesink", {"sync": False, "buffer-time": 60000, "latency-time": 10000}) \
+                    if Gst.ElementFactory.find("pulsesink") else make_element("autoaudiosink", {"sync": False})
+                chain(pipeline, [self.asrc, make_element("opusdec", {}), make_element("audioconvert", {}),
+                                 make_element("audioresample", {}), out])
+                pipeline.set_state(Gst.State.PLAYING)
+                self.audio = pipeline
+            except RuntimeError as e:
+                print(f"firox-stream: no sound: {e}", file=sys.stderr)
+                self.asrc = None
+
+        def on_message(self, kind, payload):
+            # (the channel's thread)
+            if kind == "V":
+                self.vsrc.emit("push-buffer", Gst.Buffer.new_wrapped(payload))
+            elif kind == "A":
+                if self.asrc is not None:
+                    self.asrc.emit("push-buffer", Gst.Buffer.new_wrapped(payload))
+            elif kind == "K":
+                msg = json.loads(payload)
+                caps = Gst.Caps.from_string(msg.get("caps", ""))
+                if msg.get("kind") == "video":
+                    self.vsrc.set_property("caps", caps)
+                    s = caps.get_structure(0)
+                    ok_w, w = s.get_int("width")
+                    ok_h, h = s.get_int("height")
+                    if ok_w and ok_h:
+                        GLib.idle_add(self.set_video_size, w, h)
+                elif msg.get("kind") == "audio" and self.asrc is not None:
+                    self.asrc.set_property("caps", caps)
+            elif kind == "E":
+                self.channel.close(json.loads(payload).get("error", ""))
+
+        def set_video_size(self, w, h):
+            self.vsize = (w, h)
+            return False
+
+        def on_closed(self, reason):
+            GLib.idle_add(self.closed, reason)
+
+        def closed(self, reason):
+            for p in (self.video, self.audio):
+                if p is not None:
+                    p.set_state(Gst.State.NULL)
+            if not self.ended:
+                self.ended = True
+                if not self.stopping and reason not in ("", "stopped"):
+                    error(self, "The stream ended", reason[:1].upper() + reason[1:])
+                self.destroy()
+            return False
+
+        def stop(self):
+            if self.stopping:
+                return
+            self.stopping = True
+            self.release_all()
+            self.channel.send("Q")
+            GLib.timeout_add(300, lambda: self.channel.close("stopped") or False)
+
+        # -- keyboard and mouse
+        def on_realize(self, area):
+            if self.info.get("cursor") and self.info.get("input"):
+                # That computer draws its pointer into the picture
+                area.get_window().set_cursor(Gdk.Cursor.new_for_display(area.get_display(),
+                                                                       Gdk.CursorType.BLANK_CURSOR))
+
+        def send(self, *ev):
+            if self.info.get("input"):
+                self.channel.send("I", [list(ev)])
+
+        def to_video(self, x, y):
+            a = self.area.get_allocation()
+            vw, vh = self.vsize or (a.width, a.height)
+            if not (a.width and a.height and vw and vh):
+                return 0.0, 0.0
+            s = min(a.width / vw, a.height / vh)
+            w, h = vw * s, vh * s
+            return (min(max((x - (a.width - w) / 2) / w, 0.0), 1.0),
+                    min(max((y - (a.height - h) / 2) / h, 0.0), 1.0))
+
+        def on_motion(self, _w, ev):
+            u, v = self.to_video(ev.x, ev.y)
+            self.send("m", round(u, 5), round(v, 5))
+            return True
+
+        def on_button(self, _w, ev, down):
+            if ev.type in (Gdk.EventType._2BUTTON_PRESS, Gdk.EventType._3BUTTON_PRESS):
+                return True                     # GTK's extra events for double clicks
+            self.area.grab_focus()
+            code = GDK_BUTTONS.get(ev.button)
+            if code:
+                u, v = self.to_video(ev.x, ev.y)
+                self.send("m", round(u, 5), round(v, 5))
+                (self.down_buttons.add if down else self.down_buttons.discard)(code)
+                self.send("b", code, down)
+            return True
+
+        def on_scroll(self, _w, ev):
+            if ev.direction == Gdk.ScrollDirection.SMOOTH:
+                ok, dx, dy = ev.get_scroll_deltas()
+            else:
+                dx, dy = {Gdk.ScrollDirection.UP: (0, -1), Gdk.ScrollDirection.DOWN: (0, 1),
+                          Gdk.ScrollDirection.LEFT: (-1, 0), Gdk.ScrollDirection.RIGHT: (1, 0)}.get(
+                    ev.direction, (0, 0))
+            if dx or dy:
+                self.send("s", round(dx, 3), round(dy, 3))
+            return True
+
+        def on_key(self, _w, ev, down):
+            mods = ev.state & (Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.MOD1_MASK |
+                               Gdk.ModifierType.SHIFT_MASK)
+            if down and mods == (Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.MOD1_MASK |
+                                 Gdk.ModifierType.SHIFT_MASK):
+                key = Gdk.keyval_to_lower(ev.keyval)
+                if key == Gdk.KEY_q:
+                    self.stop()
+                    return True
+                if key == Gdk.KEY_f:
+                    self.release_all()
+                    (self.unfullscreen if self.fullscreened else self.fullscreen)()
+                    self.fullscreened = not self.fullscreened
+                    return True
+            code = ev.hardware_keycode - 8          # evdev's numbering, as the host's virtual keyboard
+            if 1 <= code <= 248:
+                if down and code in self.down_keys:
+                    return True                     # a repeat: the host repeats it itself
+                (self.down_keys.add if down else self.down_keys.discard)(code)
+                self.send("k", code, down)
+            return True
+
+        def release_all(self):
+            for code in list(self.down_keys):
+                self.send("k", code, False)
+            for code in list(self.down_buttons):
+                self.send("b", code, False)
+            self.down_keys.clear()
+            self.down_buttons.clear()
+
+    class Chooser(Gtk.ApplicationWindow):
+        """Pick a computer to stream, and whether others may stream this one."""
+
+        def __init__(self, app):
+            super().__init__(application=app, title="Firox Stream")
+            self.set_default_size(460, 480)
+            self.set_icon_name("preferences-desktop-remote-desktop")
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+            for side in ("start", "end", "top", "bottom"):
+                getattr(box, f"set_margin_{side}")(14)
+            self.add(box)
+            intro = Gtk.Label(xalign=0, wrap=True, max_width_chars=50)
+            intro.set_markup("<b>Play another computer here</b>\nPick a Firox computer on your network to see "
+                             "its screen, hear its sound and use it with this keyboard and mouse.")
+            box.add(intro)
+            self.store = Gtk.ListStore(str, str, str)      # label, address, markup
+            self.view = Gtk.TreeView(model=self.store, headers_visible=False)
+            icon = Gtk.CellRendererPixbuf(icon_name="computer", stock_size=Gtk.IconSize.DND)
+            col = Gtk.TreeViewColumn()
+            col.pack_start(icon, False)
+            text = Gtk.CellRendererText(ypad=4)
+            col.pack_start(text, True)
+            col.add_attribute(text, "markup", 2)
+            self.view.append_column(col)
+            self.view.connect("row-activated", lambda *_a: self.connect_selected())
+            scroll = Gtk.ScrolledWindow(vexpand=True, shadow_type=Gtk.ShadowType.IN)
+            scroll.add(self.view)
+            box.add(scroll)
+            row = Gtk.Box(spacing=6)
+            row.add(Gtk.Label(label="Address:"))
+            self.entry = Gtk.Entry(hexpand=True, placeholder_text="name or IP address", activates_default=True)
+            self.entry.connect("activate", lambda *_a: self.connect_to(self.entry.get_text()))
+            row.add(self.entry)
+            refresh = Gtk.Button.new_from_icon_name("view-refresh-symbolic", Gtk.IconSize.BUTTON)
+            refresh.set_tooltip_text("Look for computers again")
+            refresh.connect("clicked", lambda *_a: self.refresh())
+            row.add(refresh)
+            self.go = Gtk.Button(label="Connect")
+            self.go.get_style_context().add_class("suggested-action")
+            self.go.connect("clicked", lambda *_a: self.connect_selected())
+            row.add(self.go)
+            box.add(row)
+            self.status = Gtk.Label(xalign=0, wrap=True)
+            box.add(self.status)
+            box.add(Gtk.Separator(margin_top=6, margin_bottom=6))
+            self.allow = Gtk.CheckButton(label="Let other computers stream this one")
+            self.allow.set_active(bool(load_conf().get("enabled")))
+            self.allow.connect("toggled", self.on_allow)
+            box.add(self.allow)
+            self.allow_note = Gtk.Label(xalign=0, wrap=True, max_width_chars=50)
+            self.allow_note.get_style_context().add_class("dim-label")
+            box.add(self.allow_note)
+            unpair = Gtk.Button(label="Forget Paired Computers", halign=Gtk.Align.START)
+            unpair.connect("clicked", self.on_unpair)
+            box.add(unpair)
+            self.update_note()
+            self.refresh()
+
+        def update_note(self):
+            conf = load_conf()
+            n = len(conf.get("clients", {}))
+            if conf.get("enabled"):
+                self.allow_note.set_text(
+                    "Computers you've paired can stream this one whenever you're logged in. "
+                    f"Paired: {n}. A new one needs the PIN this computer shows.")
+            else:
+                self.allow_note.set_text("Nobody can stream this computer.")
+
+        def on_allow(self, button):
+            set_enabled(button.get_active())
+            self.update_note()
+
+        def on_unpair(self, _b):
+            conf = load_conf()
+            conf["clients"] = {}
+            save_conf(conf)
+            self.update_note()
+            self.status.set_text("Computers will need a PIN again to stream this one.")
+
+        def refresh(self):
+            self.status.set_text("Looking for computers…")
+            threading.Thread(target=lambda: GLib.idle_add(self.fill, discover()), daemon=True).start()
+
+        def fill(self, found):
+            self.store.clear()
+            seen = set()
+            paired = {h.get("address"): h for h in load_hosts().values()}
+            for f in found:
+                addr = f["address"] if f["port"] == PORT else f"{f['address']}:{f['port']}"
+                seen.add(addr)
+                tag = "paired" if addr in paired else "on the network"
+                self.store.append([f["name"], addr, f"<b>{GLib.markup_escape_text(f['name'])}</b>\n"
+                                                    f"<small>{addr} · {tag}</small>"])
+            for addr, h in paired.items():
+                if addr and addr not in seen:
+                    name = h.get("name") or addr
+                    self.store.append([name, addr, f"<b>{GLib.markup_escape_text(name)}</b>\n"
+                                                   f"<small>{GLib.markup_escape_text(addr)} · paired, "
+                                                   "not seen on the network</small>"])
+            self.status.set_text("" if len(self.store) else
+                                 "No computers found. On the computer you want to stream, open Firox Stream and "
+                                 "tick “Let other computers stream this one”, or type its address.")
+            if len(self.store):
+                self.view.get_selection().select_path(Gtk.TreePath(0))
+            return False
+
+        def connect_selected(self):
+            text = self.entry.get_text().strip()
+            if text:
+                return self.connect_to(text)
+            model, it = self.view.get_selection().get_selected()
+            if it is not None:
+                self.connect_to(model[it][1])
+
+        def connect_to(self, address):
+            address = address.strip()
+            if not address:
+                return
+            self.go.set_sensitive(False)
+            self.status.set_text(f"Connecting to {address}…")
+            open_stream(self, address, done=self.connected)
+
+        def connected(self, ok):
+            self.go.set_sensitive(True)
+            self.status.set_text("")
+            if ok:
+                self.hide()
+
+    def open_stream(parent, address, done=None):
+        app = parent.get_application() if parent else App.instance
+
+        def ask_pin(host_name, note):
+            answer = queue.Queue()
+            GLib.idle_add(lambda: answer.put(ask_pin_dialog(parent, host_name, note)) or False)
+            return answer.get()
+
+        def work():
+            try:
+                sock, info = connect(address, ask_pin)
+            except EOFError:
+                GLib.idle_add(failed, "That computer closed the connection. If it was showing a PIN, "
+                                      "pairing was cancelled there.")
+                return
+            except (OSError, ValueError, ConnectionError, ssl.SSLError) as e:
+                GLib.idle_add(failed, str(e))
+                return
+            GLib.idle_add(started, sock, info)
+
+        def failed(text):
+            if text:
+                error(parent, f"Couldn't stream {address}", text)
+            if done:
+                done(False)
+            elif parent is None or not parent.get_visible():
+                app.quit()
+            return False
+
+        def started(sock, info):
+            win = StreamWindow(app, sock, info, address)
+            win.connect("destroy", lambda *_a: stream_closed())
+            if done:
+                done(True)
+            return False
+
+        def stream_closed():
+            chooser = next((w for w in app.get_windows() if isinstance(w, Chooser)), None)
+            if chooser is not None:
+                chooser.show_all()
+                chooser.present()
+
+        threading.Thread(target=work, daemon=True).start()
+
+    class App(Gtk.Application):
+        instance = None
+
+        def __init__(self):
+            super().__init__(application_id="org.firox.Stream",
+                             flags=Gio.ApplicationFlags.NON_UNIQUE if address else Gio.ApplicationFlags.FLAGS_NONE)
+            App.instance = self
+
+        def do_activate(self):
+            if address:
+                self.hold()
+                # A window to own the PIN dialog and errors; streams open on their own
+                open_stream(None, address, done=lambda ok: self.release())
+                return
+            win = self.get_active_window() or Chooser(self)
+            win.show_all()
+            win.present()
+
+    return App().run([sys.argv[0]])
+
+
+def main(argv):
+    cmd = argv[1] if len(argv) > 1 else ""
+    if cmd == "daemon":
+        return run_daemon()
+    if cmd in ("on", "off"):
+        set_enabled(cmd == "on")
+        print(f"Streaming this computer is {cmd}.")
+        return 0
+    if cmd == "unpair":
+        conf = load_conf()
+        conf["clients"] = {}
+        save_conf(conf)
+        print("Forgot every paired computer.")
+        return 0
+    if cmd == "status":
+        conf = load_conf()
+        print(f"streaming this computer: {'on' if conf.get('enabled') else 'off'}"
+              f"{' (running)' if daemon_running() else ''}; port {conf.get('port', PORT)}")
+        for c in conf.get("clients", {}).values():
+            print(f"paired: {c.get('name')} (since {time.strftime('%m/%d/%Y', time.localtime(c.get('paired', 0)))})")
+        for h in load_hosts().values():
+            print(f"streamed: {h.get('name')} at {h.get('address')}")
+        return 0
+    if cmd == "connect" and len(argv) > 2:
+        return client_ui(argv[2])
+    if cmd == "":
+        return client_ui()
+    print(__doc__.strip(), file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
