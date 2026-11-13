@@ -10,6 +10,9 @@ firox-windows: run Windows programs (.exe, .msi, .bat) with Proton-GE.
     firox-windows --winetricks VERB...    install Windows components (fonts,
                                           runtimes) into the C: drive
     firox-windows --status                print the Proton-GE and C: drive state
+    firox-windows --host [--at-login]     keep the shared container running
+                                          (login, and the first program)
+    firox-windows --stop-host             stop it, and the programs in it
 
 It runs the program with umu-launcher, which runs Proton outside Steam
 inside the Steam Linux Runtime, the same way Steam does. PROTONPATH is
@@ -26,6 +29,15 @@ driver instead of XWayland; 0 for XWayland), UMU_CONTAINER_NSENTER (1 by
 default: programs started while another is running join its container, so
 several can run at once on the same C: drive).
 
+Several programs can run at once and close in any order: they all run as
+guests in one Steam Runtime container per C: drive (UMU_CONTAINER_NSENTER),
+which a stand-in that only sleeps (firox-sleep.exe) keeps open. That host
+starts at login once Proton-GE is downloaded (--host --at-login, from labwc's
+autostart) or with the first Windows program, uses the newest Proton-GE as
+it starts (guests use the same one, so a newer download waits for the next
+start), and stops at logout or with --stop-host. FIROX_WINDOWS_HOST=0 turns
+it off.
+
 When run from a terminal, the program's output stays in the terminal.
 Otherwise it goes to ~/.local/state/firox/programs/NAME.log, and if the
 program fails within two minutes you're shown its last lines. The kernel
@@ -34,8 +46,10 @@ also runs Windows programs marked runnable through this
 """
 
 import glob
+import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -48,6 +62,9 @@ PROTONS = os.path.join(DATA, "Steam", "compatibilitytools.d")     # where umu pu
 RUNTIME = os.path.join(DATA, "umu")
 LOGS = os.path.join(STATE, "firox", "programs")
 UMU = os.environ.get("FIROX_UMU_RUN") or "umu-run"
+# The stand-in that keeps the shared container running (build_files/firox-sleep.c)
+SLEEPER = os.environ.get("FIROX_WINDOWS_SLEEPER") or "/usr/lib/firox/windows/firox-sleep.exe"
+HOST_STATE = os.path.join(STATE, "firox", "windows-host.json")
 
 
 def environment():
@@ -76,6 +93,154 @@ def ge_versions():
         nums = re.findall(r"\d+", os.path.basename(path))
         return [int(n) for n in nums]
     return sorted(glob.glob(os.path.join(PROTONS, "GE-Proton*")), key=key, reverse=True)
+
+
+def shared_container(env):
+    """Is an earlier program already running the shared container for this
+    C: drive? umu names its launcher service com.steampowered.App + the md5
+    of the prefix's path, on the session bus."""
+    import hashlib
+    from pathlib import Path
+    pfx = str(Path(env["WINEPREFIX"]).expanduser().resolve(strict=False))
+    name = "com.steampowered.App" + hashlib.md5(pfx.encode()).hexdigest()
+    try:
+        r = subprocess.run(["gdbus", "call", "--session", "--dest", "org.freedesktop.DBus",
+                            "--object-path", "/org/freedesktop/DBus",
+                            "--method", "org.freedesktop.DBus.NameHasOwner", name],
+                           capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return "true" in r.stdout
+
+
+# ---------------------------------------------------------- the host --
+# Windows programs share one Steam Runtime container per C: drive. Rather
+# than letting the first program own it (so closing it, or Ctrl+C on its
+# terminal, closed the others), a stand-in that only sleeps hosts it, and
+# every program runs inside as a guest: they open and close in any order.
+# It starts at login (if Proton-GE is already downloaded) or with the first
+# Windows program, and stops at logout.
+
+def host_wanted(env):
+    return (env.get("UMU_CONTAINER_NSENTER") == "1" and env.get("FIROX_WINDOWS_HOST", "1") != "0"
+            and os.path.isfile(SLEEPER))
+
+
+def read_host():
+    """The running host's record, or None."""
+    try:
+        with open(HOST_STATE) as fh:
+            data = json.load(fh)
+        os.kill(int(data["pid"]), 0)
+        return data
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def write_host(data):
+    os.makedirs(os.path.dirname(HOST_STATE), exist_ok=True)
+    tmp = HOST_STATE + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(data, fh)
+    os.replace(tmp, HOST_STATE)
+
+
+def host(at_login=False):
+    """firox-windows --host: run the stand-in until logout."""
+    env = environment()
+    if not shutil.which(UMU) or not host_wanted(env) or shared_container(env) or read_host():
+        return 0
+    if at_login and env["PROTONPATH"] in ("GE-Proton", "UMU-Proton") and first_run():
+        return 0                       # never start a 1 GB download at login
+    try:
+        from gi.repository import Gio
+        bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    except Exception:  # noqa: BLE001
+        bus = None
+    os.makedirs(LOGS, exist_ok=True)
+    log = open(os.path.join(LOGS, "windows-host.log"), "w")
+    log.write(f"firox-windows --host: {UMU} {SLEEPER}\n  WINEPREFIX={env['WINEPREFIX']} "
+              f"PROTONPATH={env['PROTONPATH']}\n\n")
+    log.flush()
+    proc = subprocess.Popen([UMU, SLEEPER], env=env, cwd=HOME, stdin=subprocess.DEVNULL, stdout=log,
+                            stderr=subprocess.STDOUT, start_new_session=True)
+    state = {"pid": os.getpid(), "umu": proc.pid, "prefix": env["WINEPREFIX"], "proton": "",
+             "started": int(time.time())}
+    write_host(state)
+
+    def stop(*_args):
+        for sig, wait in ((signal.SIGTERM, 15), (signal.SIGKILL, 5)):
+            try:
+                os.killpg(proc.pid, sig)
+            except OSError:
+                break
+            try:
+                proc.wait(wait)
+                break
+            except subprocess.TimeoutExpired:
+                continue
+        try:
+            os.unlink(HOST_STATE)
+        except OSError:
+            pass
+        sys.exit(0)
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(sig, stop)
+    while proc.poll() is None:
+        time.sleep(1)
+        if not state["proton"] and shared_container(env):
+            # The Proton it ended up with: guests use the same one, so a newer
+            # Proton-GE downloaded meanwhile can't meet this one's wineserver
+            gev = ge_versions()
+            state["proton"] = env["PROTONPATH"] if os.path.isabs(env["PROTONPATH"]) else (gev[0] if gev else "")
+            write_host(state)
+        if bus is not None and bus.is_closed():           # logged out
+            stop()
+    try:
+        os.unlink(HOST_STATE)
+    except OSError:
+        pass
+    return proc.returncode or 0
+
+
+def ensure_host(env):
+    """Make sure the stand-in is running before a program starts; True once
+    its container is up."""
+    if not host_wanted(env):
+        return False
+    if shared_container(env):
+        return True
+    me = os.path.abspath(sys.argv[0]) if os.path.isfile(sys.argv[0]) else "firox-windows"
+    if not read_host():
+        try:
+            subprocess.Popen([me, "--host"], start_new_session=True, stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError:
+            return False
+        time.sleep(1)
+    deadline = time.time() + 1800          # the first run downloads Proton-GE and the runtime
+    while time.time() < deadline:
+        if shared_container(env):
+            return True
+        if not read_host():
+            return False                    # it gave up: run the program the old way
+        time.sleep(0.5)
+    return False
+
+
+def stop_host():
+    data = read_host()
+    if not data:
+        print("The shared Windows container isn't running.")
+        return 0
+    os.kill(int(data["pid"]), signal.SIGTERM)
+    for _ in range(40):
+        if not read_host():
+            print("Stopped the shared Windows container (and the programs in it).")
+            return 0
+        time.sleep(0.5)
+    print("It didn't stop.", file=sys.stderr)
+    return 1
 
 
 def first_run():
@@ -166,13 +331,32 @@ def run(path, args):
     env = environment()
     argv = [UMU] + command(path, args)
     cwd = os.path.dirname(path)
-    if tty():
-        os.chdir(cwd)
-        os.execvpe(UMU, argv, env)
-    if first_run():
+    downloading = first_run()
+    if downloading and not tty():
         notify("Getting Windows programs ready",
                f"“{name}” will start in a few minutes: Proton-GE and the Steam Linux Runtime are "
                "downloading (about 1 GB). This only happens once.")
+    hosted = ensure_host(env)
+    if hosted:
+        data = read_host()
+        for _ in range(20):                       # the host notes its Proton just after its container is up
+            if not data or data.get("proton"):
+                break
+            time.sleep(0.25)
+            data = read_host()
+        if data and data.get("proton") and env["PROTONPATH"] in ("GE-Proton", "UMU-Proton"):
+            env["PROTONPATH"] = data["proton"]      # the host's Proton, not a newer download
+    if tty():
+        if hosted:
+            print(f"firox-windows: {name} runs in the shared Windows container; other Windows programs "
+                  "can open and close alongside it.", file=sys.stderr)
+        elif env.get("UMU_CONTAINER_NSENTER") == "1" and not shared_container(env):
+            print(f"firox-windows: {name} starts the shared container that Windows programs opened "
+                  "after it will run in.\n  This terminal keeps going until all of them have closed, "
+                  "even after this program does;\n  Ctrl+C or closing the terminal stops them all.",
+                  file=sys.stderr)
+        os.chdir(cwd)
+        os.execvpe(UMU, argv, env)
     os.makedirs(LOGS, exist_ok=True)
     log = os.path.join(LOGS, name + ".log")
     with open(log, "w") as out:
@@ -181,7 +365,6 @@ def run(path, args):
                   f"PROTON_ENABLE_WAYLAND={env['PROTON_ENABLE_WAYLAND']}\n\n")
         out.flush()
         started = time.time()
-        downloading = first_run()
         try:
             code = subprocess.run(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=out,
                                   stderr=subprocess.STDOUT).returncode
@@ -218,6 +401,13 @@ def status():
     drive = os.path.join(env["WINEPREFIX"], "drive_c")
     print(f"C: drive: {drive}" + ("" if os.path.isdir(drive) else " (made on the first run)"))
     print(f"Wine's Wayland driver: {'on' if env['PROTON_ENABLE_WAYLAND'] not in ('', '0') else 'off (XWayland)'}")
+    if env.get("UMU_CONTAINER_NSENTER") == "1":
+        data = read_host()
+        if data:
+            print(f"Shared container: running, held open by firox-windows --host (pid {data['pid']}"
+                  + (f", {os.path.basename(data['proton'])}" if data.get("proton") else "") + ")")
+        else:
+            print(f"Shared container: {'running (new programs join it)' if shared_container(env) else 'not running'}")
     print(f"umu-launcher: {shutil.which(UMU) or 'not installed'}")
     return 0
 
@@ -229,6 +419,10 @@ def main():
         return 0 if args else 2
     if args[0] == "--status":
         return status()
+    if args[0] == "--host":
+        return host(at_login="--at-login" in args)
+    if args[0] == "--stop-host":
+        return stop_host()
     if args[0] == "--c-drive":
         drive = os.path.join(environment()["WINEPREFIX"], "drive_c")
         if not os.path.isdir(drive):
