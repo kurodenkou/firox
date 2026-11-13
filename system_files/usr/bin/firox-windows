@@ -22,7 +22,9 @@ All programs share one Windows "C: drive" (a Wine prefix) in
 variables: WINEPREFIX (another C: drive), PROTONPATH (a Proton folder, or
 GE-Proton / UMU-Proton), GAMEID (a umu game ID, for its game fixes; default
 umu-default), PROTON_ENABLE_WAYLAND (1 by default: Wine's native Wayland
-driver instead of XWayland; 0 for XWayland).
+driver instead of XWayland; 0 for XWayland), UMU_CONTAINER_NSENTER (1 by
+default: programs started while another is running join its container, so
+several can run at once on the same C: drive).
 
 When run from a terminal, the program's output stays in the terminal.
 Otherwise it goes to ~/.local/state/firox/programs/NAME.log, and if the
@@ -56,6 +58,14 @@ def environment():
     # Wine's native Wayland driver rather than XWayland (Proton-GE only uses
     # it when WAYLAND_DISPLAY is set); PROTON_ENABLE_WAYLAND=0 turns it off
     env.setdefault("PROTON_ENABLE_WAYLAND", "1")
+    # More than one program at once: each umu-run normally starts its own
+    # Steam Runtime container, and a second container on the same C: drive
+    # fights the first one's wineserver, so the second program won't start.
+    # With this, the first one runs a launcher service on the session bus
+    # (named after the prefix) and later ones run inside that container
+    # ("runinprefix"). Cost: umu looks for the service for ~5 s before the
+    # first program of a session starts.
+    env.setdefault("UMU_CONTAINER_NSENTER", "1")
     return env
 
 
