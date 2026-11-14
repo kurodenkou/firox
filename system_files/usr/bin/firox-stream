@@ -639,6 +639,9 @@ class Capture:
 
     # video
     _encoder = {}                       # the setting -> the encoder that worked (tried once per daemon)
+    # The portal offers no ordinary memory: go through OpenGL (found out on
+    # the first try; FIROX_STREAM_GPU=1 starts that way)
+    _gpu_buffers = os.environ.get("FIROX_STREAM_GPU") == "1"
 
     def pick_encoder(self, kbps, fps):
         """The first encoder that encodes a few frames of a test picture.
@@ -690,13 +693,20 @@ class Capture:
         pipeline = Gst.Pipeline.new("video")
         if self.source:
             fd, node = self.source
-            src = [make_element("pipewiresrc", {"fd": os.dup(fd), "path": str(node), "do-timestamp": True,
-                                                "keepalive-time": 1000, "always-copy": True}),
-                   # Ordinary memory. Otherwise pipewiresrc offers the portal only
-                   # the GPU buffer layouts the encoder takes (VA-API's, behind
-                   # vapostproc), and with NVIDIA's DMA-BUFs none match: "no more
-                   # input formats". The encoder uploads the frames itself.
-                   make_element("capsfilter", {"caps": "video/x-raw"})]
+            if Capture._gpu_buffers:
+                # The portal only hands out GPU buffers (DMA-BUFs; NVIDIA does
+                # this): OpenGL imports them and copies the picture out
+                src = [make_element("pipewiresrc", {"fd": os.dup(fd), "path": str(node), "do-timestamp": True,
+                                                    "keepalive-time": 1000}),
+                       make_element("glupload", {}), make_element("glcolorconvert", {}),
+                       make_element("gldownload", {}), make_element("capsfilter", {"caps": "video/x-raw"})]
+            else:
+                src = [make_element("pipewiresrc", {"fd": os.dup(fd), "path": str(node), "do-timestamp": True,
+                                                    "keepalive-time": 1000, "always-copy": True}),
+                       # Ordinary memory. Otherwise pipewiresrc offers the portal
+                       # only the GPU buffer layouts the encoder takes (VA-API's,
+                       # behind vapostproc). The encoder uploads the frames itself.
+                       make_element("capsfilter", {"caps": "video/x-raw"})]
         else:
             src = [make_element("videotestsrc", {"is-live": True, "pattern": "ball"}),
                    make_element("capsfilter", {"caps": f"video/x-raw,width=1280,height=720,framerate={fps}/1"})]
@@ -982,7 +992,16 @@ class Host:
                     os.close(source[0])
                 # Some failures happen the same way every time: don't keep
                 # knocking the portal over (systemd stops restarting it)
-                final = ("encoder" in str(e) or "no more input formats" in str(e) or "cancelled" in str(e)
+                formats = "no more input formats" in str(e)
+                if formats and not Capture._gpu_buffers and not test:
+                    import gi
+                    gi.require_version("Gst", "1.0")
+                    from gi.repository import Gst
+                    if Gst.ElementFactory.find("glupload"):
+                        Capture._gpu_buffers = True
+                        log("the portal offers no ordinary memory: capturing through OpenGL instead")
+                        formats = False
+                final = ("encoder" in str(e) or formats or "cancelled" in str(e)
                          or "no screen was shared" in str(e))
                 if attempt == 5 or final or channel.closed:
                     raise
@@ -1161,8 +1180,17 @@ def firewall_closed(port):
                                capture_output=True, text=True, timeout=10)
         except (OSError, subprocess.SubprocessError):
             continue
-        if q.returncode == 1:               # "no" (other codes: couldn't ask)
-            closed.append(zone)
+        if q.returncode != 1:               # open (0), or couldn't ask
+            continue
+        # A zone that lets everything in (trusted, e.g. Waydroid's) needs no port
+        try:
+            info = subprocess.run(["firewall-cmd", f"--zone={zone}", "--list-all"], capture_output=True,
+                                  text=True, timeout=10).stdout
+        except (OSError, subprocess.SubprocessError):
+            info = ""
+        if any(line.split() == ["target:", "ACCEPT"] for line in info.splitlines()):
+            continue
+        closed.append(zone)
     return closed
 
 
