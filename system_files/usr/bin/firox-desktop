@@ -1201,7 +1201,9 @@ class Desktop:
         entry = Gtk.Entry()
         entry.get_style_context().add_class("firox-rename")
         entry.set_has_frame(True)
-        entry.set_text(os.path.basename(item.path))
+        launcher = item.app is not None and item.path.endswith(".desktop")
+        # A launcher is renamed by the name it shows, not its file's
+        entry.set_text(item.name if launcher else os.path.basename(item.path))
         entry.set_alignment(0.5)
         entry.set_halign(Gtk.Align.START)
         entry.set_valign(Gtk.Align.START)
@@ -1219,7 +1221,7 @@ class Desktop:
         self.rename_entry = entry
         stem, ext = os.path.splitext(entry.get_text())
         entry.grab_focus()
-        entry.select_region(0, len(stem) if (ext and not item.is_dir) else -1)
+        entry.select_region(0, len(stem) if (ext and not item.is_dir and not launcher) else -1)
         state = {"done": False}
 
         def finish(apply):
@@ -1248,6 +1250,8 @@ class Desktop:
         entry.connect("focus-out-event", lambda *_: finish(True) or False)
 
     def do_rename(self, item, new):
+        if item.app is not None and item.path.endswith(".desktop"):
+            return self.rename_launcher(item, new)
         if not new or new == os.path.basename(item.path):
             return
         if "/" in new:
@@ -1269,6 +1273,24 @@ class Desktop:
             self.positions.pop(item.id, None)
             item.id = f"file:{new}"
             self.save_positions()
+
+    def rename_launcher(self, item, new):
+        """Change the name a launcher shows (its Name=), and its file to match."""
+        import firox_launcher
+        if not new or new == item.name:
+            return
+        try:
+            path = firox_launcher.set_launcher_name(item.path, new)
+        except OSError as err:
+            self.error("Couldn't rename", str(err))
+            return
+        new_id = f"file:{os.path.basename(path)}"
+        if item.cell is not None and new_id != item.id:
+            self.positions[new_id] = item.cell
+            self.positions.pop(item.id, None)
+            item.id = new_id
+            self.save_positions()
+        self.schedule_reload()
 
     def properties(self, item):
         dlg = Gtk.Dialog(title=f"{item.name} Properties", modal=True)
