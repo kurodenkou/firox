@@ -361,6 +361,17 @@ class PortalError(Exception):
     pass
 
 
+def reset_portal():
+    """Let systemd start xdg-desktop-portal-wlr again after it has stopped a
+    few times in a row (start-limit-hit), which otherwise fails every
+    screen-sharing request with CreateSession until the next login."""
+    try:
+        subprocess.run(["systemctl", "--user", "reset-failed", "xdg-desktop-portal-wlr.service"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
 class ScreenCast:
     """A screen-sharing session through xdg-desktop-portal. The portal's
     answers arrive as D-Bus signals on the main loop (the daemon runs
@@ -680,7 +691,12 @@ class Capture:
         if self.source:
             fd, node = self.source
             src = [make_element("pipewiresrc", {"fd": os.dup(fd), "path": str(node), "do-timestamp": True,
-                                                "keepalive-time": 1000, "always-copy": True})]
+                                                "keepalive-time": 1000, "always-copy": True}),
+                   # Ordinary memory. Otherwise pipewiresrc offers the portal only
+                   # the GPU buffer layouts the encoder takes (VA-API's, behind
+                   # vapostproc), and with NVIDIA's DMA-BUFs none match: "no more
+                   # input formats". The encoder uploads the frames itself.
+                   make_element("capsfilter", {"caps": "video/x-raw"})]
         else:
             src = [make_element("videotestsrc", {"is-live": True, "pattern": "ball"}),
                    make_element("capsfilter", {"caps": f"video/x-raw,width=1280,height=720,framerate={fps}/1"})]
@@ -937,6 +953,8 @@ class Host:
         still out, and is disconnected); it comes straight back, so this
         tries a new screen-sharing session a few times."""
         test = os.environ.get("FIROX_STREAM_SOURCE") == "test"
+        if not test:
+            reset_portal()
         for attempt in range(1, 6):
             cast = source = capture = None
             cursor = False
@@ -962,10 +980,15 @@ class Host:
                     cast.close()
                 if source:
                     os.close(source[0])
-                if attempt == 5 or isinstance(e, PortalError) or "encoder" in str(e) or channel.closed:
+                # Some failures happen the same way every time: don't keep
+                # knocking the portal over (systemd stops restarting it)
+                final = ("encoder" in str(e) or "no more input formats" in str(e) or "cancelled" in str(e)
+                         or "no screen was shared" in str(e))
+                if attempt == 5 or final or channel.closed:
                     raise
                 log(f"capture attempt {attempt} failed ({e}); trying again")
-                time.sleep(1)
+                reset_portal()
+                time.sleep(3)
 
     @staticmethod
     def close_capture(capture, cast):
