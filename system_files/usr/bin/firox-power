@@ -25,7 +25,8 @@
 #   BATTERY_ACTION                  then do BATTERY_ACTION_KIND:
 #   BATTERY_ACTION_KIND             0 nothing, 1 sleep, 2 hibernate, 3 shut down
 # Settings live in ~/.config/firox/power.conf (defaults: /etc/firox/power.conf).
-# Apps that play video or are full screen keep the screen on (idle inhibit).
+# Apps that play video or are full screen keep the screen on (idle inhibit),
+# and so does another computer streaming this one (Firox Stream).
 set -u
 
 SYS_CONF=/etc/firox/power.conf
@@ -33,6 +34,8 @@ USER_CONF="${XDG_CONFIG_HOME:-$HOME/.config}/firox/power.conf"
 KEYS="MONITOR_AC MONITOR_BATTERY LOCK SLEEP_AC SLEEP_BATTERY LOCK_ON_WAKE SCREENSAVER_WAIT BATTERY_LOW BATTERY_CRITICAL BATTERY_ACTION BATTERY_ACTION_KIND"
 PS="${FIROX_POWER_SUPPLY:-/sys/class/power_supply}"
 AWAKE="${XDG_RUNTIME_DIR:-/tmp}/firox-stay-awake"
+# Firox Stream holds the timers while another computer streams this one
+STREAM_AWAKE="${XDG_RUNTIME_DIR:-/tmp}/firox-stream-awake"
 
 get() {
     local v=""
@@ -145,8 +148,9 @@ battery_watch() {
 
 start() {
     pkill -u "$USER" -x swayidle
-    # "Keep the screen on" (taskbar): no timers until it's turned off
-    [ -e "$AWAKE" ] && return 0
+    # "Keep the screen on" (taskbar), or a stream (firox-stream): no timers
+    # until it's turned off
+    if [ -e "$AWAKE" ] || [ -e "$STREAM_AWAKE" ]; then return 0; fi
     local args=(-w) m src
     m="$(get SCREENSAVER_WAIT)"
     if [ "$m" -gt 0 ] && [ "$(firox-screensaver current)" != none ]; then

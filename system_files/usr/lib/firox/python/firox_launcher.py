@@ -140,7 +140,8 @@ def entry_text(name, program, args="", terminal=False, icon=None):
 
 
 def safe_filename(name):
-    s = re.sub(r'[/\\:*?"<>|\x00-\x1f]+', " ", name).strip().strip(".") or "Launcher"
+    s = re.sub(r'[/\\:*?"<>|\x00-\x1f]+', " ", name)
+    s = re.sub(r"\s+", " ", s).strip().strip(".") or "Launcher"
     return s[:120]
 
 
@@ -150,6 +151,62 @@ def unique(folder, stem, ext):
     while os.path.exists(path):
         path = os.path.join(folder, f"{stem} ({n}){ext}")
         n += 1
+    return path
+
+
+def set_launcher_name(path, name, rename_file=True):
+    """Rename a launcher (.desktop file) the way people see it: change its
+    Name= (and drop translated names, which would win over it), and by
+    default give the file a matching name. A launcher that is a link to an
+    app's own entry (read-only) becomes a copy of it here. Returns the
+    launcher's path afterwards. Raises OSError."""
+    with open(path, encoding="utf-8", errors="surrogateescape") as fh:
+        lines = fh.read().splitlines()
+    out, group, done = [], None, False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            if group == "[Desktop Entry]" and not done:
+                out.append(f"Name={name}")
+                done = True
+            group = stripped
+        elif group == "[Desktop Entry]":
+            key = stripped.split("=", 1)[0].strip()
+            if key == "Name":
+                if not done:
+                    out.append(f"Name={name}")
+                    done = True
+                continue
+            if key.startswith("Name["):
+                continue
+        out.append(line)
+    if not done:
+        if "[Desktop Entry]" not in (l.strip() for l in out):
+            out.insert(0, "[Desktop Entry]")
+        idx = next(i for i, l in enumerate(out) if l.strip() == "[Desktop Entry]")
+        out.insert(idx + 1, f"Name={name}")
+    folder = os.path.dirname(os.path.abspath(path))
+    try:
+        mode = os.stat(path).st_mode & 0o7777
+    except OSError:
+        mode = 0o755
+    if os.path.islink(path):
+        mode |= 0o755
+    tmp = tempfile.NamedTemporaryFile("w", dir=folder, prefix=".launcher-", suffix=".tmp",
+                                      delete=False, encoding="utf-8", errors="surrogateescape")
+    with tmp:
+        tmp.write("\n".join(out) + "\n")
+    os.chmod(tmp.name, mode)
+    os.replace(tmp.name, path)              # a link is replaced by the copy, its target untouched
+    if rename_file:
+        current = os.path.basename(path)
+        wanted = safe_filename(name) + ".desktop"
+        if wanted != current:
+            target = os.path.join(folder, wanted)
+            if os.path.exists(target):
+                target = unique(folder, safe_filename(name), ".desktop")
+            os.rename(path, target)
+            path = target
     return path
 
 

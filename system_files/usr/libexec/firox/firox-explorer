@@ -1800,9 +1800,19 @@ class Explorer(Gtk.ApplicationWindow):
             error_box(self, "Couldn't rename", "A name can't contain “/”.")
             return
         try:
-            gfile.set_display_name(new, None)
+            renamed = gfile.set_display_name(new, None)
         except GLib.Error as err:
             error_box(self, "Couldn't rename", err.message)
+            return
+        # A launcher shows its Name=, not its file name (on the desktop, in
+        # menus): keep them the same
+        path = renamed.get_path()
+        if path and row[C_NAME].endswith(".desktop") and new.endswith(".desktop") and new != ".desktop":
+            import firox_launcher
+            try:
+                firox_launcher.set_launcher_name(path, new[:-len(".desktop")], rename_file=False)
+            except OSError:
+                pass
 
     def new_folder(self):
         dest = self.dest_path()

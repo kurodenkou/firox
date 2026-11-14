@@ -78,14 +78,14 @@ install-app-store:
 # Firox Stream (built in, GStreamer) streams this computer's screen and
 # sound to another Firox computer, which sends its keyboard and mouse back.
 # The Start menu's Firox Stream does the same; this is for a terminal.
-# Let other computers stream this one: ujust stream on|off|status|unpair
+# Let other computers stream this one: ujust stream on|off|status|kick|unpair
 [group('Firox Linux')]
 stream ACTION="status":
     #!/usr/bin/bash
     set -euo pipefail
     case "{{ ACTION }}" in
-        on|off|status|unpair) firox-stream "{{ ACTION }}" ;;
-        *) echo "Usage: ujust stream on|off|status|unpair"; exit 2 ;;
+        on|off|status|kick|unpair) firox-stream "{{ ACTION }}" ;;
+        *) echo "Usage: ujust stream on|off|status|kick|unpair"; exit 2 ;;
     esac
 
 # Firox Explorer is now Firox's file manager. This tidies up after the
