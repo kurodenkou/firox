@@ -569,11 +569,11 @@ def video_encoders(kbps, fps):
     va = [("vapostproc", {}), ("capsfilter", {"caps": "video/x-raw(memory:VAMemory),format=NV12"})]
     va_props = {"bitrate": kbps, "key-int-max": gop, "b-frames": 0, "rate-control": "cbr", "target-usage": 6}
     return [
-        ("vah264lpenc", va + [("vah264lpenc", va_props)]),
-        ("vah264enc", va + [("vah264enc", va_props)]),
         ("nvh264enc", [("videoconvert", {}), nv12,
                        ("nvh264enc", {"bitrate": kbps, "gop-size": gop, "bframes": 0, "rc-mode": "cbr",
                                       "zerolatency": True, "preset": "low-latency-hq"})]),
+        ("vah264lpenc", va + [("vah264lpenc", va_props)]),
+        ("vah264enc", va + [("vah264enc", va_props)]),
         ("qsvh264enc", [("videoconvert", {}), nv12,
                         ("qsvh264enc", {"bitrate": kbps, "gop-size": gop, "b-frames": 0,
                                         "rate-control": "cbr", "low-latency": True})]),
@@ -649,10 +649,14 @@ class Capture:
         capture of the same portal stream can upset the portal."""
         Gst = self.Gst
         wanted = self.conf.get("encoder") or "auto"
-        if wanted in Capture._encoder:
-            return Capture._encoder[wanted]
+        key = (wanted, Capture._gpu_buffers)
+        if key in Capture._encoder:
+            return Capture._encoder[key]
+        # Through OpenGL (NVIDIA), VA-API is another chip's, or none: on the
+        # first NVIDIA computer it garbled the colours and stopped after a frame
         candidates = [c for c in video_encoders(kbps, fps)
-                      if wanted in ("auto", c[0]) and Gst.ElementFactory.find(c[0])]
+                      if wanted in ("auto", c[0]) and Gst.ElementFactory.find(c[0])
+                      and not (Capture._gpu_buffers and wanted == "auto" and c[0].startswith("va"))]
         for name, elements in candidates:
             pipeline = Gst.Pipeline.new("probe")
             try:
@@ -668,7 +672,7 @@ class Capture:
             msg = pipeline.get_bus().timed_pop_filtered(10 * Gst.SECOND, Gst.MessageType.EOS | Gst.MessageType.ERROR)
             pipeline.set_state(Gst.State.NULL)
             if msg is not None and msg.type == Gst.MessageType.EOS:
-                Capture._encoder[wanted] = (name, elements)
+                Capture._encoder[key] = (name, elements)
                 return name, elements
             log(f"{name}: " + (msg.parse_error()[0].message if msg is not None else "no picture after 10 seconds"))
         raise RuntimeError("no H.264 encoder works on this computer" if wanted == "auto"
