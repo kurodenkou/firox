@@ -28,6 +28,11 @@ stays in the window and moves the other computer's mouse by relative
 motion).
     Ctrl+Alt+Shift+Z  release the mouse     Ctrl+Alt+Shift+M  capture on click on/off
     Ctrl+Alt+Shift+F  full screen           Ctrl+Alt+Shift+Q  stop
+    Ctrl+Alt+Shift+U  unlock it (its password)  Ctrl+Alt+Shift+W  wake its screen
+
+Connecting wakes the other computer's screen (monitors back on, screen saver
+off), and its screen saver, lock, monitor-off and sleep timers wait while
+it's being streamed.
 
 Settings: ~/.config/firox/stream.json (host: on/off, bitrate, sound, paired
 computers) and ~/.config/firox/stream-hosts.json (the computers this one has
@@ -1057,7 +1062,10 @@ class Host:
                "To stop it, turn streaming off in Firox Stream.")
         injector = None
         channel = Channel(sock, None)
-        state = {"capture": None, "cast": None}
+        state = {"capture": None, "cast": None, "locked": screen_locked()}
+        keep_awake(True)
+        wake_screen()
+        time.sleep(0.5)                     # monitors coming back on
         try:
             import firox_monitors
             output = firox_monitors.main_name()
@@ -1068,9 +1076,11 @@ class Host:
                 log(f"keyboard and mouse unavailable: {e}")
             audio = state["capture"].start_audio()
             sock.sendall(frame("O", {"name": self.name, "input": injector is not None,
-                                     "cursor": cursor, "audio": audio, "encoder": state["capture"].encoder}))
+                                     "cursor": cursor, "audio": audio, "encoder": state["capture"].encoder,
+                                     "locked": state["locked"]}))
         except Exception as e:
             log(f"couldn't start: {e}")
+            keep_awake(False)
             self.close_capture(state["capture"], state["cast"])
             if injector:
                 injector.close()
@@ -1087,6 +1097,22 @@ class Host:
             elif kind == "F":
                 if state["capture"] is not None:
                     state["capture"].request_key()
+            elif kind == "W":
+                threading.Thread(target=wake_screen, daemon=True).start()
+            elif kind == "U":
+                try:
+                    password = str(json.loads(payload).get("password", ""))
+                except (ValueError, AttributeError):
+                    password = ""
+
+                def try_unlock():
+                    ok, message = unlock_screen(password) if password else (False, "No password given.")
+                    log(f"remote unlock from {client}: {'unlocked' if ok else 'not unlocked'}")
+                    channel.send("u", {"ok": ok, "message": message})
+                    if ok:
+                        state["locked"] = False
+                        channel.send("L", {"locked": False})
+                threading.Thread(target=try_unlock, daemon=True).start()
             elif kind == "Q":
                 channel.close("stopped")
 
@@ -1094,7 +1120,15 @@ class Host:
             """Start the capture again when it stops in the middle (the
             other computer gets a fresh key frame and carries on)."""
             restarts = collections.deque()
+            checked = time.monotonic()
             while not channel.closed:
+                # Tell the other computer when this one locks or unlocks
+                if time.monotonic() - checked > 2:
+                    checked = time.monotonic()
+                    locked = screen_locked()
+                    if locked != state["locked"]:
+                        state["locked"] = locked
+                        channel.send("L", {"locked": locked})
                 if not state["capture"].broken.wait(1) or channel.closed:
                     continue
                 now = time.monotonic()
@@ -1124,6 +1158,7 @@ class Host:
         self.close_capture(state["capture"], state["cast"])
         if injector:
             injector.close()
+        keep_awake(False)
         try:
             os.unlink(CHOOSER_HINT)
         except OSError:
@@ -1165,6 +1200,67 @@ class Host:
         return False
 
 
+RUNTIME = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+STREAM_AWAKE = os.path.join(RUNTIME, "firox-stream-awake")      # read by firox-power
+LOCK_SOCKET = os.path.join(RUNTIME, "firox-lock.sock")          # served by firox-lock
+
+
+def keep_awake(on):
+    """Hold this computer's idle timers (screen saver, lock, monitor off,
+    sleep) while it's being streamed: firox-power skips them while the file
+    exists."""
+    try:
+        if on:
+            open(STREAM_AWAKE, "w").close()
+        else:
+            os.unlink(STREAM_AWAKE)
+    except OSError:
+        pass
+    try:
+        subprocess.Popen(["firox-power", "start"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        pass
+
+
+def wake_screen():
+    """Monitors on and the screen saver gone, before capturing them."""
+    for cmd in (["wlopm", "--on", "*"], ["firox-screensaver", "stop"]):
+        try:
+            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+
+def screen_locked():
+    """Is firox-lock up (and able to take a password)?"""
+    if not os.path.exists(LOCK_SOCKET):
+        return False
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(2)
+            s.connect(LOCK_SOCKET)
+        return True                 # (an empty connection is ignored)
+    except OSError:
+        return False
+
+
+def unlock_screen(password):
+    """Give firox-lock the password: (unlocked, message)."""
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(30)
+            s.connect(LOCK_SOCKET)
+            s.sendall(password.encode() + b"\n")
+            answer = s.recv(64).decode(errors="replace").strip()
+    except OSError:
+        return False, "That computer isn't locked (or its lock screen can't be unlocked this way)."
+    if answer == "ok":
+        return True, "Unlocked"
+    if answer == "busy":
+        return False, "That computer's lock screen is busy checking a password. Try again in a moment."
+    return False, "The password is incorrect."
+
+
 def notify(summary, body):
     try:
         subprocess.Popen(["notify-send", "-a", "Firox Stream", "-i", "preferences-desktop-remote-desktop",
@@ -1184,6 +1280,17 @@ def run_daemon():
     except OSError as e:
         log(f"couldn't start: {e}")          # most likely already running
         return 1
+    if os.path.exists(STREAM_AWAKE):        # left by a daemon that didn't finish
+        keep_awake(False)
+
+    def warm_up():
+        # GStreamer scans its plugins the first time (seconds, more after an
+        # update): do it now rather than while someone waits to connect
+        import gi
+        gi.require_version("Gst", "1.0")
+        from gi.repository import Gst
+        Gst.init(None)
+    threading.Thread(target=warm_up, daemon=True).start()
     from gi.repository import Gtk
     Gtk.main()
     return 0
@@ -1490,6 +1597,9 @@ def connect(address, ask_pin):
         known = hosts.get(fingerprint, {})
         name = computer_name()
         sock.sendall(frame("H", {"v": 1, "name": name, "token": known.get("token", "")}))
+        # Starting the capture can take a while (GStreamer's first plugin
+        # scan after an update, the portal's retries)
+        sock.settimeout(90)
         note = ""
         while True:
             kind, msg = recv_json(sock)
@@ -1501,7 +1611,7 @@ def connect(address, ask_pin):
                 host_name = msg.get("name") or known.get("name") or host
                 sock.settimeout(None)
                 pin = ask_pin(host_name if kind == "N" else known.get("name", host_name), note)
-                sock.settimeout(30)
+                sock.settimeout(90)
                 if not pin:
                     raise ConnectionError("")
                 known["name"] = host_name
@@ -1634,8 +1744,11 @@ def client_ui(address=None):
             self.connect("delete-event", lambda *_a: self.stop() or False)
             self.channel = Channel(sock, self.on_message, self.on_closed)
             threading.Thread(target=self.channel.run, daemon=True).start()
+            self.locked = False
             self.show_all()
             self.area.grab_focus()
+            if info.get("locked"):
+                GLib.timeout_add(1500, lambda: self.set_locked(True) or False)
 
         # -- playing
         def build_video(self, sink_name):
@@ -1722,6 +1835,11 @@ def client_ui(address=None):
                         GLib.idle_add(self.set_video_size, w, h)
                 elif msg.get("kind") == "audio" and self.asrc is not None:
                     self.asrc.set_property("caps", caps)
+            elif kind == "L":
+                GLib.idle_add(self.set_locked, bool(json.loads(payload).get("locked")))
+            elif kind == "u":
+                msg = json.loads(payload)
+                GLib.idle_add(self.unlock_answer, bool(msg.get("ok")), str(msg.get("message", "")))
             elif kind == "E":
                 self.channel.close(json.loads(payload).get("error", ""))
 
@@ -1766,11 +1884,61 @@ def client_ui(address=None):
                            if hide else None)
 
         def show_hint(self, text, seconds=4):
+            """A note over the picture; seconds=0 keeps it up."""
             self.hint.set_text(text)
             self.hint.show()
             if self.hint_timer:
                 GLib.source_remove(self.hint_timer)
-            self.hint_timer = GLib.timeout_add_seconds(seconds, self.hide_hint)
+            self.hint_timer = GLib.timeout_add_seconds(seconds, self.hide_hint) if seconds else 0
+
+        # -- that computer's lock screen
+        LOCKED_NOTE = ("That computer is locked \u00b7 Ctrl+Alt+Shift+U to unlock it with its password "
+                       "(or type the password into its lock screen)")
+
+        def set_locked(self, locked):
+            was, self.locked = self.locked, locked
+            if locked and not was:
+                self.release_mouse()
+                self.show_hint(self.LOCKED_NOTE, 0)
+            elif was and not locked:
+                self.show_hint("Unlocked", 3)
+            return False
+
+        def ask_unlock(self):
+            if not self.info.get("input"):
+                return
+            self.release_mouse()
+            self.release_all()
+            dlg = Gtk.Dialog(title="Unlock", transient_for=self, modal=True)
+            dlg.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Unlock", Gtk.ResponseType.OK)
+            dlg.set_default_response(Gtk.ResponseType.OK)
+            box = dlg.get_content_area()
+            box.set_spacing(8)
+            for side in ("start", "end", "top", "bottom"):
+                getattr(box, f"set_margin_{side}")(14)
+            name = GLib.markup_escape_text(self.info.get("name") or "that computer")
+            lbl = Gtk.Label(xalign=0, wrap=True, max_width_chars=44)
+            lbl.set_markup(f"<b>Unlock {name}</b>\n\nType the password of the account that's locked there. "
+                           "It's checked by that computer's lock screen, exactly as if typed there.")
+            entry = Gtk.Entry(visibility=False, activates_default=True, input_purpose=Gtk.InputPurpose.PASSWORD)
+            box.add(lbl)
+            box.add(entry)
+            dlg.show_all()
+            password = entry.get_text() if dlg.run() == Gtk.ResponseType.OK else ""
+            entry.set_text("")
+            dlg.destroy()
+            self.area.grab_focus()
+            if password:
+                self.show_hint("Checking the password\u2026", 0)
+                self.channel.send("U", {"password": password})
+
+        def unlock_answer(self, ok, message):
+            if ok:
+                self.locked = False
+                self.show_hint("Unlocked", 3)
+            else:
+                self.show_hint(message + (" \u00b7 Ctrl+Alt+Shift+U to try again" if self.locked else ""), 6)
+            return False
 
         def hide_hint(self):
             self.hint.hide()
@@ -1887,6 +2055,13 @@ def client_ui(address=None):
                 key = Gdk.keyval_to_lower(ev.keyval)
                 if key == Gdk.KEY_q:
                     self.stop()
+                    return True
+                if key == Gdk.KEY_u:
+                    self.ask_unlock()
+                    return True
+                if key == Gdk.KEY_w:
+                    self.channel.send("W")          # wake its screen (monitors off, screen saver)
+                    self.show_hint("Waking that computer's screen", 2)
                     return True
                 if key == Gdk.KEY_z:
                     self.release_all()

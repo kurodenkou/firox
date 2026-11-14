@@ -14,6 +14,11 @@ get in the way of the text. ~/.config/firox/lock.conf: `blur = light`
 ~/.cache/firox/ until the wallpaper changes. Turn off computer offers Sleep, Turn Off and
 Restart. The password is checked with PAM (/etc/pam.d/firox-lock).
 
+While locked, $XDG_RUNTIME_DIR/firox-lock.sock (only you can open it)
+takes a password from another program, Firox Stream's remote unlock: it's
+checked exactly like one typed here, with the same pause after a wrong one,
+and answered "ok", "wrong" or "busy". Nothing unlocks without the password.
+
 Locking uses the Wayland ext-session-lock protocol (gtk-session-lock): if
 the lock screen ever crashed, the screen would stay locked, not open. Exits
 with 2 if the compositor can't lock this way (firox-open then uses swaylock).
@@ -29,6 +34,7 @@ import threading
 import time
 
 THEMES = "/usr/share/firox/themes"
+SOCKET = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}", "firox-lock.sock")
 DEFAULT_FACE = "/usr/share/firox/icons/user-default.svg"
 PAM_SERVICE = "firox-lock"
 CONFIG = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "firox")
@@ -408,6 +414,10 @@ def run(notify_fd):
         if ok:
             unlock()
             return False
+        wrong()
+        return False
+
+    def wrong(note="The password is incorrect. Try again.", then=None):
         state["fails"] += 1
         # A short pause after each wrong try, longer after several
         delay = 1500 if state["fails"] < 3 else 4000
@@ -416,10 +426,99 @@ def run(notify_fd):
             state["busy"] = False
             everywhere(lambda w: w.entry.set_text(""))
             everywhere(lambda w: w.set_busy(False))
-            everywhere(lambda w: w.say("The password is incorrect. Try again."))
+            everywhere(lambda w: w.say(note))
+            if then:
+                then()
             return False
         GLib.timeout_add(delay, again)
+
+    # ---- unlocking from another program (Firox Stream), with the password
+    def remote_unlock(password, conn):
+        """On the main loop: check a password that came over the socket."""
+        def reply(word):
+            try:
+                conn.sendall(word.encode() + b"\n")
+            except OSError:
+                pass
+            conn.close()
+
+        if state["busy"] or state["unlocked"]:
+            reply("busy")
+            return False
+        state["busy"] = True
+        everywhere(lambda w: w.set_busy(True))
+        everywhere(lambda w: w.say(""))
+
+        def check():
+            ok = False
+            try:
+                import pam
+                ok = bool(pam.pam().authenticate(username, password, service=PAM_SERVICE))
+            except Exception as err:  # noqa: BLE001 - never crash while locked
+                print(f"firox-lock: PAM: {err}", file=sys.stderr)
+            GLib.idle_add(remote_checked, ok)
+
+        def remote_checked(ok):
+            if ok:
+                reply("ok")
+                unlock()
+            else:
+                wrong("A wrong password was typed from another computer.", lambda: reply("wrong"))
+            return False
+        threading.Thread(target=check, daemon=True).start()
         return False
+
+    def serve_socket():
+        import socket
+        try:
+            os.unlink(SOCKET)
+        except OSError:
+            pass
+        try:
+            server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            old = os.umask(0o177)
+            try:
+                server.bind(SOCKET)
+            finally:
+                os.umask(old)
+            server.listen(2)
+        except OSError as err:
+            print(f"firox-lock: no remote unlock: {err}", file=sys.stderr)
+            return
+
+        def loop():
+            while not state["unlocked"]:
+                try:
+                    conn, _addr = server.accept()
+                except OSError:
+                    return
+                # Only this user's own programs (the socket is 0600 as well)
+                try:
+                    creds = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
+                    uid = int.from_bytes(creds[4:8], sys.byteorder)
+                except OSError:
+                    uid = -1
+                if uid != os.getuid():
+                    conn.close()
+                    continue
+                conn.settimeout(10)
+                try:
+                    data = conn.recv(4096)
+                except OSError:
+                    conn.close()
+                    continue
+                password = data.decode("utf-8", "replace").rstrip("\r\n")
+                if not password:
+                    conn.close()
+                    continue
+                GLib.idle_add(remote_unlock, password, conn)
+        threading.Thread(target=loop, daemon=True).start()
+
+    def remove_socket():
+        try:
+            os.unlink(SOCKET)
+        except OSError:
+            pass
 
     def power_menu(win):
         dlg = Gtk.Dialog(title="Turn off computer", transient_for=win, modal=True)
@@ -481,6 +580,7 @@ def run(notify_fd):
 
     def unlock():
         state["unlocked"] = True
+        remove_socket()
         lock.unlock_and_destroy()
         # Make sure the compositor has the unlock, then just leave: tearing
         # the lock windows down ourselves afterwards is a protocol error
@@ -489,6 +589,7 @@ def run(notify_fd):
         display.sync()
         GLib.timeout_add(150, lambda: Gtk.main_quit() or False)
 
+    lock.connect("locked", lambda _l: serve_socket())
     lock.connect("locked", on_locked)
     lock.connect("finished", on_finished)
     lock.lock_lock()
@@ -503,6 +604,7 @@ def run(notify_fd):
         return True
     GLib.timeout_add_seconds(10, tick)
     Gtk.main()
+    remove_socket()
     if not state["unlocked"]:
         sys.exit(1)
 
