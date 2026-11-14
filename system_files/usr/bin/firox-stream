@@ -741,6 +741,16 @@ class Capture:
             self.sent_caps.add(kind)
             self.channel.send("K", {"kind": kind, "caps": sample.get_caps().to_string()})
 
+    def request_key(self):
+        """Send a key frame (and the stream headers) next: the other side
+        has a new decoder, which can't use frames that build on earlier ones."""
+        if self.video is None:
+            return
+        sink = self.video.get_by_name("sink")
+        self.need_key = True
+        self.key_asked = time.monotonic()
+        sink.send_event(self.GstVideo.video_event_new_upstream_force_key_unit(self.Gst.CLOCK_TIME_NONE, True, 0))
+
     def _on_video(self, sink):
         Gst = self.Gst
         sample = sink.emit("pull-sample")
@@ -1052,6 +1062,9 @@ class Host:
                         injector.handle(ev)
                 except (ValueError, TypeError, IndexError, OSError) as e:
                     log(f"input: {e}")
+            elif kind == "F":
+                if state["capture"] is not None:
+                    state["capture"].request_key()
             elif kind == "Q":
                 channel.close("stopped")
 
@@ -1442,7 +1455,7 @@ def client_ui(address=None):
                 self.build_video("gtksink")
                 if caps:
                     self.vsrc.set_property("caps", caps)
-                self.channel.send("I", [["r"]])
+                self.channel.send("F")              # the new decoder needs a key frame
 
         def build_audio(self):
             self.asrc = self.audio = None
