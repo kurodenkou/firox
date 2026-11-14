@@ -23,7 +23,11 @@ the host: whoever connects must be able to see the host's screen. Both sides
 then remember each other, the host by a token, the other computer by the
 host's certificate.
 
-While streaming:  Ctrl+Alt+Shift+F  full screen      Ctrl+Alt+Shift+Q  stop
+While streaming, click in the picture to capture the mouse (for games: it
+stays in the window and moves the other computer's mouse by relative
+motion).
+    Ctrl+Alt+Shift+Z  release the mouse     Ctrl+Alt+Shift+M  capture on click on/off
+    Ctrl+Alt+Shift+F  full screen           Ctrl+Alt+Shift+Q  stop
 
 Settings: ~/.config/firox/stream.json (host: on/off, bitrate, sound, paired
 computers) and ~/.config/firox/stream-hosts.json (the computers this one has
@@ -31,6 +35,7 @@ streamed). Host log: ~/.local/state/firox/stream.log
 """
 
 import collections
+import errno
 import hashlib
 import hmac
 import json
@@ -360,6 +365,17 @@ class PortalError(Exception):
     pass
 
 
+def reset_portal():
+    """Let systemd start xdg-desktop-portal-wlr again after it has stopped a
+    few times in a row (start-limit-hit), which otherwise fails every
+    screen-sharing request with CreateSession until the next login."""
+    try:
+        subprocess.run(["systemctl", "--user", "reset-failed", "xdg-desktop-portal-wlr.service"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
 class ScreenCast:
     """A screen-sharing session through xdg-desktop-portal. The portal's
     answers arrive as D-Bus signals on the main loop (the daemon runs
@@ -470,8 +486,12 @@ class Injector:
             e.EV_ABS: [(e.ABS_X, AbsInfo(0, 0, 65535, 0, 0, 0)), (e.ABS_Y, AbsInfo(0, 0, 65535, 0, 0, 0))],
             e.EV_REL: [e.REL_WHEEL, e.REL_HWHEEL, e.REL_WHEEL_HI_RES, e.REL_HWHEEL_HI_RES],
         }, name="Firox Stream Mouse")
+        # For a captured mouse (games): movement, not a position
+        self.rel_mouse = UInput({e.EV_KEY: list(self.BUTTONS), e.EV_REL: [e.REL_X, e.REL_Y]},
+                                name="Firox Stream Mouse (relative)")
         self.down_keys, self.down_buttons = set(), set()
         self.wheel = [0.0, 0.0]
+        self.rel = [0.0, 0.0]
         self.geometry(output)
 
     def geometry(self, output):
@@ -499,6 +519,15 @@ class Injector:
             self.mouse.write(e.EV_ABS, e.ABS_X, int((mx + u * mw) * 65535))
             self.mouse.write(e.EV_ABS, e.ABS_Y, int((my + v * mh) * 65535))
             self.mouse.syn()
+        elif kind == "d":
+            # Captured mouse: movement in the other computer's mouse units
+            for i, axis in ((0, e.REL_X), (1, e.REL_Y)):
+                self.rel[i] += max(min(float(ev[1 + i]), 10000.0), -10000.0)
+                whole = int(self.rel[i])
+                if whole:
+                    self.rel_mouse.write(e.EV_REL, axis, whole)
+                    self.rel[i] -= whole
+            self.rel_mouse.syn()
         elif kind == "b":
             code, down = int(ev[1]), bool(ev[2])
             if code in self.BUTTONS and (down != (code in self.down_buttons)):
@@ -546,6 +575,7 @@ class Injector:
         finally:
             self.kb.close()
             self.mouse.close()
+            self.rel_mouse.close()
 
 
 def video_encoders(kbps, fps):
@@ -557,11 +587,11 @@ def video_encoders(kbps, fps):
     va = [("vapostproc", {}), ("capsfilter", {"caps": "video/x-raw(memory:VAMemory),format=NV12"})]
     va_props = {"bitrate": kbps, "key-int-max": gop, "b-frames": 0, "rate-control": "cbr", "target-usage": 6}
     return [
-        ("vah264lpenc", va + [("vah264lpenc", va_props)]),
-        ("vah264enc", va + [("vah264enc", va_props)]),
         ("nvh264enc", [("videoconvert", {}), nv12,
                        ("nvh264enc", {"bitrate": kbps, "gop-size": gop, "bframes": 0, "rc-mode": "cbr",
                                       "zerolatency": True, "preset": "low-latency-hq"})]),
+        ("vah264lpenc", va + [("vah264lpenc", va_props)]),
+        ("vah264enc", va + [("vah264enc", va_props)]),
         ("qsvh264enc", [("videoconvert", {}), nv12,
                         ("qsvh264enc", {"bitrate": kbps, "gop-size": gop, "b-frames": 0,
                                         "rate-control": "cbr", "low-latency": True})]),
@@ -627,6 +657,9 @@ class Capture:
 
     # video
     _encoder = {}                       # the setting -> the encoder that worked (tried once per daemon)
+    # The portal offers no ordinary memory: go through OpenGL (found out on
+    # the first try; FIROX_STREAM_GPU=1 starts that way)
+    _gpu_buffers = os.environ.get("FIROX_STREAM_GPU") == "1"
 
     def pick_encoder(self, kbps, fps):
         """The first encoder that encodes a few frames of a test picture.
@@ -634,10 +667,14 @@ class Capture:
         capture of the same portal stream can upset the portal."""
         Gst = self.Gst
         wanted = self.conf.get("encoder") or "auto"
-        if wanted in Capture._encoder:
-            return Capture._encoder[wanted]
+        key = (wanted, Capture._gpu_buffers)
+        if key in Capture._encoder:
+            return Capture._encoder[key]
+        # Through OpenGL (NVIDIA), VA-API is another chip's, or none: on the
+        # first NVIDIA computer it garbled the colours and stopped after a frame
         candidates = [c for c in video_encoders(kbps, fps)
-                      if wanted in ("auto", c[0]) and Gst.ElementFactory.find(c[0])]
+                      if wanted in ("auto", c[0]) and Gst.ElementFactory.find(c[0])
+                      and not (Capture._gpu_buffers and wanted == "auto" and c[0].startswith("va"))]
         for name, elements in candidates:
             pipeline = Gst.Pipeline.new("probe")
             try:
@@ -653,7 +690,7 @@ class Capture:
             msg = pipeline.get_bus().timed_pop_filtered(10 * Gst.SECOND, Gst.MessageType.EOS | Gst.MessageType.ERROR)
             pipeline.set_state(Gst.State.NULL)
             if msg is not None and msg.type == Gst.MessageType.EOS:
-                Capture._encoder[wanted] = (name, elements)
+                Capture._encoder[key] = (name, elements)
                 return name, elements
             log(f"{name}: " + (msg.parse_error()[0].message if msg is not None else "no picture after 10 seconds"))
         raise RuntimeError("no H.264 encoder works on this computer" if wanted == "auto"
@@ -678,8 +715,20 @@ class Capture:
         pipeline = Gst.Pipeline.new("video")
         if self.source:
             fd, node = self.source
-            src = [make_element("pipewiresrc", {"fd": os.dup(fd), "path": str(node), "do-timestamp": True,
-                                                "keepalive-time": 1000, "always-copy": True})]
+            if Capture._gpu_buffers:
+                # The portal only hands out GPU buffers (DMA-BUFs; NVIDIA does
+                # this): OpenGL imports them and copies the picture out
+                src = [make_element("pipewiresrc", {"fd": os.dup(fd), "path": str(node), "do-timestamp": True,
+                                                    "keepalive-time": 1000}),
+                       make_element("glupload", {}), make_element("glcolorconvert", {}),
+                       make_element("gldownload", {}), make_element("capsfilter", {"caps": "video/x-raw"})]
+            else:
+                src = [make_element("pipewiresrc", {"fd": os.dup(fd), "path": str(node), "do-timestamp": True,
+                                                    "keepalive-time": 1000, "always-copy": True}),
+                       # Ordinary memory. Otherwise pipewiresrc offers the portal
+                       # only the GPU buffer layouts the encoder takes (VA-API's,
+                       # behind vapostproc). The encoder uploads the frames itself.
+                       make_element("capsfilter", {"caps": "video/x-raw"})]
         else:
             src = [make_element("videotestsrc", {"is-live": True, "pattern": "ball"}),
                    make_element("capsfilter", {"caps": f"video/x-raw,width=1280,height=720,framerate={fps}/1"})]
@@ -713,6 +762,16 @@ class Capture:
         if kind not in self.sent_caps:
             self.sent_caps.add(kind)
             self.channel.send("K", {"kind": kind, "caps": sample.get_caps().to_string()})
+
+    def request_key(self):
+        """Send a key frame (and the stream headers) next: the other side
+        has a new decoder, which can't use frames that build on earlier ones."""
+        if self.video is None:
+            return
+        sink = self.video.get_by_name("sink")
+        self.need_key = True
+        self.key_asked = time.monotonic()
+        sink.send_event(self.GstVideo.video_event_new_upstream_force_key_unit(self.Gst.CLOCK_TIME_NONE, True, 0))
 
     def _on_video(self, sink):
         Gst = self.Gst
@@ -817,6 +876,15 @@ class Host:
         self.publish()
         GLib.timeout_add_seconds(30, self.watchdog)
         log(f"listening on port {self.port}")
+        threading.Thread(target=self.check_firewall, daemon=True).start()
+
+    def check_firewall(self):
+        closed = firewall_closed(self.port)
+        if closed:
+            log(f"the firewall blocks port {self.port}/tcp in: {', '.join(closed)}")
+            notify("Other computers can't stream this one",
+                   f"The firewall blocks Firox Stream's port. Open Firox Stream and untick and tick "
+                   f"\u201cLet other computers stream this one\u201d to open it.")
 
     def publish(self):
         try:
@@ -927,6 +995,8 @@ class Host:
         still out, and is disconnected); it comes straight back, so this
         tries a new screen-sharing session a few times."""
         test = os.environ.get("FIROX_STREAM_SOURCE") == "test"
+        if not test:
+            reset_portal()
         for attempt in range(1, 6):
             cast = source = capture = None
             cursor = False
@@ -952,10 +1022,24 @@ class Host:
                     cast.close()
                 if source:
                     os.close(source[0])
-                if attempt == 5 or isinstance(e, PortalError) or "encoder" in str(e) or channel.closed:
+                # Some failures happen the same way every time: don't keep
+                # knocking the portal over (systemd stops restarting it)
+                formats = "no more input formats" in str(e)
+                if formats and not Capture._gpu_buffers and not test:
+                    import gi
+                    gi.require_version("Gst", "1.0")
+                    from gi.repository import Gst
+                    if Gst.ElementFactory.find("glupload"):
+                        Capture._gpu_buffers = True
+                        log("the portal offers no ordinary memory: capturing through OpenGL instead")
+                        formats = False
+                final = ("encoder" in str(e) or formats or "cancelled" in str(e)
+                         or "no screen was shared" in str(e))
+                if attempt == 5 or final or channel.closed:
                     raise
                 log(f"capture attempt {attempt} failed ({e}); trying again")
-                time.sleep(1)
+                reset_portal()
+                time.sleep(3)
 
     @staticmethod
     def close_capture(capture, cast):
@@ -1000,6 +1084,9 @@ class Host:
                         injector.handle(ev)
                 except (ValueError, TypeError, IndexError, OSError) as e:
                     log(f"input: {e}")
+            elif kind == "F":
+                if state["capture"] is not None:
+                    state["capture"].request_key()
             elif kind == "Q":
                 channel.close("stopped")
 
@@ -1102,16 +1189,79 @@ def run_daemon():
     return 0
 
 
+def firewall_closed(port):
+    """The active firewall zones that don't let the port in ([] when
+    firewalld isn't running or the port is open everywhere)."""
+    try:
+        out = subprocess.run(["firewall-cmd", "--get-active-zones"], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if out.returncode != 0:
+        return []
+    # "public (default)\n  interfaces: enp3s0": zone names start a line
+    zones = [line.split()[0] for line in out.stdout.splitlines() if line.strip() and not line[0].isspace()]
+    if not zones:
+        try:
+            zones = [subprocess.run(["firewall-cmd", "--get-default-zone"], capture_output=True, text=True,
+                                    timeout=10).stdout.strip()]
+        except (OSError, subprocess.SubprocessError):
+            return []
+    closed = []
+    for zone in zones:
+        if not zone.replace("-", "").replace("_", "").isalnum():
+            continue
+        try:
+            q = subprocess.run(["firewall-cmd", f"--zone={zone}", f"--query-port={port}/tcp"],
+                               capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if q.returncode != 1:               # open (0), or couldn't ask
+            continue
+        # A zone that lets everything in (trusted, e.g. Waydroid's) needs no port
+        try:
+            info = subprocess.run(["firewall-cmd", f"--zone={zone}", "--list-all"], capture_output=True,
+                                  text=True, timeout=10).stdout
+        except (OSError, subprocess.SubprocessError):
+            info = ""
+        if any(line.split() == ["target:", "ACCEPT"] for line in info.splitlines()):
+            continue
+        closed.append(zone)
+    return closed
+
+
+def open_firewall(port):
+    """Let other computers reach the port (asks for the password). An image
+    update doesn't bring the port to a zone whose settings were changed on
+    this computer (by an old Sunshine install, for example), so check here."""
+    closed = firewall_closed(port)
+    if not closed:
+        return True
+    script = "; ".join(f"firewall-cmd --permanent --zone={z} --add-port={port}/tcp && "
+                       f"firewall-cmd --zone={z} --add-port={port}/tcp" for z in closed)
+    try:
+        ok = subprocess.run(["pkexec", "sh", "-c", script], stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL).returncode == 0
+    except OSError:
+        ok = False
+    return ok and not firewall_closed(port)
+
+
 def set_enabled(on):
     conf = load_conf()
     conf["enabled"] = bool(on)
     save_conf(conf)
+    reachable = True
+    if on and not open_firewall(int(conf.get("port") or PORT)):
+        reachable = False
+        print(f"The firewall still blocks port {conf.get('port') or PORT}/tcp: other computers can't connect.",
+              file=sys.stderr)
     subprocess.run(["pkill", "-u", str(os.getuid()), "-f", "firox-stream daemon"],
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if on:
         time.sleep(0.3)
         subprocess.Popen([sys.argv[0], "daemon"], start_new_session=True,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return reachable
 
 
 def daemon_running():
@@ -1120,6 +1270,205 @@ def daemon_running():
 
 
 # ----------------------------------------------------------------- client --
+
+class PointerLock:
+    """Mouse capture for games, as in VMware, Parsec or Moonlight: the
+    pointer stays locked in the window and its movement goes to the host as
+    relative motion (what mouse-look needs). GTK 3 doesn't offer this, so it
+    speaks the compositor's pointer-constraints and relative-pointer
+    protocols itself (labwc has both), on GTK's own Wayland connection.
+
+    on_motion(dx, dy) gets unaccelerated movement while locked; on_unlocked()
+    runs when the compositor ends the lock (the window lost focus)."""
+
+    def __init__(self, gtk_window, on_motion, on_unlocked):
+        import ctypes as C
+        self.C = C
+        self.on_motion, self.on_unlocked = on_motion, on_unlocked
+        self.locked_pointer = None
+        self.active = False
+        gdk = C.CDLL("libgdk-3.so.0")
+        wl = self.wl = C.CDLL("libwayland-client.so.0")
+        display = gtk_window.get_display()
+        if type(display).__name__ != "GdkWaylandDisplay":
+            raise RuntimeError("not a Wayland session")
+
+        def ptr(obj):
+            get = C.pythonapi.PyCapsule_GetPointer
+            get.restype, get.argtypes = C.c_void_p, [C.py_object, C.c_char_p]
+            return get(obj.__gpointer__, None)
+
+        for name in ("gdk_wayland_display_get_wl_display", "gdk_wayland_window_get_wl_surface",
+                     "gdk_wayland_device_get_wl_pointer"):
+            getattr(gdk, name).restype = C.c_void_p
+            getattr(gdk, name).argtypes = [C.c_void_p]
+        self.display = gdk.gdk_wayland_display_get_wl_display(ptr(display))
+        self.surface = gdk.gdk_wayland_window_get_wl_surface(ptr(gtk_window.get_window()))
+        self.pointer = gdk.gdk_wayland_device_get_wl_pointer(ptr(display.get_default_seat().get_pointer()))
+        if not (self.display and self.surface and self.pointer):
+            raise RuntimeError("no Wayland surface or pointer")
+        for name, res in (("wl_proxy_marshal_flags", C.c_void_p), ("wl_proxy_add_listener", C.c_int),
+                          ("wl_proxy_get_version", C.c_uint32), ("wl_display_create_queue", C.c_void_p),
+                          ("wl_proxy_create_wrapper", C.c_void_p), ("wl_display_roundtrip_queue", C.c_int)):
+            getattr(wl, name).restype = res
+        wl.wl_proxy_destroy.argtypes = [C.c_void_p]
+        wl.wl_proxy_wrapper_destroy.argtypes = [C.c_void_p]
+        wl.wl_proxy_set_queue.argtypes = [C.c_void_p, C.c_void_p]
+        wl.wl_proxy_get_version.argtypes = [C.c_void_p]
+        wl.wl_display_create_queue.argtypes = [C.c_void_p]
+        wl.wl_display_roundtrip_queue.argtypes = [C.c_void_p, C.c_void_p]
+        wl.wl_event_queue_destroy.argtypes = [C.c_void_p]
+        wl.wl_proxy_create_wrapper.argtypes = [C.c_void_p]
+        wl.wl_proxy_add_listener.argtypes = [C.c_void_p, C.c_void_p, C.c_void_p]
+        self._define_interfaces()
+
+        # Find the two managers on a private queue, so GTK's own event
+        # handling never sees these replies
+        found = {}
+        queue = wl.wl_display_create_queue(self.display)
+        wrapper = wl.wl_proxy_create_wrapper(self.display)
+        wl.wl_proxy_set_queue(wrapper, queue)
+        registry = self._marshal(wrapper, 1, self.registry_iface, (), new=True)    # wl_display.get_registry
+        wl.wl_proxy_wrapper_destroy(wrapper)
+        GLOBAL = C.CFUNCTYPE(None, C.c_void_p, C.c_void_p, C.c_uint32, C.c_char_p, C.c_uint32)
+        REMOVE = C.CFUNCTYPE(None, C.c_void_p, C.c_void_p, C.c_uint32)
+
+        def on_global(_data, _reg, name, iface, version):
+            found[iface.decode()] = name
+
+        self._keep = [GLOBAL(on_global), REMOVE(lambda *a: None)]      # (callbacks must stay alive)
+        self._registry_listener = (C.c_void_p * 2)(*(C.cast(f, C.c_void_p).value for f in self._keep))
+        wl.wl_proxy_add_listener(registry, self._registry_listener, None)
+        wl.wl_display_roundtrip_queue(self.display, queue)
+        if "zwp_pointer_constraints_v1" not in found or "zwp_relative_pointer_manager_v1" not in found:
+            wl.wl_proxy_destroy(registry)
+            wl.wl_event_queue_destroy(queue)
+            raise RuntimeError("this desktop can't lock the pointer")
+        self.constraints = self._bind(registry, found["zwp_pointer_constraints_v1"], self.constraints_iface)
+        relmgr = self._bind(registry, found["zwp_relative_pointer_manager_v1"], self.relmgr_iface)
+        # Everything from here on is GTK's default queue: GTK dispatches it
+        wl.wl_proxy_set_queue(self.constraints, None)
+        wl.wl_proxy_set_queue(relmgr, None)
+        wl.wl_proxy_destroy(registry)
+        wl.wl_event_queue_destroy(queue)
+        self.relptr = self._marshal(relmgr, 1, self.relptr_iface, (C.c_void_p(self.pointer),), new=True)
+        MOTION = C.CFUNCTYPE(None, C.c_void_p, C.c_void_p, C.c_uint32, C.c_uint32,
+                             C.c_int32, C.c_int32, C.c_int32, C.c_int32)
+
+        def on_relative(_data, _obj, _hi, _lo, _dx, _dy, dx_unaccel, dy_unaccel):
+            if self.active:
+                self.on_motion(dx_unaccel / 256.0, dy_unaccel / 256.0)
+
+        self._keep.append(MOTION(on_relative))
+        self._rel_listener = (C.c_void_p * 1)(C.cast(self._keep[-1], C.c_void_p).value)
+        wl.wl_proxy_add_listener(self.relptr, self._rel_listener, None)
+        EVENT = C.CFUNCTYPE(None, C.c_void_p, C.c_void_p)
+
+        def on_locked(_data, _obj):
+            self.active = True
+
+        def on_unlocked(_data, _obj):
+            was = self.active
+            self.active = False
+            self._drop_lock()
+            if was:
+                self.on_unlocked()
+
+        self._keep += [EVENT(on_locked), EVENT(on_unlocked)]
+        self._lock_listener = (C.c_void_p * 2)(C.cast(self._keep[-2], C.c_void_p).value,
+                                               C.cast(self._keep[-1], C.c_void_p).value)
+
+    def _define_interfaces(self):
+        C = self.C
+
+        class Message(C.Structure):
+            _fields_ = [("name", C.c_char_p), ("signature", C.c_char_p), ("types", C.c_void_p)]
+
+        class Interface(C.Structure):
+            _fields_ = [("name", C.c_char_p), ("version", C.c_int), ("method_count", C.c_int),
+                        ("methods", C.c_void_p), ("event_count", C.c_int), ("events", C.c_void_p)]
+
+        keep = self._defs = []
+
+        def types(*ifaces):
+            arr = (C.c_void_p * max(len(ifaces), 1))(*[C.addressof(i) if i is not None else None
+                                                        for i in ifaces])
+            keep.append(arr)
+            return C.cast(arr, C.c_void_p).value
+
+        def messages(*msgs):
+            arr = (Message * max(len(msgs), 1))(*[Message(n.encode(), sig.encode(), t) for n, sig, t in msgs])
+            keep.append(arr)
+            return C.cast(arr, C.c_void_p).value
+
+        def interface(iface, name, version, methods, events):
+            keep.append(name.encode())
+            iface.name, iface.version = keep[-1], version
+            iface.method_count, iface.methods = len(methods), messages(*methods) if methods else None
+            iface.event_count, iface.events = len(events), messages(*events) if events else None
+
+        ext = lambda n: Interface.in_dll(self.wl, n)            # libwayland-client's own
+        wl_surface, wl_pointer, wl_region = ext("wl_surface_interface"), ext("wl_pointer_interface"), \
+            ext("wl_region_interface")
+        self.registry_iface = ext("wl_registry_interface")
+        relptr, relmgr, locked, confined, constraints = (Interface() for _ in range(5))
+        keep += [relptr, relmgr, locked, confined, constraints]
+        nulls = types(None, None, None, None, None, None)
+        interface(relptr, "zwp_relative_pointer_v1", 1, [("destroy", "", nulls)],
+                  [("relative_motion", "uuffff", nulls)])
+        interface(relmgr, "zwp_relative_pointer_manager_v1", 1,
+                  [("destroy", "", nulls), ("get_relative_pointer", "no", types(relptr, wl_pointer))], [])
+        interface(locked, "zwp_locked_pointer_v1", 1,
+                  [("destroy", "", nulls), ("set_cursor_position_hint", "ff", nulls),
+                   ("set_region", "?o", types(wl_region))],
+                  [("locked", "", nulls), ("unlocked", "", nulls)])
+        interface(confined, "zwp_confined_pointer_v1", 1,
+                  [("destroy", "", nulls), ("set_region", "?o", types(wl_region))],
+                  [("confined", "", nulls), ("unconfined", "", nulls)])
+        lock_types = types(locked, wl_surface, wl_pointer, wl_region, None)
+        interface(constraints, "zwp_pointer_constraints_v1", 1,
+                  [("destroy", "", nulls), ("lock_pointer", "noo?ou", lock_types),
+                   ("confine_pointer", "noo?ou", types(confined, wl_surface, wl_pointer, wl_region, None))], [])
+        self.relptr_iface, self.relmgr_iface, self.locked_iface, self.constraints_iface = \
+            relptr, relmgr, locked, constraints
+
+    def _marshal(self, proxy, opcode, iface, args, new=False):
+        C = self.C
+        version = self.wl.wl_proxy_get_version(C.c_void_p(proxy))
+        head = [C.c_void_p(proxy), C.c_uint32(opcode),
+                C.c_void_p(C.addressof(iface)) if new else C.c_void_p(None), C.c_uint32(version),
+                C.c_uint32(0)]
+        tail = ([C.c_void_p(None)] if new else []) + list(args)
+        return self.wl.wl_proxy_marshal_flags(*head, *tail)
+
+    def _bind(self, registry, name, iface):
+        C = self.C
+        return self.wl.wl_proxy_marshal_flags(C.c_void_p(registry), C.c_uint32(0), C.c_void_p(C.addressof(iface)),
+                                              C.c_uint32(1), C.c_uint32(0), C.c_uint32(name), iface.name,
+                                              C.c_uint32(1), C.c_void_p(None))
+
+    def lock(self):
+        if self.locked_pointer:
+            return
+        C = self.C
+        # lock_pointer(id, surface, pointer, region = none, lifetime = oneshot)
+        self.locked_pointer = self.wl.wl_proxy_marshal_flags(
+            C.c_void_p(self.constraints), C.c_uint32(1), C.c_void_p(C.addressof(self.locked_iface)),
+            C.c_uint32(1), C.c_uint32(0), C.c_void_p(None), C.c_void_p(self.surface),
+            C.c_void_p(self.pointer), C.c_void_p(None), C.c_uint32(1))
+        self.wl.wl_proxy_add_listener(self.locked_pointer, self._lock_listener, None)
+
+    def _drop_lock(self):
+        if self.locked_pointer:
+            C = self.C
+            self.wl.wl_proxy_marshal_flags(C.c_void_p(self.locked_pointer), C.c_uint32(0), C.c_void_p(None),
+                                           C.c_uint32(1), C.c_uint32(1))     # destroy (flag: destroy proxy)
+            self.locked_pointer = None
+
+    def unlock(self):
+        self.active = False
+        self._drop_lock()
+
 
 # GTK's mouse buttons to the host's (left, middle, right, back, forward)
 GDK_BUTTONS = {1: 0x110, 2: 0x112, 3: 0x111, 8: 0x113, 9: 0x114}
@@ -1176,6 +1525,22 @@ def connect(address, ask_pin):
         raise
 
 
+def explain(e):
+    """A connection error in words."""
+    if e.errno == errno.EHOSTUNREACH:
+        return ("Its firewall turned the connection away, or it's switched off or asleep. On that computer, "
+                "open Firox Stream and untick and tick \u201cLet other computers stream this one\u201d: that "
+                f"opens Firox Stream's port (TCP {PORT}) in its firewall.")
+    if e.errno == errno.ECONNREFUSED:
+        return ("Nothing answered there. Streaming may be off on that computer: open Firox Stream on it and tick "
+                "\u201cLet other computers stream this one\u201d.")
+    if isinstance(e, socket.timeout) or e.errno == errno.ETIMEDOUT:
+        return "That computer didn't answer. Check that it's on, awake and on the same network."
+    if isinstance(e, socket.gaierror):
+        return "There's no computer by that name on the network. Try its IP address."
+    return str(e)
+
+
 def client_ui(address=None):
     import gi
     gi.require_version("Gtk", "3.0")
@@ -1225,6 +1590,12 @@ def client_ui(address=None):
             self.vsize = None
             self.fullscreened = False
             self.down_keys, self.down_buttons = set(), set()
+            self.captured = False               # the mouse is locked in the window (games)
+            self.capture_on_click = True
+            self.swallow_release = False
+            self.lock = None
+            self.rel = [0.0, 0.0]
+            self.rel_pending = False
             self.stopping = False
             self.ended = False
             self.overlay = Gtk.Overlay()
@@ -1235,6 +1606,8 @@ def client_ui(address=None):
             self.area.get_style_context().add_provider(css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
             self.overlay.add(self.area)
             hint = "Ctrl+Alt+Shift+F full screen · Ctrl+Alt+Shift+Q stop"
+            if info.get("input"):
+                hint = "Click to capture the mouse, Ctrl+Alt+Shift+Z to release it · " + hint
             if not info.get("input"):
                 hint = "View only: that computer can't use this keyboard and mouse · " + hint
             self.hint = Gtk.Label(label=hint, halign=Gtk.Align.CENTER, valign=Gtk.Align.START)
@@ -1243,7 +1616,7 @@ def client_ui(address=None):
             for side in ("start", "end"):
                 getattr(self.hint, f"set_margin_{side}")(12)
             self.overlay.add_overlay(self.hint)
-            GLib.timeout_add_seconds(5, lambda: self.hint.hide() or False)
+            self.hint_timer = GLib.timeout_add_seconds(6, self.hide_hint)
             self.build_video(os.environ.get("FIROX_STREAM_SINK") or
                              ("gtkglsink" if Gst.ElementFactory.find("gtkglsink") else "gtksink"))
             self.build_audio()
@@ -1257,7 +1630,7 @@ def client_ui(address=None):
             self.area.connect("realize", self.on_realize)
             self.connect("key-press-event", self.on_key, True)
             self.connect("key-release-event", self.on_key, False)
-            self.connect("focus-out-event", lambda *_a: self.release_all())
+            self.connect("focus-out-event", lambda *_a: (self.release_mouse(), self.release_all()))
             self.connect("delete-event", lambda *_a: self.stop() or False)
             self.channel = Channel(sock, self.on_message, self.on_closed)
             threading.Thread(target=self.channel.run, daemon=True).start()
@@ -1311,7 +1684,7 @@ def client_ui(address=None):
                 self.build_video("gtksink")
                 if caps:
                     self.vsrc.set_property("caps", caps)
-                self.channel.send("I", [["r"]])
+                self.channel.send("F")              # the new decoder needs a key frame
 
         def build_audio(self):
             self.asrc = self.audio = None
@@ -1380,10 +1753,77 @@ def client_ui(address=None):
 
         # -- keyboard and mouse
         def on_realize(self, area):
-            if self.info.get("cursor") and self.info.get("input"):
-                # That computer draws its pointer into the picture
-                area.get_window().set_cursor(Gdk.Cursor.new_for_display(area.get_display(),
-                                                                       Gdk.CursorType.BLANK_CURSOR))
+            self.set_local_cursor()
+
+        def set_local_cursor(self):
+            """No pointer of our own while captured, or while that computer
+            draws its pointer into the picture."""
+            win = self.area.get_window()
+            if win is None:
+                return
+            hide = self.captured or (self.info.get("cursor") and self.info.get("input"))
+            win.set_cursor(Gdk.Cursor.new_for_display(self.area.get_display(), Gdk.CursorType.BLANK_CURSOR)
+                           if hide else None)
+
+        def show_hint(self, text, seconds=4):
+            self.hint.set_text(text)
+            self.hint.show()
+            if self.hint_timer:
+                GLib.source_remove(self.hint_timer)
+            self.hint_timer = GLib.timeout_add_seconds(seconds, self.hide_hint)
+
+        def hide_hint(self):
+            self.hint.hide()
+            self.hint_timer = 0
+            return False
+
+        def capture_mouse(self):
+            if self.captured or not self.info.get("input"):
+                return
+            if self.lock is None:
+                try:
+                    self.lock = PointerLock(self, self.on_relative, self.on_unlocked)
+                except (OSError, RuntimeError, AttributeError) as e:
+                    print(f"firox-stream: can't capture the mouse: {e}", file=sys.stderr)
+                    self.capture_on_click = False
+                    self.show_hint(f"This desktop can't capture the mouse ({e})", 6)
+                    return
+            self.lock.lock()
+            self.captured = True
+            self.set_local_cursor()
+            self.show_hint("Mouse captured \u00b7 Ctrl+Alt+Shift+Z releases it", 3)
+
+        def release_mouse(self, hint=False):
+            if not self.captured:
+                return
+            self.captured = False
+            if self.lock is not None:
+                self.lock.unlock()
+            self.set_local_cursor()
+            if hint:
+                self.show_hint("Mouse released \u00b7 click in the picture to capture it again", 3)
+
+        def on_unlocked(self):
+            # The desktop ended the capture (the window lost focus)
+            self.captured = False
+            self.set_local_cursor()
+
+        def on_relative(self, dx, dy):
+            # Movement arrives at the mouse's rate (up to 1000 a second);
+            # send it in batches, once per main-loop turn
+            self.rel[0] += dx
+            self.rel[1] += dy
+            if not self.rel_pending:
+                self.rel_pending = True
+                GLib.idle_add(self.flush_relative)
+
+        def flush_relative(self):
+            self.rel_pending = False
+            dx, dy = self.rel
+            self.rel = [0.0, 0.0]
+            if self.captured and (dx or dy):
+                self.send("d", round(dx, 2), round(dy, 2))
+            return False
 
         def send(self, *ev):
             if self.info.get("input"):
@@ -1400,6 +1840,8 @@ def client_ui(address=None):
                     min(max((y - (a.height - h) / 2) / h, 0.0), 1.0))
 
         def on_motion(self, _w, ev):
+            if self.captured:
+                return True                     # movement goes as relative motion
             u, v = self.to_video(ev.x, ev.y)
             self.send("m", round(u, 5), round(v, 5))
             return True
@@ -1408,10 +1850,20 @@ def client_ui(address=None):
             if ev.type in (Gdk.EventType._2BUTTON_PRESS, Gdk.EventType._3BUTTON_PRESS):
                 return True                     # GTK's extra events for double clicks
             self.area.grab_focus()
+            if down and ev.button == 1 and not self.captured and self.capture_on_click \
+                    and self.info.get("input"):
+                self.capture_mouse()            # this click only captures, as in VMware
+                if self.captured:
+                    self.swallow_release = True
+                    return True
+            if not down and ev.button == 1 and self.swallow_release:
+                self.swallow_release = False
+                return True
             code = GDK_BUTTONS.get(ev.button)
             if code:
-                u, v = self.to_video(ev.x, ev.y)
-                self.send("m", round(u, 5), round(v, 5))
+                if not self.captured:
+                    u, v = self.to_video(ev.x, ev.y)
+                    self.send("m", round(u, 5), round(v, 5))
                 (self.down_buttons.add if down else self.down_buttons.discard)(code)
                 self.send("b", code, down)
             return True
@@ -1435,6 +1887,17 @@ def client_ui(address=None):
                 key = Gdk.keyval_to_lower(ev.keyval)
                 if key == Gdk.KEY_q:
                     self.stop()
+                    return True
+                if key == Gdk.KEY_z:
+                    self.release_all()
+                    self.release_mouse(hint=True)
+                    return True
+                if key == Gdk.KEY_m:
+                    self.capture_on_click = not self.capture_on_click
+                    if not self.capture_on_click:
+                        self.release_mouse()
+                    self.show_hint("Clicking captures the mouse" if self.capture_on_click else
+                                   "Clicking no longer captures the mouse (Ctrl+Alt+Shift+M turns it back on)", 4)
                     return True
                 if key == Gdk.KEY_f:
                     self.release_all()
@@ -1526,8 +1989,11 @@ def client_ui(address=None):
                 self.allow_note.set_text("Nobody can stream this computer.")
 
         def on_allow(self, button):
-            set_enabled(button.get_active())
+            reachable = set_enabled(button.get_active())
             self.update_note()
+            if not reachable:
+                self.status.set_text(f"The firewall still blocks Firox Stream's port (TCP {PORT}), so other "
+                                     "computers can't connect. Untick and tick the box to try again.")
 
         def on_unpair(self, _b):
             conf = load_conf()
@@ -1600,7 +2066,10 @@ def client_ui(address=None):
                 GLib.idle_add(failed, "That computer closed the connection. If it was showing a PIN, "
                                       "pairing was cancelled there.")
                 return
-            except (OSError, ValueError, ConnectionError, ssl.SSLError) as e:
+            except OSError as e:
+                GLib.idle_add(failed, explain(e))
+                return
+            except (ValueError, ConnectionError, ssl.SSLError) as e:
                 GLib.idle_add(failed, str(e))
                 return
             GLib.idle_add(started, sock, info)
