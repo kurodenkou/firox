@@ -7,6 +7,7 @@ firox-stream: play another Firox computer's games and desktop from this one.
     firox-stream daemon           at login, when streaming is on: let paired
                                   computers stream this one
     firox-stream on|off           let other computers stream this one, or not
+    firox-stream kick             disconnect everyone streaming this one now
     firox-stream unpair           forget every computer paired with this one
     firox-stream status           print whether it's on and what's paired
 
@@ -638,10 +639,10 @@ def chain(pipeline, elements):
 
 
 class Capture:
-    """The host's GStreamer pipelines for one connection: the shared screen
-    (and the sound) out to the channel."""
+    """The host's GStreamer pipelines: the shared screen (and the sound),
+    out to everyone watching through `out` (a Session)."""
 
-    def __init__(self, conf, channel, source=None):
+    def __init__(self, conf, out, source=None):
         import gi
         gi.require_version("Gst", "1.0")
         gi.require_version("GstVideo", "1.0")
@@ -649,11 +650,10 @@ class Capture:
         Gst.init(None)
         self.Gst, self.GstVideo = Gst, GstVideo
         self.conf = conf
-        self.channel = channel
+        self.out = out
         self.source = source            # (pipewire fd, node) or None for a test picture
         self.video = self.audio = None
-        self.sent_caps = set()
-        self.need_key = False
+        self.caps = {}
         self.key_asked = 0.0
         self.first = threading.Event()
         self.broken = threading.Event()     # the video stopped (any time)
@@ -764,17 +764,17 @@ class Capture:
         return Gst.BusSyncReply.DROP
 
     def _send_caps(self, kind, sample):
-        if kind not in self.sent_caps:
-            self.sent_caps.add(kind)
-            self.channel.send("K", {"kind": kind, "caps": sample.get_caps().to_string()})
+        caps = sample.get_caps().to_string()
+        if self.caps.get(kind) != caps:
+            self.caps[kind] = caps
+            self.out.send_caps(kind, caps)
 
     def request_key(self):
-        """Send a key frame (and the stream headers) next: the other side
+        """Make the next frame a key frame (with the stream headers): someone
         has a new decoder, which can't use frames that build on earlier ones."""
         if self.video is None:
             return
         sink = self.video.get_by_name("sink")
-        self.need_key = True
         self.key_asked = time.monotonic()
         sink.send_event(self.GstVideo.video_event_new_upstream_force_key_unit(self.Gst.CLOCK_TIME_NONE, True, 0))
 
@@ -788,23 +788,16 @@ class Capture:
         if self.failed:
             return Gst.FlowReturn.OK
         delta = buf.has_flags(Gst.BufferFlags.DELTA_UNIT)
-        if self.channel.backlog() > BACKLOG_LIMIT:
-            self.need_key = True                    # the network is behind: skip to a key frame
-        if self.need_key:
-            if not delta and self.channel.backlog() <= BACKLOG_LIMIT:
-                self.need_key = False
-            else:
-                if time.monotonic() - self.key_asked > 1:
-                    self.key_asked = time.monotonic()
-                    sink.send_event(self.GstVideo.video_event_new_upstream_force_key_unit(
-                        Gst.CLOCK_TIME_NONE, True, 0))
-                return Gst.FlowReturn.OK
         ok, info = buf.map(Gst.MapFlags.READ)
-        if ok:
-            data = bytes(info.data)
-            buf.unmap(info)
-            self._send_caps("video", sample)
-            self.channel.send("V", data)
+        if not ok:
+            return Gst.FlowReturn.OK
+        data = bytes(info.data)
+        buf.unmap(info)
+        self._send_caps("video", sample)
+        # Someone is waiting for a key frame (new, or behind on the network)
+        if self.out.send_video(data, delta) and time.monotonic() - self.key_asked > 1:
+            self.key_asked = time.monotonic()
+            sink.send_event(self.GstVideo.video_event_new_upstream_force_key_unit(Gst.CLOCK_TIME_NONE, True, 0))
         return Gst.FlowReturn.OK
 
     # sound
@@ -839,15 +832,13 @@ class Capture:
         sample = sink.emit("pull-sample")
         if sample is None:
             return Gst.FlowReturn.EOS
-        if self.channel.backlog() > BACKLOG_LIMIT:
-            return Gst.FlowReturn.OK
         buf = sample.get_buffer()
         ok, info = buf.map(Gst.MapFlags.READ)
         if ok:
             data = bytes(info.data)
             buf.unmap(info)
             self._send_caps("audio", sample)
-            self.channel.send("A", data)
+            self.out.send_audio(data)
         return Gst.FlowReturn.OK
 
     def stop(self):
@@ -855,6 +846,207 @@ class Capture:
             if p is not None:
                 p.set_state(self.Gst.State.NULL)
         self.video = self.audio = None
+
+
+class Session:
+    """What everyone watching this computer shares: one screen capture (and
+    sound), the virtual keyboard and mice, and the idle-timer hold. Each
+    viewer's channel gets the picture on its own terms: one that falls
+    behind on the network skips to the next key frame without holding the
+    others back. Ends when the last viewer leaves."""
+
+    def __init__(self, host):
+        self.host = host
+        self.lock = threading.Lock()
+        self.viewers = {}                   # Channel -> {"name", "need_key"}
+        self.capture = self.cast = self.injector = None
+        self.cursor = self.audio = False
+        self.locked = False
+        self.ended = False
+        self.output = None
+
+    @property
+    def closed(self):                       # (open_capture gives up when it is)
+        return self.ended
+
+    def names(self):
+        with self.lock:
+            return [v["name"] for ch, v in self.viewers.items() if not ch.closed]
+
+    def info(self):
+        return {"name": self.host.name, "input": self.injector is not None, "cursor": self.cursor,
+                "audio": self.audio, "encoder": self.capture.encoder if self.capture else None,
+                "locked": self.locked, "viewers": self.names()}
+
+    # -- starting and stopping
+    def start(self, conf):
+        import firox_monitors
+        self.conf = conf
+        self.locked = screen_locked()
+        keep_awake(True)
+        wake_screen()
+        time.sleep(0.5)                     # monitors coming back on
+        self.output = firox_monitors.main_name()
+        self.capture, self.cast, self.cursor = self.host.open_capture(conf, self, self.output)
+        try:
+            self.injector = Injector(self.output)
+        except Exception as e:              # no /dev/uinput access: the picture only
+            log(f"keyboard and mouse unavailable: {e}")
+        self.audio = self.capture.start_audio()
+        threading.Thread(target=self.supervise, daemon=True).start()
+
+    def stop(self):
+        self.ended = True
+        self.host.close_capture(self.capture, self.cast)
+        self.capture = self.cast = None
+        if self.injector:
+            self.injector.close()
+            self.injector = None
+        keep_awake(False)
+        try:
+            os.unlink(CHOOSER_HINT)
+        except OSError:
+            pass
+
+    def add(self, channel, name):
+        with self.lock:
+            others = [v["name"] for ch, v in self.viewers.items() if not ch.closed]
+            self.viewers[channel] = {"name": name, "need_key": True}
+        # The newcomer's decoder needs the stream headers and a key frame
+        for kind, caps in (self.capture.caps if self.capture else {}).items():
+            channel.send("K", {"kind": kind, "caps": caps})
+        if self.capture:
+            self.capture.request_key()
+        if others:
+            self.broadcast("S", {"viewers": self.names(), "joined": name})
+
+    def remove(self, channel):
+        """Returns how many are still watching."""
+        with self.lock:
+            v = self.viewers.pop(channel, None)
+            left = sum(1 for ch in self.viewers if not ch.closed)
+        if self.injector:
+            try:
+                self.injector.release_all()     # nothing stays held down
+            except OSError:
+                pass
+        if v and left:
+            self.broadcast("S", {"viewers": self.names(), "left": v["name"]})
+        return left
+
+    def kick(self, reason):
+        with self.lock:
+            channels = list(self.viewers)
+            self.viewers.clear()            # gone from the list now; their connections close shortly
+        if self.injector:
+            try:
+                self.injector.release_all()
+            except OSError:
+                pass
+        for ch in channels:
+            ch.send("E", {"error": reason})
+            threading.Timer(1.0, ch.close, args=("disconnected by this computer",)).start()
+
+    # -- out to everyone (called from GStreamer's threads)
+    def channels(self):
+        with self.lock:
+            return [(ch, v) for ch, v in self.viewers.items() if not ch.closed]
+
+    def broadcast(self, kind, payload=b""):
+        for ch, _v in self.channels():
+            ch.send(kind, payload)
+
+    def send_caps(self, kind, caps):
+        self.broadcast("K", {"kind": kind, "caps": caps})
+
+    def send_video(self, data, delta):
+        """Returns True when someone waits for a key frame."""
+        want_key = False
+        for ch, v in self.channels():
+            if ch.backlog() > BACKLOG_LIMIT:
+                v["need_key"] = True        # behind on the network: skip to a key frame
+            if v["need_key"]:
+                if delta or ch.backlog() > BACKLOG_LIMIT:
+                    want_key = True
+                    continue
+                v["need_key"] = False
+            ch.send("V", data)
+        return want_key
+
+    def send_audio(self, data):
+        for ch, _v in self.channels():
+            if ch.backlog() <= BACKLOG_LIMIT:
+                ch.send("A", data)
+
+    # -- from a viewer
+    def on_message(self, channel, client, kind, payload):
+        if kind == "I" and self.injector is not None:
+            try:
+                for ev in json.loads(payload):
+                    self.injector.handle(ev)
+            except (ValueError, TypeError, IndexError, OSError) as e:
+                log(f"input: {e}")
+        elif kind == "F":
+            with self.lock:
+                if channel in self.viewers:
+                    self.viewers[channel]["need_key"] = True
+            if self.capture is not None:
+                self.capture.request_key()
+        elif kind == "W":
+            threading.Thread(target=wake_screen, daemon=True).start()
+        elif kind == "U":
+            try:
+                password = str(json.loads(payload).get("password", ""))
+            except (ValueError, AttributeError):
+                password = ""
+
+            def try_unlock():
+                ok, message = unlock_screen(password) if password else (False, "No password given.")
+                log(f"remote unlock from {client}: {'unlocked' if ok else 'not unlocked'}")
+                channel.send("u", {"ok": ok, "message": message})
+                if ok:
+                    self.locked = False
+                    self.broadcast("L", {"locked": False})
+            threading.Thread(target=try_unlock, daemon=True).start()
+        elif kind == "Q":
+            channel.close("stopped")
+
+    def supervise(self):
+        """Tell viewers when this computer locks or unlocks, and start the
+        capture again when it stops in the middle (viewers get a fresh key
+        frame and carry on)."""
+        restarts = collections.deque()
+        checked = time.monotonic()
+        while not self.ended:
+            if time.monotonic() - checked > 2:
+                checked = time.monotonic()
+                locked = screen_locked()
+                if locked != self.locked:
+                    self.locked = locked
+                    self.broadcast("L", {"locked": locked})
+            capture = self.capture
+            if capture is None or not capture.broken.wait(1) or self.ended:
+                continue
+            now = time.monotonic()
+            while restarts and now - restarts[0] > 60:
+                restarts.popleft()
+            reason = capture.failed or "the screen capture stopped"
+            self.host.close_capture(capture, self.cast)
+            self.capture = self.cast = None
+            if len(restarts) >= 5:
+                self.kick(f"The screen capture keeps stopping: {reason}")
+                return
+            restarts.append(now)
+            log(f"capture stopped ({reason}); starting it again")
+            try:
+                self.capture, self.cast, _c = self.host.open_capture(self.conf, self, self.output)
+                self.capture.start_audio()
+                with self.lock:
+                    for v in self.viewers.values():
+                        v["need_key"] = True
+            except Exception as e:
+                self.kick(f"The screen capture stopped: {e}")
+                return
 
 
 class Host:
@@ -873,11 +1065,13 @@ class Host:
         self.tls.load_cert_chain(cert, key)
         self.server = socket.create_server(("", self.port), family=socket.AF_INET6, dualstack_ipv6=True) \
             if socket.has_dualstack_ipv6() else socket.create_server(("0.0.0.0", self.port))
-        self.busy = threading.Lock()
+        self.session = None                 # everyone watching shares one Session
+        self.session_lock = threading.RLock()
         self.pin_dialog = None
         self.publisher = None
         self.name = computer_name()
         threading.Thread(target=self.accept_loop, daemon=True).start()
+        threading.Thread(target=self.serve_control, daemon=True).start()
         self.publish()
         GLib.timeout_add_seconds(30, self.watchdog)
         log(f"listening on port {self.port}")
@@ -926,19 +1120,29 @@ class Host:
             return
         try:
             client = self.handshake(sock, address)
+            mode = self.choose_mode(sock, client) if client else None
         except (OSError, ValueError, EOFError) as e:
             log(f"{address}: {e}")
-            client = None
-        if client is None:
+            client = mode = None
+        if client is None or mode is None:
             sock.close()
             return
-        if not self.busy.acquire(blocking=False):
-            self._refuse(sock, "Someone else is streaming this computer right now.")
-            return
-        try:
-            self.stream(sock, client, address)
-        finally:
-            self.busy.release()
+        self.stream(sock, client, address, mode)
+
+    def choose_mode(self, sock, client):
+        """Someone is streaming already: ask whether to watch with them or
+        take over. "join", "takeover", or None (they went away)."""
+        with self.session_lock:
+            session = self.session if self.session and not self.session.ended else None
+            names = session.names() if session else []
+        if not names:
+            return "join"
+        sock.sendall(frame("B", {"viewers": names}))
+        sock.settimeout(180)
+        kind, msg = recv_json(sock)
+        sock.settimeout(15)
+        mode = msg.get("mode") if kind == "J" and isinstance(msg, dict) else None
+        return mode if mode in ("join", "takeover") else None
 
     def _refuse(self, sock, text):
         try:
@@ -959,7 +1163,7 @@ class Host:
         token = str(hello.get("token") or "")
         known = self.conf.get("clients", {}).get(token_key(token)) if token else None
         if known:
-            return known.get("name") or name
+            return name                     # its name now (it may have been renamed)
         # Pairing: a PIN on this screen, which the other computer's user types
         pin = f"{random.SystemRandom().randrange(10000):04d}"
         cancelled = threading.Event()
@@ -1055,115 +1259,85 @@ class Host:
         if cast:
             cast.close()
 
-    def stream(self, sock, client, address):
+    def stream(self, sock, client, address, mode="join"):
         conf = load_conf()
-        log(f"{client} ({address}) connected")
-        notify(f"{client} is streaming this computer",
-               "To stop it, turn streaming off in Firox Stream.")
-        injector = None
         channel = Channel(sock, None)
-        state = {"capture": None, "cast": None, "locked": screen_locked()}
-        keep_awake(True)
-        wake_screen()
-        time.sleep(0.5)                     # monitors coming back on
-        try:
-            import firox_monitors
-            output = firox_monitors.main_name()
-            state["capture"], state["cast"], cursor = self.open_capture(conf, channel, output)
-            try:
-                injector = Injector(output)
-            except Exception as e:              # no /dev/uinput access: the picture only
-                log(f"keyboard and mouse unavailable: {e}")
-            audio = state["capture"].start_audio()
-            sock.sendall(frame("O", {"name": self.name, "input": injector is not None,
-                                     "cursor": cursor, "audio": audio, "encoder": state["capture"].encoder,
-                                     "locked": state["locked"]}))
-        except Exception as e:
-            log(f"couldn't start: {e}")
-            keep_awake(False)
-            self.close_capture(state["capture"], state["cast"])
-            if injector:
-                injector.close()
-            self._refuse(sock, f"That computer couldn't share its screen: {e}")
-            return
-
-        def on_message(kind, payload):
-            if kind == "I" and injector is not None:
+        with self.session_lock:
+            session = self.session
+            if mode == "takeover" and session is not None and not session.ended:
+                log(f"{client} ({address}) takes over from {', '.join(session.names())}")
+                session.kick(f"{client} took over the stream.")
+            if session is None or session.ended:
+                session = Session(self)
                 try:
-                    for ev in json.loads(payload):
-                        injector.handle(ev)
-                except (ValueError, TypeError, IndexError, OSError) as e:
-                    log(f"input: {e}")
-            elif kind == "F":
-                if state["capture"] is not None:
-                    state["capture"].request_key()
-            elif kind == "W":
-                threading.Thread(target=wake_screen, daemon=True).start()
-            elif kind == "U":
-                try:
-                    password = str(json.loads(payload).get("password", ""))
-                except (ValueError, AttributeError):
-                    password = ""
-
-                def try_unlock():
-                    ok, message = unlock_screen(password) if password else (False, "No password given.")
-                    log(f"remote unlock from {client}: {'unlocked' if ok else 'not unlocked'}")
-                    channel.send("u", {"ok": ok, "message": message})
-                    if ok:
-                        state["locked"] = False
-                        channel.send("L", {"locked": False})
-                threading.Thread(target=try_unlock, daemon=True).start()
-            elif kind == "Q":
-                channel.close("stopped")
-
-        def supervise():
-            """Start the capture again when it stops in the middle (the
-            other computer gets a fresh key frame and carries on)."""
-            restarts = collections.deque()
-            checked = time.monotonic()
-            while not channel.closed:
-                # Tell the other computer when this one locks or unlocks
-                if time.monotonic() - checked > 2:
-                    checked = time.monotonic()
-                    locked = screen_locked()
-                    if locked != state["locked"]:
-                        state["locked"] = locked
-                        channel.send("L", {"locked": locked})
-                if not state["capture"].broken.wait(1) or channel.closed:
-                    continue
-                now = time.monotonic()
-                while restarts and now - restarts[0] > 60:
-                    restarts.popleft()
-                reason = state["capture"].failed or "the screen capture stopped"
-                self.close_capture(state["capture"], state["cast"])
-                state["capture"] = state["cast"] = None
-                if len(restarts) >= 5:
-                    channel.close(f"the screen capture keeps stopping: {reason}")
-                    return
-                restarts.append(now)
-                log(f"capture stopped ({reason}); starting it again")
-                try:
-                    state["capture"], state["cast"], _c = self.open_capture(conf, channel, output)
-                    state["capture"].start_audio()
+                    session.start(conf)
                 except Exception as e:
-                    channel.close(f"the screen capture stopped: {e}")
+                    log(f"couldn't start: {e}")
+                    session.stop()
+                    self._refuse(sock, f"That computer couldn't share its screen: {e}")
                     return
-
-        channel.on_message = on_message
-        watcher = threading.Thread(target=supervise, daemon=True)
-        watcher.start()
+                self.session = session
+            try:
+                sock.sendall(frame("O", session.info()))
+            except OSError:
+                if not session.viewers:
+                    session.stop()
+                    self.session = None
+                return
+            session.add(channel, client)
+        log(f"{client} ({address}) connected; watching: {', '.join(session.names())}")
+        notify(f"{client} is streaming this computer",
+               "Firox Stream shows who's connected and can disconnect them.")
+        channel.on_message = lambda kind, payload: session.on_message(channel, client, kind, payload)
         channel.run()
         log(f"{client} disconnected: {channel.reason}")
-        watcher.join(30)
-        self.close_capture(state["capture"], state["cast"])
-        if injector:
-            injector.close()
-        keep_awake(False)
+        with self.session_lock:
+            if session.remove(channel) == 0:
+                session.stop()
+                if self.session is session:
+                    self.session = None
+        notify(f"{client} stopped streaming this computer", "")
+
+    def viewers(self):
+        with self.session_lock:
+            return self.session.names() if self.session and not self.session.ended else []
+
+    def kick_all(self, reason="This computer ended the stream."):
+        with self.session_lock:
+            if self.session and not self.session.ended:
+                log(f"disconnecting {', '.join(self.session.names())}")
+                self.session.kick(reason)
+
+    # -- `firox-stream kick` and `status`, and the Firox Stream window
+    def serve_control(self):
         try:
-            os.unlink(CHOOSER_HINT)
+            os.unlink(CONTROL)
         except OSError:
             pass
-        notify(f"{client} stopped streaming this computer", "")
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        old = os.umask(0o177)
+        try:
+            server.bind(CONTROL)
+        finally:
+            os.umask(old)
+        server.listen(4)
+        while True:
+            try:
+                conn, _ = server.accept()
+            except OSError:
+                return
+            with conn:
+                try:
+                    creds = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
+                    if int.from_bytes(creds[4:8], sys.byteorder) != os.getuid():
+                        continue
+                    conn.settimeout(5)
+                    cmd = conn.recv(256).decode(errors="replace").strip()
+                    if cmd == "kick":
+                        self.kick_all()
+                    conn.sendall(json.dumps({"viewers": self.viewers()}).encode())
+                except OSError:
+                    pass
 
     # -- the PIN window
     def _show_pin(self, name, pin, cancelled, sock):
@@ -1203,6 +1377,7 @@ class Host:
 RUNTIME = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
 STREAM_AWAKE = os.path.join(RUNTIME, "firox-stream-awake")      # read by firox-power
 LOCK_SOCKET = os.path.join(RUNTIME, "firox-lock.sock")          # served by firox-lock
+CONTROL = os.path.join(RUNTIME, "firox-stream.sock")            # the daemon: status, kick
 
 
 def keep_awake(on):
@@ -1259,6 +1434,25 @@ def unlock_screen(password):
     if answer == "busy":
         return False, "That computer's lock screen is busy checking a password. Try again in a moment."
     return False, "The password is incorrect."
+
+
+def control(cmd="status"):
+    """Ask the running daemon: {"viewers": [...]} (after kicking, for
+    "kick"), or None when it isn't running."""
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(5)
+            s.connect(CONTROL)
+            s.sendall(cmd.encode() + b"\n")
+            data = b""
+            while True:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+        return json.loads(data or b"{}")
+    except (OSError, ValueError):
+        return None
 
 
 def notify(summary, body):
@@ -1581,9 +1775,10 @@ class PointerLock:
 GDK_BUTTONS = {1: 0x110, 2: 0x112, 3: 0x111, 8: 0x113, 9: 0x114}
 
 
-def connect(address, ask_pin):
+def connect(address, ask_pin, ask_busy=None):
     """Connect and pair if needed (blocking; call from a thread). Returns
-    (TLS socket, host info). ask_pin(host name, note) -> PIN or None."""
+    (TLS socket, host info). ask_pin(host name, note) -> PIN or None.
+    ask_busy(names already streaming it) -> "join", "takeover" or None."""
     host, port = split_address(address)
     raw = socket.create_connection((host, port), timeout=10)
     keepalive(raw)
@@ -1616,6 +1811,13 @@ def connect(address, ask_pin):
                     raise ConnectionError("")
                 known["name"] = host_name
                 sock.sendall(frame("P", {"proof": proof(pin.strip(), fingerprint, name)}))
+            elif kind == "B":
+                sock.settimeout(None)
+                mode = ask_busy(msg.get("viewers") or []) if ask_busy else "join"
+                sock.settimeout(90)
+                if not mode:
+                    raise ConnectionError("")
+                sock.sendall(frame("J", {"mode": mode}))
             elif kind == "T":
                 known["token"] = msg.get("token", "")
                 hosts = load_hosts()
@@ -1658,6 +1860,21 @@ def client_ui(address=None):
     gi.require_version("Gst", "1.0")
     from gi.repository import Gdk, Gio, GLib, Gst, Gtk
     Gst.init(None)
+
+    def ask_busy_dialog(parent, address, names):
+        who = ", ".join(names) or "Another computer"
+        dlg = Gtk.MessageDialog(transient_for=parent, modal=True, message_type=Gtk.MessageType.QUESTION,
+                                buttons=Gtk.ButtonsType.NONE, text=f"{who} {'is' if len(names) < 2 else 'are'} "
+                                                                  "streaming that computer")
+        dlg.set_title("Firox Stream")
+        dlg.format_secondary_text("Watch it together (everyone can use the keyboard and mouse), or take over: "
+                                  "that disconnects them. Taking over also clears a stream left open on "
+                                  "another device.")
+        dlg.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Take Over", 2, "Join", 1)
+        dlg.set_default_response(1)
+        answer = dlg.run()
+        dlg.destroy()
+        return {1: "join", 2: "takeover"}.get(answer)
 
     def ask_pin_dialog(parent, host_name, note):
         dlg = Gtk.Dialog(title="Firox Stream", transient_for=parent, modal=True)
@@ -1747,6 +1964,9 @@ def client_ui(address=None):
             self.locked = False
             self.show_all()
             self.area.grab_focus()
+            others = [n for n in info.get("viewers") or []]
+            if others and not info.get("locked"):
+                GLib.timeout_add(1500, lambda: self.show_hint("Also watching: " + ", ".join(others), 5) or False)
             if info.get("locked"):
                 GLib.timeout_add(1500, lambda: self.set_locked(True) or False)
 
@@ -1835,6 +2055,16 @@ def client_ui(address=None):
                         GLib.idle_add(self.set_video_size, w, h)
                 elif msg.get("kind") == "audio" and self.asrc is not None:
                     self.asrc.set_property("caps", caps)
+            elif kind == "S":
+                msg = json.loads(payload)
+                if msg.get("joined"):
+                    text = f"{msg['joined']} joined"
+                elif msg.get("left"):
+                    text = f"{msg['left']} left"
+                else:
+                    text = ""
+                if text and not self.locked:
+                    GLib.idle_add(lambda t=text: self.show_hint(t, 4) or False)
             elif kind == "L":
                 GLib.idle_add(self.set_locked, bool(json.loads(payload).get("locked")))
             elif kind == "u":
@@ -2147,11 +2377,37 @@ def client_ui(address=None):
             self.allow_note = Gtk.Label(xalign=0, wrap=True, max_width_chars=50)
             self.allow_note.get_style_context().add_class("dim-label")
             box.add(self.allow_note)
-            unpair = Gtk.Button(label="Forget Paired Computers", halign=Gtk.Align.START)
+            self.watching = Gtk.Label(xalign=0, wrap=True, max_width_chars=50)
+            box.add(self.watching)
+            buttons = Gtk.Box(spacing=6)
+            self.kick = Gtk.Button(label="Disconnect Everyone")
+            self.kick.set_tooltip_text("End every stream of this computer that's open now")
+            self.kick.connect("clicked", self.on_kick)
+            buttons.add(self.kick)
+            unpair = Gtk.Button(label="Forget Paired Computers")
             unpair.connect("clicked", self.on_unpair)
-            box.add(unpair)
+            buttons.add(unpair)
+            box.add(buttons)
             self.update_note()
             self.refresh()
+            self.update_watching()
+            GLib.timeout_add_seconds(3, self.update_watching)
+
+        def update_watching(self):
+            if not self.get_visible() and self.get_realized():
+                return True
+            viewers = (control() or {}).get("viewers") or []
+            self.watching.set_markup(
+                "<b>Streaming this computer now:</b> " + GLib.markup_escape_text(", ".join(viewers))
+                if viewers else "")
+            self.watching.set_visible(bool(viewers))
+            self.kick.set_sensitive(bool(viewers))
+            return True
+
+        def on_kick(self, _b):
+            control("kick")
+            self.status.set_text("Disconnected everyone streaming this computer.")
+            GLib.timeout_add(1500, lambda: self.update_watching() and False)
 
         def update_note(self):
             conf = load_conf()
@@ -2229,6 +2485,11 @@ def client_ui(address=None):
     def open_stream(parent, address, done=None):
         app = parent.get_application() if parent else App.instance
 
+        def ask_busy(names):
+            answer = queue.Queue()
+            GLib.idle_add(lambda: answer.put(ask_busy_dialog(parent, address, names)) or False)
+            return answer.get()
+
         def ask_pin(host_name, note):
             answer = queue.Queue()
             GLib.idle_add(lambda: answer.put(ask_pin_dialog(parent, host_name, note)) or False)
@@ -2236,7 +2497,7 @@ def client_ui(address=None):
 
         def work():
             try:
-                sock, info = connect(address, ask_pin)
+                sock, info = connect(address, ask_pin, ask_busy)
             except EOFError:
                 GLib.idle_add(failed, "That computer closed the connection. If it was showing a PIN, "
                                       "pairing was cancelled there.")
@@ -2302,6 +2563,15 @@ def main(argv):
         set_enabled(cmd == "on")
         print(f"Streaming this computer is {cmd}.")
         return 0
+    if cmd == "kick":
+        answer = control("kick")
+        if answer is None:
+            print("Streaming this computer isn't running.")
+        elif answer.get("viewers"):
+            print("Disconnected: " + ", ".join(answer["viewers"]))
+        else:
+            print("Nobody was streaming this computer.")
+        return 0
     if cmd == "unpair":
         conf = load_conf()
         conf["clients"] = {}
@@ -2312,6 +2582,8 @@ def main(argv):
         conf = load_conf()
         print(f"streaming this computer: {'on' if conf.get('enabled') else 'off'}"
               f"{' (running)' if daemon_running() else ''}; port {conf.get('port', PORT)}")
+        for name in (control() or {}).get("viewers") or []:
+            print(f"streaming it now: {name}")
         for c in conf.get("clients", {}).values():
             print(f"paired: {c.get('name')} (since {time.strftime('%m/%d/%Y', time.localtime(c.get('paired', 0)))})")
         for h in load_hosts().values():
