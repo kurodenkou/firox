@@ -661,6 +661,9 @@ class Desktop:
         self.watch_dir(TRASH_FILES, lambda: self.schedule_reload())
         os.makedirs(os.path.dirname(firox_wallpaper.USER_CONF), exist_ok=True)
         self.watch_dir(os.path.dirname(firox_wallpaper.USER_CONF), self.settings_changed)
+        # A policy's wallpaper (firox-policy), as it changes
+        if os.path.isdir(os.path.dirname(firox_wallpaper.MANAGED_CONF)):
+            self.watch_dir(os.path.dirname(firox_wallpaper.MANAGED_CONF), self.settings_changed)
         os.makedirs(CONFIG, exist_ok=True)
         self.watch_dir(CONFIG, self.config_changed)
         Gtk.IconTheme.get_default().connect("changed", lambda *_: self.icons_changed())

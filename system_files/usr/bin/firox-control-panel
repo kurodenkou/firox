@@ -1281,10 +1281,17 @@ class BackgroundDialog(Gtk.Dialog):
         scroll.set_shadow_type(Gtk.ShadowType.IN)
         scroll.add(self.flow)
         box.pack_start(scroll, True, True, 0)
+        if "Wallpaper" in firox_wallpaper.managed():
+            # A policy (firox-policy) sets the wallpaper: show it, don't offer others
+            note = Gtk.Label(label="Your organization's policy sets the wallpaper.", xalign=0)
+            note.get_style_context().add_class("dim-label")
+            box.pack_start(note, False, False, 0)
+            scroll.set_sensitive(False)
 
         row = Gtk.Box(spacing=8)
         browse = Gtk.Button(label="Browse\u2026")
         browse.connect("clicked", self.on_browse)
+        browse.set_sensitive("Wallpaper" not in firox_wallpaper.managed())
         row.pack_start(browse, False, False, 0)
         row.pack_start(Gtk.Label(label="Position:"), False, False, 6)
         self.mode = Gtk.ComboBoxText()

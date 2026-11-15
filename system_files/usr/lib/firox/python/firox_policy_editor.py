@@ -83,7 +83,7 @@ def run(fp):
     class Editor(Gtk.ApplicationWindow):
         def __init__(self, app):
             super().__init__(application=app, title="Policy Editor")
-            self.set_default_size(640, 720)
+            self.set_default_size(860, 680)
             self.set_icon_name("preferences-system")
             outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
             margins(outer)
@@ -112,44 +112,49 @@ def run(fp):
             org.add(self.org)
             outer.add(org)
 
-            # -- the settings
-            grid = Gtk.Grid(row_spacing=12, column_spacing=16)
-            margins(grid, 10)
-            self.controls = {}
-            settings = conf.get("settings") or {}
-            for row, pol in enumerate(P.POLICIES):
-                text = Gtk.Label(xalign=0, wrap=True, max_width_chars=48, hexpand=True)
-                text.set_markup(f"<b>{GLib.markup_escape_text(pol.title)}</b>\n"
-                                f"<small>{GLib.markup_escape_text(pol.description)}</small>")
-                grid.attach(text, 0, row, 1, 1)
-                value = settings.get(pol.key)
-                if pol.kind == "bool":
-                    combo = Gtk.ComboBoxText(valign=Gtk.Align.CENTER)
-                    for item in ("Not configured", pol.on_label, pol.off_label):
-                        combo.append_text(item)
-                    combo.set_active(0 if value is None else (1 if value else 2))
-                    grid.attach(combo, 1, row, 1, 1)
-                    self.controls[pol.key] = combo
-                else:
-                    box = Gtk.Box(spacing=6, valign=Gtk.Align.CENTER)
-                    combo = Gtk.ComboBoxText()
-                    for item in ("Not configured", "Set to"):
-                        combo.append_text(item)
-                    spin = Gtk.SpinButton.new_with_range(pol.low, pol.high, 1)
-                    spin.set_value(value if isinstance(value, int) else min(max(10, pol.low), pol.high))
-                    combo.connect("changed", lambda c, s=spin: s.set_sensitive(c.get_active() == 1))
-                    combo.set_active(0 if value is None else 1)
-                    spin.set_sensitive(value is not None)
-                    box.add(combo)
-                    box.add(spin)
-                    if pol.unit:
-                        box.add(Gtk.Label(label=pol.unit))
-                    grid.attach(box, 1, row, 1, 1)
-                    self.controls[pol.key] = (combo, spin)
-            scroll = Gtk.ScrolledWindow(vexpand=True, shadow_type=Gtk.ShadowType.IN)
-            scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-            scroll.add(grid)
-            outer.add(scroll)
+            # -- the settings: categories | settings in it | the one selected
+            self.settings = dict(conf.get("settings") or {})
+            paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL, vexpand=True)
+            paned.set_position(190)
+            self.tree = Gtk.TreeStore(str, str)             # label, category path
+            nodes = {}
+            for pol in P.POLICIES:
+                parts = pol.category.split("/")
+                for depth in range(len(parts)):
+                    path = "/".join(parts[:depth + 1])
+                    if path not in nodes:
+                        nodes[path] = self.tree.append(nodes.get("/".join(parts[:depth])), [parts[depth], path])
+            self.tree.prepend(None, ["All Settings", ""])
+            self.cats = Gtk.TreeView(model=self.tree, headers_visible=False)
+            self.cats.append_column(Gtk.TreeViewColumn("", Gtk.CellRendererText(), text=0))
+            self.cats.expand_all()
+            self.cats.get_selection().connect("changed", lambda *_a: self.fill_list())
+            left = Gtk.ScrolledWindow(shadow_type=Gtk.ShadowType.IN)
+            left.add(self.cats)
+            paned.pack1(left, False, False)
+
+            right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+            self.list = Gtk.ListStore(str, str, str)       # title, state, key
+            self.view = Gtk.TreeView(model=self.list)
+            title_col = Gtk.TreeViewColumn("Setting", Gtk.CellRendererText(ellipsize=3), text=0)
+            title_col.set_expand(True)
+            self.view.append_column(title_col)
+            state_col = Gtk.TreeViewColumn("State", Gtk.CellRendererText(ellipsize=3), text=1)
+            state_col.set_min_width(230)
+            state_col.set_max_width(320)
+            self.view.append_column(state_col)
+            self.view.get_selection().connect("changed", lambda *_a: self.show_setting())
+            top = Gtk.ScrolledWindow(shadow_type=Gtk.ShadowType.IN, vexpand=True)
+            top.set_min_content_height(150)
+            top.add(self.view)
+            right.pack_start(top, True, True, 0)
+            self.detail = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            self.detail.set_margin_start(6)
+            self.detail.set_margin_top(4)
+            right.pack_start(self.detail, False, False, 0)
+            paned.pack2(right, True, False)
+            outer.add(paned)
+            self.cats.get_selection().select_path(Gtk.TreePath(0))
 
             self.encrypt = Gtk.CheckButton(label="Encrypt the policy (only enrolled computers can read it)")
             self.encrypt.set_active(bool(conf.get("encrypt")))
@@ -173,27 +178,127 @@ def run(fp):
 
         # -- the form
         def values(self):
-            out = {}
+            return {k: v for k, v in self.settings.items() if k in P.BY_KEY}
+
+        def state_text(self, pol):
+            value = self.settings.get(pol.key)
+            return "Not configured" if value is None else pol.describe(value)
+
+        def fill_list(self):
+            model, it = self.cats.get_selection().get_selected()
+            category = model[it][1] if it is not None else ""
+            keep = self.selected_key()
+            self.list.clear()
             for pol in P.POLICIES:
-                c = self.controls[pol.key]
-                if pol.kind == "bool":
-                    if c.get_active() in (1, 2):
-                        out[pol.key] = c.get_active() == 1
-                elif c[0].get_active() == 1:
-                    out[pol.key] = int(c[1].get_value())
-            return out
+                if not category or pol.category == category or pol.category.startswith(category + "/"):
+                    self.list.append([pol.title if category else f"{pol.category.replace('/', ' › ')} › {pol.title}",
+                                      self.state_text(pol), pol.key])
+            for i, row in enumerate(self.list):
+                if row[2] == keep:
+                    self.view.get_selection().select_path(Gtk.TreePath(i))
+                    return
+            if len(self.list):
+                self.view.get_selection().select_path(Gtk.TreePath(0))
+
+        def selected_key(self):
+            model, it = self.view.get_selection().get_selected() if hasattr(self, "view") else (None, None)
+            return model[it][2] if it is not None else None
+
+        def refresh_state(self, key):
+            for row in self.list:
+                if row[2] == key:
+                    row[1] = self.state_text(P.BY_KEY[key])
+
+        def show_setting(self):
+            """The selected setting: Not configured, or its value."""
+            for child in self.detail.get_children():
+                self.detail.remove(child)
+            key = self.selected_key()
+            if key is None:
+                return
+            pol = P.BY_KEY[key]
+            head = Gtk.Label(xalign=0, wrap=True, max_width_chars=60)
+            head.set_markup(f"<b>{GLib.markup_escape_text(pol.title)}</b>\n"
+                            f"<small>{GLib.markup_escape_text(pol.description)}</small>")
+            self.detail.add(head)
+            value = self.settings.get(key)
+
+            def set_value(v):
+                if v is None:
+                    self.settings.pop(key, None)
+                else:
+                    self.settings[key] = v
+                self.refresh_state(key)
+
+            off = Gtk.RadioButton.new_with_label(None, "Not configured (left to each person)")
+            self.detail.add(off)
+            if pol.kind == "bool":
+                on_b = Gtk.RadioButton.new_with_label_from_widget(off, pol.on_label)
+                off_b = Gtk.RadioButton.new_with_label_from_widget(off, pol.off_label)
+                self.detail.add(on_b)
+                self.detail.add(off_b)
+                (on_b if value is True else off_b if value is False else off).set_active(True)
+                on_b.connect("toggled", lambda b: b.get_active() and set_value(True))
+                off_b.connect("toggled", lambda b: b.get_active() and set_value(False))
+            else:
+                row = Gtk.Box(spacing=6)
+                set_b = Gtk.RadioButton.new_with_label_from_widget(off, "Set to")
+                row.add(set_b)
+                if pol.kind == "minutes":
+                    field = Gtk.SpinButton.new_with_range(pol.low, pol.high, 1)
+                    field.set_value(value if isinstance(value, int) else min(max(10, pol.low), pol.high))
+                    current = lambda: int(field.get_value())       # noqa: E731
+                    field.connect("value-changed", lambda *_a: set_b.get_active() and set_value(current()))
+                    row.add(field)
+                    if pol.unit:
+                        row.add(Gtk.Label(label=pol.unit))
+                else:
+                    field = Gtk.Entry(hexpand=True, text=value or "", placeholder_text=pol.placeholder)
+                    note = Gtk.Label(xalign=0)
+                    note.get_style_context().add_class("dim-label")
+
+                    def current():
+                        text = field.get_text().strip()
+                        try:
+                            pol.check(text)
+                            note.set_text("")
+                            return text
+                        except P.PolicyError as e:
+                            note.set_text(str(e).replace(pol.key, "It"))
+                            return None
+
+                    def typed(*_a):
+                        if set_b.get_active():
+                            v = current()
+                            if v is not None:
+                                set_value(v)
+                            else:
+                                set_value(None)
+                                self.refresh_state(key)
+                    field.connect("changed", typed)
+                    row.add(field)
+                self.detail.add(row)
+                if pol.kind not in ("bool", "minutes"):
+                    self.detail.add(note)
+                set_b.set_active(value is not None)
+                field.set_sensitive(value is not None)
+
+                def chosen(b):
+                    field.set_sensitive(b.get_active())
+                    if b.get_active():
+                        v = current()
+                        set_value(v)
+                        if pol.kind not in ("bool", "minutes"):
+                            field.grab_focus()
+                set_b.connect("toggled", chosen)
+            off.connect("toggled", lambda b: b.get_active() and set_value(None))
+            self.detail.show_all()
 
         def load(self, settings, organization=None):
             if organization is not None:
                 self.org.set_text(organization)
-            for pol in P.POLICIES:
-                c, value = self.controls[pol.key], settings.get(pol.key)
-                if pol.kind == "bool":
-                    c.set_active(0 if value is None else (1 if value else 2))
-                else:
-                    c[0].set_active(0 if value is None else 1)
-                    if isinstance(value, int):
-                        c[1].set_value(value)
+            self.settings = {k: v for k, v in settings.items() if k in P.BY_KEY}
+            self.fill_list()
 
         def keep_draft(self):
             conf.update(organization=self.org.get_text().strip(), settings=self.values(),

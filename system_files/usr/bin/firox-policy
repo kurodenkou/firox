@@ -344,7 +344,9 @@ def cmd_unenroll():
     if os.path.isdir(KEYRING):
         stop_agent(KEYRING)
     shutil.rmtree(ETC, ignore_errors=True)
-    for path in (STATUS, LAST_POLICY, P.MANAGED_POWER):
+    for path in [STATUS, LAST_POLICY, P.MANAGED_POWER, P.MANAGED_DESKTOP] + [
+            os.path.join(STATE, n) for n in (os.listdir(STATE) if os.path.isdir(STATE) else [])
+            if n.startswith("wallpaper.")]:
         try:
             os.unlink(path)
         except OSError:
