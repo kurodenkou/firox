@@ -1,0 +1,13 @@
+[Unit]
+Description=Fetch and apply this computer's Firox policy
+# Only on enrolled computers (sudo firox-policy enroll FILE)
+ConditionPathExists=/etc/firox/policy/enrollment.json
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/firox-policy update
+# A failed check (offline, refused policy) leaves the last policy in force;
+# firox-policy status and Event Viewer show why
+SuccessExitStatus=1 2

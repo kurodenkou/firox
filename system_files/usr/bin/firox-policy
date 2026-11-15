@@ -1,0 +1,455 @@
+#!/usr/bin/python3
+"""
+firox-policy: manage Firox computers from one place, with signed policies.
+
+    firox-policy                    open the policy editor (write, sign and
+                                    publish policies; make enrollment files)
+    firox-policy status             what policy this computer follows
+    sudo firox-policy enroll FILE   follow the policies described in an
+                                    enrollment file (.firoxenroll)
+    sudo firox-policy unenroll      stop following them
+    sudo firox-policy update        fetch and apply the policy now (the
+                                    firox-policy.timer does this every 30
+                                    minutes and at startup)
+    sudo firox-policy apply FILE    apply a policy file once, from here
+
+How it fits together. You (the admin) keep a GnuPG signing key, made by the
+editor, in ~/.local/share/firox/policy-admin. A policy is a small JSON
+document of settings (see firox_policies.py for the list), signed with that
+key and, if you like, encrypted to a "machines" key. You publish it
+anywhere the computers can fetch it: an HTTPS address, a git repository
+over HTTPS, or a file (a network share, a USB stick).
+
+Each managed computer is enrolled once with an enrollment file: where to
+fetch the policy, your signing key's public half (and fingerprint), and
+the machines key if policies are encrypted. Then it fetches the policy on
+a timer, and applies it only if it carries a valid signature from exactly
+that key. Encrypting alone would prove nothing (anyone can encrypt to a
+public key); the signature is what makes a policy yours. Each policy has a
+serial number, and a computer refuses one older than the last it applied,
+so an old policy can't be replayed.
+
+Managed computer:  /etc/firox/policy/ (enrollment.json; gnupg/, root only)
+                   /var/lib/firox/policy/ (status, what's in force)
+"""
+
+import datetime
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+
+sys.path.insert(0, "/usr/lib/firox/python")
+import firox_policies as P  # noqa: E402
+
+ETC = os.environ.get("FIROX_POLICY_ETC", "/etc/firox/policy")
+ENROLLMENT = os.path.join(ETC, "enrollment.json")
+KEYRING = os.path.join(ETC, "gnupg")
+STATE = P.STATE_DIR
+STATUS = P.MANAGED_JSON                 # readable by everyone: no secrets
+LAST_POLICY = os.path.join(STATE, "policy.json")
+GIT_DIR = os.path.join(STATE, "git")
+MAX_POLICY = 1 << 20                    # a policy is a few KB; refuse anything huge
+POLICY_FORMAT, ENROLL_FORMAT, VERSION = "firox-policy", "firox-enrollment", 1
+
+ADMIN_DIR = os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share"),
+                         "firox", "policy-admin")
+ADMIN_KEYRING = os.path.join(ADMIN_DIR, "gnupg")
+EDITOR_CONF = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+                           "firox", "policy-editor.json")
+
+
+class Refused(Exception):
+    """A policy or enrollment that mustn't be used, with the reason."""
+
+
+def now_iso():
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def write_json(path, data, mode=0o644):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    with os.fdopen(fd, "w") as fh:
+        json.dump(data, fh, indent=1)
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def read_json(path, default=None):
+    try:
+        with open(path) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return default
+
+
+# ------------------------------------------------------------------- gnupg --
+
+def stop_agent(home):
+    """gpg-agent keeps its socket in the keyring folder: stop it before the
+    folder moves or goes, or it answers for the old place."""
+    subprocess.run(["gpgconf", "--homedir", home, "--kill", "all"], capture_output=True, timeout=30)
+
+
+def gpg(home, *args, input=None, passphrase=None):
+    """Run gpg with its own keyring: (returncode, stdout bytes, status lines)."""
+    os.makedirs(home, mode=0o700, exist_ok=True)
+    os.chmod(home, 0o700)
+    agent_conf = os.path.join(home, "gpg-agent.conf")
+    if home == ADMIN_KEYRING and not os.path.exists(agent_conf):
+        # Ask for the admin passphrase every time: never remember it
+        with open(agent_conf, "w") as fh:
+            fh.write("default-cache-ttl 0\nmax-cache-ttl 0\nallow-loopback-pinentry\n")
+        stop_agent(home)
+    cmd = ["gpg", "--homedir", home, "--batch", "--no-tty", "--status-fd", "2",
+           "--trust-model", "always", "--no-auto-key-retrieve", "--no-auto-key-locate"]
+    if passphrase is not None:
+        cmd += ["--pinentry-mode", "loopback", "--passphrase", passphrase]
+    p = subprocess.run(cmd + list(args), input=input, capture_output=True, timeout=120)
+    status = [l[9:] for l in p.stderr.decode(errors="replace").splitlines() if l.startswith("[GNUPG:] ")]
+    other = [l for l in p.stderr.decode(errors="replace").splitlines() if not l.startswith("[GNUPG:] ")]
+    return p.returncode, p.stdout, status, other
+
+
+def open_policy(data, home, admin_fpr):
+    """Check a signed (and maybe encrypted) policy: the JSON it holds, or
+    Refused. It must carry a good signature whose primary key is exactly
+    the enrolled admin key."""
+    rc, out, status, other = gpg(home, "--decrypt", input=data)
+    valid = [s.split() for s in status if s.startswith("VALIDSIG ")]
+    bad = [s for s in status if s.split()[0] in ("BADSIG", "ERRSIG", "EXPKEYSIG", "REVKEYSIG",
+                                                 "DECRYPTION_FAILED", "NO_SECKEY")]
+    if bad:
+        why = {"BADSIG": "the signature doesn't match the contents (changed after signing?)",
+               "ERRSIG": "it's signed by a key this computer doesn't trust",
+               "EXPKEYSIG": "the admin key has expired", "REVKEYSIG": "the admin key was revoked",
+               "DECRYPTION_FAILED": "it couldn't be decrypted",
+               "NO_SECKEY": "it's encrypted to a key this computer doesn't have"}
+        raise Refused(why.get(bad[0].split()[0], bad[0].split()[0].lower()))
+    if not valid:
+        raise Refused("it isn't signed" if rc == 0 else
+                      "it couldn't be read: " + (other[-1] if other else "gpg failed"))
+    primary = valid[0][-1].upper()
+    if primary != admin_fpr.upper():
+        raise Refused(f"it's signed by a different key ({primary[-16:]}), not this computer's admin key")
+    if rc != 0:
+        raise Refused("gpg reported a problem: " + (other[-1] if other else f"exit {rc}"))
+    try:
+        policy = json.loads(out)
+    except ValueError:
+        raise Refused("the signed content isn't a policy (not JSON)") from None
+    if not isinstance(policy, dict) or policy.get("format") != POLICY_FORMAT:
+        raise Refused("the signed content isn't a Firox policy")
+    if policy.get("version") != VERSION:
+        raise Refused(f"policy format version {policy.get('version')} needs a newer Firox")
+    if not isinstance(policy.get("serial"), int) or not isinstance(policy.get("settings"), dict):
+        raise Refused("the policy has no serial number or settings")
+    return policy
+
+
+# ------------------------------------------------------------------- fetch --
+
+def fetch(source):
+    """The policy file's bytes from its source:
+        https://host/path/policy.firoxpol
+        git+https://host/repo.git[#path/in/repo]   (default policy.firoxpol;
+                                                    git+file:// for a share)
+        /path/to/policy.firoxpol  or  file:///path/..."""
+    if source.startswith("https://"):
+        req = urllib.request.Request(source, headers={"User-Agent": "firox-policy"})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = resp.read(MAX_POLICY + 1)
+        except (urllib.error.URLError, OSError) as e:
+            raise OSError(f"couldn't download {source}: {getattr(e, 'reason', e)}") from None
+    elif source.startswith(("git+https://", "git+file://")):
+        url, _, path = source[4:].partition("#")
+        path = path or "policy.firoxpol"
+        if ".." in path.split("/"):
+            raise OSError("the path in the repository can't contain ..")
+        if os.path.isdir(os.path.join(GIT_DIR, ".git")):
+            cur = subprocess.run(["git", "-C", GIT_DIR, "remote", "get-url", "origin"],
+                                 capture_output=True, text=True).stdout.strip()
+            if cur != url:
+                shutil.rmtree(GIT_DIR)
+        env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+        if not os.path.isdir(os.path.join(GIT_DIR, ".git")):
+            os.makedirs(STATE, exist_ok=True)
+            p = subprocess.run(["git", "clone", "--depth", "1", "--quiet", url, GIT_DIR],
+                               capture_output=True, text=True, env=env, timeout=300)
+        else:
+            p = subprocess.run(["git", "-C", GIT_DIR, "fetch", "--depth", "1", "--quiet", "origin", "HEAD"],
+                               capture_output=True, text=True, env=env, timeout=300)
+            if p.returncode == 0:
+                p = subprocess.run(["git", "-C", GIT_DIR, "reset", "--hard", "--quiet", "FETCH_HEAD"],
+                                   capture_output=True, text=True, timeout=60)
+        if p.returncode != 0:
+            raise OSError(f"couldn't fetch {url}: {(p.stderr or '').strip().splitlines()[-1:] or ['git failed']}")
+        with open(os.path.join(GIT_DIR, path), "rb") as fh:
+            data = fh.read(MAX_POLICY + 1)
+    elif source.startswith("file://") or source.startswith("/"):
+        with open(source[7:] if source.startswith("file://") else source, "rb") as fh:
+            data = fh.read(MAX_POLICY + 1)
+    else:
+        raise OSError(f"don't know how to fetch {source!r} (use https://, git+https:// or a path)")
+    if len(data) > MAX_POLICY:
+        raise OSError("the policy file is too big")
+    return data
+
+
+# ------------------------------------------------------------------- apply --
+
+def apply_policy(policy, enrollment):
+    """Apply a checked policy; refuses one older than the last applied."""
+    last = read_json(LAST_POLICY, {}) or {}
+    if policy["serial"] < last.get("serial", -1):
+        raise Refused(f"it's older (serial {policy['serial']}) than the policy already applied "
+                      f"(serial {last['serial']})")
+    settings, results = {}, {}
+    for key, value in policy["settings"].items():
+        pol = P.BY_KEY.get(key)
+        if pol is None:
+            results[key] = "unknown setting: this computer needs a newer Firox"
+            continue
+        try:
+            results[key] = "ok: " + pol.apply(value)
+            settings[key] = value
+        except (P.PolicyError, OSError, subprocess.SubprocessError) as e:
+            results[key] = f"failed: {e}"
+    # Settings the policy no longer has: unlock them
+    for key in (last.get("settings") or {}):
+        if key not in policy["settings"] and key in P.BY_KEY:
+            try:
+                P.BY_KEY[key].release()
+                results[key] = "no longer set by the policy"
+            except (P.PolicyError, OSError) as e:
+                results[key] = f"couldn't release: {e}"
+    write_json(LAST_POLICY, policy, 0o600)
+    status = {"organization": policy.get("organization") or enrollment.get("organization") or "",
+              "source": enrollment.get("source", ""), "serial": policy["serial"],
+              "issued": policy.get("issued", ""), "applied": now_iso(), "checked": now_iso(),
+              "error": None, "settings": settings, "results": results}
+    write_json(STATUS, status)
+    return status
+
+
+def record_error(enrollment, message):
+    status = read_json(STATUS, {}) or {}
+    status.update(organization=status.get("organization") or enrollment.get("organization", ""),
+                  source=enrollment.get("source", ""), checked=now_iso(), error=message)
+    write_json(STATUS, status)
+
+
+def need_root():
+    if os.geteuid() != 0:
+        print("firox-policy: this needs root (sudo firox-policy …)", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_update(path=None):
+    need_root()
+    enrollment = read_json(ENROLLMENT)
+    if not enrollment:
+        print("This computer isn't enrolled (sudo firox-policy enroll FILE).", file=sys.stderr)
+        return 1
+    source = path or enrollment["source"]
+    try:
+        data = fetch(source)
+        policy = open_policy(data, KEYRING, enrollment["admin_fingerprint"])
+        status = apply_policy(policy, enrollment)
+    except Refused as e:
+        msg = f"policy from {source} refused: {e}"
+        print(msg, file=sys.stderr)
+        record_error(enrollment, msg)
+        return 2
+    except OSError as e:
+        msg = str(e)
+        print(msg, file=sys.stderr)
+        record_error(enrollment, msg)
+        return 1
+    print(f"Applied policy {status['serial']} from {status['organization'] or source}:")
+    for key, result in status["results"].items():
+        print(f"  {key}: {result}")
+    return 0
+
+
+def cmd_enroll(path):
+    need_root()
+    try:
+        bundle = read_json(path)
+        if not isinstance(bundle, dict) or bundle.get("format") != ENROLL_FORMAT:
+            raise Refused("that isn't a Firox enrollment file")
+        if bundle.get("version") != VERSION:
+            raise Refused("that enrollment file needs a newer Firox")
+        fpr = str(bundle.get("admin_fingerprint", "")).upper().replace(" ", "")
+        if len(fpr) < 40 or not bundle.get("admin_key") or not bundle.get("source"):
+            raise Refused("the enrollment file is missing the admin key or the policy's address")
+        tmp = tempfile.mkdtemp(prefix=".enroll-", dir=os.path.dirname(ETC) if os.path.isdir(
+            os.path.dirname(ETC)) else None)
+        home = os.path.join(tmp, "gnupg")
+        rc, _o, status, other = gpg(home, "--import", input=bundle["admin_key"].encode())
+        imported = [s.split()[2].upper() for s in status if s.startswith("IMPORT_OK")]
+        if fpr not in imported:
+            raise Refused("the admin key in the file doesn't match its fingerprint")
+        if bundle.get("machine_key"):
+            rc, _o, status, other = gpg(home, "--import", input=bundle["machine_key"].encode())
+            if rc != 0:
+                raise Refused("the machines key couldn't be imported: " + (other[-1] if other else ""))
+    except Refused as e:
+        print(f"Not enrolled: {e}", file=sys.stderr)
+        return 2
+    os.makedirs(ETC, exist_ok=True)
+    stop_agent(home)
+    if os.path.isdir(KEYRING):
+        stop_agent(KEYRING)
+        shutil.rmtree(KEYRING)
+    shutil.move(home, KEYRING)
+    shutil.rmtree(tmp, ignore_errors=True)
+    os.chmod(KEYRING, 0o700)
+    enrollment = {"organization": str(bundle.get("organization") or ""), "source": bundle["source"],
+                  "admin_fingerprint": fpr, "encrypted": bool(bundle.get("machine_key")),
+                  "enrolled": now_iso()}
+    write_json(ENROLLMENT, enrollment)
+    # (a new admin may number policies from scratch)
+    try:
+        os.unlink(LAST_POLICY)
+    except OSError:
+        pass
+    print(f"Enrolled: following {enrollment['organization'] or 'the'} policies from {enrollment['source']}")
+    print(f"Admin key: {fpr}")
+    subprocess.run(["systemctl", "enable", "--now", "firox-policy.timer"], capture_output=True)
+    return cmd_update()
+
+
+def cmd_unenroll():
+    need_root()
+    if not os.path.exists(ENROLLMENT):
+        print("This computer isn't enrolled.")
+        return 0
+    last = read_json(LAST_POLICY, {}) or {}
+    for key in (last.get("settings") or {}):
+        if key in P.BY_KEY:
+            try:
+                P.BY_KEY[key].release()
+            except (P.PolicyError, OSError):
+                pass
+    subprocess.run(["systemctl", "disable", "--now", "firox-policy.timer"], capture_output=True)
+    if os.path.isdir(KEYRING):
+        stop_agent(KEYRING)
+    shutil.rmtree(ETC, ignore_errors=True)
+    for path in (STATUS, LAST_POLICY, P.MANAGED_POWER):
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    shutil.rmtree(GIT_DIR, ignore_errors=True)
+    print("Unenrolled. The settings stay as they are, but people can change them again.")
+    return 0
+
+
+def cmd_status():
+    status = read_json(STATUS)
+    enrolled = os.path.exists(ENROLLMENT)
+    if not status and not enrolled:
+        print("This computer isn't managed by a policy.")
+        return 0
+    status = status or {}
+    print(f"Managed by: {status.get('organization') or '(no name)'}")
+    print(f"Policy from: {status.get('source', '')}")
+    if status.get("serial") is not None:
+        print(f"Policy: number {status['serial']}, issued {status.get('issued', '?')}, applied {status.get('applied', '?')}")
+    print(f"Last checked: {status.get('checked', 'never')}")
+    if status.get("error"):
+        print(f"Last check failed: {status['error']}")
+    for key, value in (status.get("settings") or {}).items():
+        pol = P.BY_KEY.get(key)
+        print(f"  {pol.title if pol else key}: {pol.describe(value) if pol else value}")
+    return 0
+
+
+# ------------------------------------------------------------- admin side --
+# (the editor: the admin's own keys, never root)
+
+def admin_keys():
+    """{"sign": fingerprint or None, "machines": fingerprint or None}."""
+    conf = read_json(EDITOR_CONF, {}) or {}
+    have = set()
+    if os.path.isdir(ADMIN_KEYRING):
+        rc, out, _s, _o = gpg(ADMIN_KEYRING, "--with-colons", "--list-secret-keys")
+        lines = out.decode(errors="replace").splitlines()
+        for i, line in enumerate(lines):
+            if line.startswith("sec:") and i + 1 < len(lines) and lines[i + 1].startswith("fpr:"):
+                have.add(lines[i + 1].split(":")[9])
+    return {"sign": conf.get("sign_key") if conf.get("sign_key") in have else None,
+            "machines": conf.get("machines_key") if conf.get("machines_key") in have else None}
+
+
+def new_key(uid, usage, passphrase=""):
+    """Make a key in the admin keyring: its fingerprint."""
+    # A primary key can't be encryption-only: the machines key is a
+    # certify-only primary with an encryption subkey
+    rc, _o, status, other = gpg(ADMIN_KEYRING, "--quick-gen-key", uid, "ed25519",
+                                "sign" if usage == "sign" else "cert", "never", passphrase=passphrase)
+    created = [s.split() for s in status if s.startswith("KEY_CREATED")]
+    if rc != 0 or not created:
+        raise RuntimeError("gpg couldn't make the key: " + (other[-1] if other else f"exit {rc}"))
+    fpr = created[0][-1].upper()
+    if usage != "sign":
+        rc, _o, status, other = gpg(ADMIN_KEYRING, "--quick-add-key", fpr, "cv25519", "encr", "never",
+                                    passphrase=passphrase)
+        if rc != 0:
+            raise RuntimeError("gpg couldn't make the encryption key: " + (other[-1] if other else f"exit {rc}"))
+    return fpr
+
+
+def sign_policy(policy, sign_fpr, passphrase="", machines_fpr=None):
+    """The policy, signed (and encrypted to the machines key): armored bytes."""
+    args = ["--armor", "--local-user", sign_fpr, "--sign"]
+    if machines_fpr:
+        args += ["--encrypt", "--recipient", machines_fpr]
+    rc, out, status, other = gpg(ADMIN_KEYRING, *args, input=json.dumps(policy, indent=1).encode(),
+                                 passphrase=passphrase)
+    if rc != 0 or not out:
+        bad = [s for s in status if "BAD_PASSPHRASE" in s]
+        raise RuntimeError("wrong passphrase for the admin key" if bad else
+                           "gpg couldn't sign: " + (other[-1] if other else f"exit {rc}"))
+    return out
+
+
+def export_key(fpr, secret=False):
+    rc, out, _s, other = gpg(ADMIN_KEYRING, "--armor", "--export-secret-keys" if secret else "--export", fpr)
+    if rc != 0 or not out:
+        raise RuntimeError("gpg couldn't export the key: " + (other[-1] if other else f"exit {rc}"))
+    return out.decode()
+
+
+# ------------------------------------------------------------------------ --
+
+def main(argv):
+    cmd = argv[1] if len(argv) > 1 else ""
+    if cmd == "status":
+        return cmd_status()
+    if cmd == "update":
+        return cmd_update()
+    if cmd == "apply" and len(argv) > 2:
+        return cmd_update(os.path.abspath(argv[2]))
+    if cmd == "enroll" and len(argv) > 2:
+        return cmd_enroll(argv[2])
+    if cmd == "unenroll":
+        return cmd_unenroll()
+    if cmd == "":
+        import firox_policy_editor
+        return firox_policy_editor.run(sys.modules[__name__])
+    print(__doc__.strip(), file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
