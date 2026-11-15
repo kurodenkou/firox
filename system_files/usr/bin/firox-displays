@@ -26,6 +26,13 @@ read from /sys/class/drm to tell them apart. `restore` double-checks after
 login and re-applies with wlr-randr, trying the matching real mode first and a
 custom mode second. Everything is logged to ~/.local/state/firox/displays.log.
 
+The layout always starts at 0,0: its top-left monitor is moved there (and the
+others with it) when it's saved and at login. A layout that starts elsewhere,
+e.g. a single monitor dragged away from the corner in the arrangement tool,
+looks fine to Wayland programs, but XWayland builds its screen from 0,0, so
+X11 programs and games (Steam, Proton) get the screen wrong: clicks that miss
+and a pointer held in part of the screen.
+
 A user-written ~/.config/kanshi/config (without the Firox header) is left alone.
 """
 
@@ -127,6 +134,36 @@ def profile_key(outs):
     return ",".join(sorted(o["name"] for o in outs))
 
 
+def normalized(snaps):
+    """The same layout moved so that it starts at 0,0 (and whether it moved)."""
+    on = [s for s in snaps if s.get("enabled")]
+    if not on:
+        return snaps, False
+    dx, dy = min(s["x"] for s in on), min(s["y"] for s in on)
+    if dx == 0 and dy == 0:
+        return snaps, False
+    out = []
+    for s in snaps:
+        s = dict(s)
+        if s.get("enabled"):
+            s["x"] -= dx
+            s["y"] -= dy
+        out.append(s)
+    return out, True
+
+
+def anchor_live(outs, why):
+    """Move the live layout to start at 0,0 if it doesn't (see the top)."""
+    snaps, moved = normalized([snapshot(o) for o in outs])
+    if not moved:
+        return False
+    log(f"{why}: the layout doesn't start at 0,0; moving it there")
+    for s in snaps:
+        if s.get("enabled"):
+            wlr_randr(["--output", s["name"], "--pos", f"{s['x']},{s['y']}"])
+    return True
+
+
 def load_store():
     try:
         with open(STORE) as fh:
@@ -160,12 +197,26 @@ def save():
         return 1
     if not outs:
         return 1
+    if anchor_live(outs, "save"):
+        outs = outputs()
 
     profiles = load_store()
     key = profile_key(outs)
-    profiles[key] = [snapshot(o) for o in sorted(outs, key=lambda o: o["name"])]
+    profiles[key], _ = normalized([snapshot(o) for o in sorted(outs, key=lambda o: o["name"])])
     log(f"save [{key}]: " + json.dumps(profiles[key]))
+    write_profiles(profiles)
 
+    # kanshi exits at login when it has no config yet, so start it if needed
+    if subprocess.run(["kanshictl", "reload"], check=False, stdout=subprocess.DEVNULL,
+                      stderr=subprocess.DEVNULL).returncode != 0:
+        subprocess.Popen(["kanshi"], start_new_session=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    notify("Display settings saved", "Your screen layout will be restored at every login.")
+    return 0
+
+
+def write_profiles(profiles):
+    """displays.json, and the same layouts as kanshi profiles."""
     os.makedirs(os.path.dirname(STORE), exist_ok=True)
     with open(STORE + ".tmp", "w") as fh:
         json.dump(profiles, fh, indent=1)
@@ -178,14 +229,6 @@ def save():
     with open(KANSHI + ".tmp", "w") as fh:
         fh.write(text)
     os.replace(KANSHI + ".tmp", KANSHI)
-
-    # kanshi exits at login when it has no config yet, so start it if needed
-    if subprocess.run(["kanshictl", "reload"], check=False, stdout=subprocess.DEVNULL,
-                      stderr=subprocess.DEVNULL).returncode != 0:
-        subprocess.Popen(["kanshi"], start_new_session=True,
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    notify("Display settings saved", "Your screen layout will be restored at every login.")
-    return 0
 
 
 def matches(s, live):
@@ -216,9 +259,21 @@ def restore():
         log(f"restore: couldn't read layout: {err}")
         return 1
     key = profile_key(outs)
-    saved = load_store().get(key)
+    profiles = load_store()
+    # Layouts saved before they were kept at 0,0: repair them (and kanshi's copy)
+    fixed = False
+    for k in list(profiles):
+        profiles[k], moved = normalized(profiles[k])
+        fixed |= moved
+    if fixed:
+        log("restore: moved saved layouts to start at 0,0")
+        write_profiles(profiles)
+        subprocess.run(["kanshictl", "reload"], check=False, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL)
+    saved = profiles.get(key)
     if not saved:
         log(f"restore [{key}]: nothing saved for this set of monitors")
+        anchor_live(outs, f"restore [{key}]")
         return 0
     live = {o["name"]: o for o in outs}
     ok = True
@@ -253,6 +308,11 @@ def restore():
         else:
             done = wlr_randr(base + rest)
         ok &= done
+    # Whatever happened above, the screens must start at 0,0
+    try:
+        anchor_live(outputs(), f"restore [{key}]")
+    except (OSError, subprocess.CalledProcessError, ValueError):
+        pass
     return 0 if ok else 1
 
 
