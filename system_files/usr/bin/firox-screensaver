@@ -123,6 +123,7 @@ case "${1:-show}" in
         sleep 0.5
         while running; do sleep 0.3; done
         kill "$watcher" 2>/dev/null
+        stop    # it may have closed itself; let notifications through again
         ;;
     start) start ;;
     stop) stop ;;

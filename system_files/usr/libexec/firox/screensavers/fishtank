@@ -6,12 +6,14 @@ Saver). Every monitor gets its own tank, laid out differently each time.
     fishtank            full screen on every monitor, above everything
     fishtank --window   in an ordinary window (for trying it out)
 
-firox-screensaver starts it with --app-id=firox-screensaver so that it can
-find and stop it. If OpenGL isn't available it shows the text aquarium
+It closes itself at the first key press, click, scroll, touch or mouse
+movement. firox-screensaver starts it with --app-id=firox-screensaver so that
+it can find and stop it too. If OpenGL isn't available it shows the text aquarium
 (asciiquarium) instead.
 """
 
 import os
+import signal
 import sys
 
 WAYLAND = bool(os.environ.get("WAYLAND_DISPLAY")) and os.environ.get("GDK_BACKEND", "wayland") != "x11"
@@ -23,7 +25,8 @@ import gi  # noqa: E402
 
 gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
-from gi.repository import Gdk, GLib, Gtk  # noqa: E402
+from gi.repository import Gdk, GLib, GLibUnix, Gtk  # noqa: E402
+import firox_saver_input  # noqa: E402
 
 try:
     gi.require_version("GtkLayerShell", "0.1")
@@ -107,6 +110,7 @@ class Saver:
     def __init__(self, windowed):
         self.windows = {}
         self.views = []
+        self.input = firox_saver_input.InputWatch(self.quit)
         display = Gdk.Display.get_default()
         if display is None:
             sys.exit("fishtank: no display")
@@ -131,7 +135,9 @@ class Saver:
                          GtkLayerShell.Edge.LEFT, GtkLayerShell.Edge.RIGHT):
                 GtkLayerShell.set_anchor(win, edge, True)
             GtkLayerShell.set_exclusive_zone(win, -1)
-            GtkLayerShell.set_keyboard_mode(win, GtkLayerShell.KeyboardMode.NONE)
+            # Take the keyboard so a key press ends it (the lock screen still
+            # comes first: ext-session-lock outranks layer surfaces)
+            GtkLayerShell.set_keyboard_mode(win, GtkLayerShell.KeyboardMode.EXCLUSIVE)
         elif windowed:
             win.set_default_size(1280, 720)
             win.connect("destroy", Gtk.main_quit)
@@ -143,11 +149,20 @@ class Saver:
         view = TankView(self)
         win.add(view)
         if not windowed:
+            # Any key, click, scroll, touch or real mouse movement ends it
+            view.set_can_focus(True)
+            self.input.attach(win, view)
+            win.connect("show", lambda _w: view.grab_focus())
             win.connect("realize", lambda w: w.get_window().set_cursor(
                 Gdk.Cursor.new_from_name(w.get_display(), "none")))
         win.show_all()
         self.windows[monitor] = win
         self.views.append(view)
+
+    @staticmethod
+    def quit(*_args):
+        Gtk.main_quit()
+        return GLib.SOURCE_REMOVE
 
     def remove(self, monitor):
         win = self.windows.pop(monitor, None)
@@ -171,6 +186,8 @@ def main(argv):
         print(__doc__.strip())
         return 0
     Saver(windowed="--window" in args)
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        GLibUnix.signal_add(GLib.PRIORITY_HIGH, sig, Saver.quit)
     Gtk.main()
     return 0
 

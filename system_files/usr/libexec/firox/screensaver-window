@@ -5,9 +5,9 @@ Run a terminal screen saver full screen on every monitor (firox-screensaver).
     screensaver-window COMMAND
 
 One black, borderless overlay per monitor (gtk-layer-shell), each with an
-embedded terminal (VTE) running COMMAND. Exits when the screen saver is
-stopped (firox-screensaver stop kills it) or when every copy of COMMAND has
-exited. Monitors plugged in or removed while it runs are followed.
+embedded terminal (VTE) running COMMAND. Exits at the first key press,
+click, scroll or mouse movement, when the screen saver is stopped
+(firox-screensaver stop kills it), or when COMMAND exits. Monitors plugged in or removed while it runs are followed.
 """
 
 import os
@@ -20,6 +20,9 @@ gi.require_version("Gdk", "3.0")
 gi.require_version("Vte", "2.91")
 gi.require_version("GtkLayerShell", "0.1")
 from gi.repository import Gdk, GLib, Gtk, GtkLayerShell, Pango, Vte  # noqa: E402
+
+sys.path.insert(0, "/usr/lib/firox/python")
+import firox_saver_input  # noqa: E402
 
 BLACK = Gdk.RGBA(0, 0, 0, 1)
 GREY = Gdk.RGBA(0.75, 0.75, 0.75, 1)
@@ -41,6 +44,7 @@ class Saver:
     def __init__(self, command):
         self.command = command
         self.windows = {}
+        self.input = firox_saver_input.InputWatch(Gtk.main_quit)
         display = Gdk.Display.get_default()
         display.connect("monitor-added", lambda _d, m: self.add(m))
         display.connect("monitor-removed", lambda _d, m: self.remove(m))
@@ -60,7 +64,9 @@ class Saver:
                      GtkLayerShell.Edge.LEFT, GtkLayerShell.Edge.RIGHT):
             GtkLayerShell.set_anchor(win, edge, True)
         GtkLayerShell.set_exclusive_zone(win, -1)           # cover the taskbar too
-        GtkLayerShell.set_keyboard_mode(win, GtkLayerShell.KeyboardMode.NONE)
+        # Take the keyboard so a key press ends it (the lock screen still
+        # comes first: ext-session-lock outranks layer surfaces)
+        GtkLayerShell.set_keyboard_mode(win, GtkLayerShell.KeyboardMode.EXCLUSIVE)
 
         term = Vte.Terminal()
         term.set_colors(GREY, BLACK, palette())
@@ -70,6 +76,8 @@ class Saver:
         term.set_scrollback_lines(0)
         term.connect("child-exited", lambda *_: self.child_exited(monitor))
         win.add(term)
+        # Any key, click, scroll, touch or real mouse movement ends it
+        self.input.attach(win, term)
         win.connect("realize", lambda w: w.get_window().set_cursor(
             Gdk.Cursor.new_from_name(w.get_display(), "none")))
         win.show_all()
