@@ -1,0 +1,16 @@
+Fish Tank's saltwater fish
+==========================
+
+clownfish, blue tang, yellow tang, blue damselfish, royal gramma, pufferfish
+(NAME.mesh, NAME.png) are from Reef Glass, a Roku screensaver by Tim Saucer:
+
+    https://github.com/timsaucer/reef_glass_roku_screensaver
+
+Its images and meshes are dedicated to the public domain under CC0 1.0
+(https://creativecommons.org/publicdomain/zero/1.0/). Each fish was generated
+as a keyed side photo (Z-Image-Turbo, Apache 2.0) and reconstructed in 3D
+(TripoSR, MIT); see that project's CREDITS.md. The way the side photo is
+projected onto the mesh's flanks follows its tools/fishviews.py.
+
+For Firox they were simplified to ~6000 triangles, turned to the tank's axes
+and their photos cropped and edge-softened by scripts/fishtank-assets.py.

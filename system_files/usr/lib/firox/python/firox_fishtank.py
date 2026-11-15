@@ -15,11 +15,18 @@ Tank(seed) holds the scene. The caller owns the GL context: call gl_init()
 once it's current, resize(w, h) when the size changes, step(dt) to move time
 on, render(target_fbo) to draw, and gl_free() before the context goes away.
 It needs PyOpenGL (python3-pyopengl).
+
+The saltwater fish (clownfish, tangs, damselfish, royal grammas, pufferfish)
+are Reef Glass's art (github.com/timsaucer/reef_glass_roku_screensaver, CC0):
+a 3D mesh per fish with its side photo projected onto the flanks, prepared by
+scripts/fishtank-assets.py into DATA_DIR. Without those files they're left out.
 """
 
 import ctypes
 import math
+import os
 import random
+import struct
 from array import array
 
 import OpenGL
@@ -35,6 +42,7 @@ FOVY = 40.0
 BACK = -14.0           # back of the tank
 FLOOR_K = 0.11         # gravel rises towards the back: y = -FLOOR_K * z
 Z_NEAR, Z_FAR = 0.5, 80.0
+DATA_DIR = os.environ.get("FIROX_FISHTANK_DATA", "/usr/share/firox/fishtank")
 TAU = math.tau
 
 
@@ -410,11 +418,12 @@ layout(location = 4) in vec4 iRot;      // heading, pitch, roll, bend
 layout(location = 5) in vec4 iAnim;     // tail phase, wave size, colour seed, fin phase
 uniform mat4 uVP;
 uniform float uWaveK;
-out vec3 vWorld, vNor, vLocal, vUv;
+uniform int uMesh;          // 1: a photo-textured mesh; aUv is its vertex colour
+out vec3 vWorld, vNor, vLocal, vUv, vLocalN;
 out float vSeed;
 void main() {
     vec3 p = aPos, n = aNor;
-    float part = aUv.z;
+    float part = uMesh == 1 ? 0.0 : aUv.z;
     if (part > 1.5 && part < 3.5) {         // pectoral fins row
         float side = part < 2.5 ? 1.0 : -1.0;
         float f = aUv.y * (0.6 + 0.4 * sin(iAnim.w));
@@ -443,6 +452,7 @@ void main() {
     vWorld = wp;
     vNor = R * n;
     vLocal = aPos;
+    vLocalN = aNor;
     vUv = aUv;
     vSeed = iAnim.z;
     gl_Position = uVP * vec4(wp, 1.0);
@@ -450,9 +460,12 @@ void main() {
 """
 
 FISH_FS = """
-in vec3 vWorld, vNor, vLocal, vUv;
+in vec3 vWorld, vNor, vLocal, vUv, vLocalN;
 in float vSeed;
 out vec4 frag;
+uniform int uMesh;
+uniform sampler2D uPhoto;
+uniform vec4 uBox;          // the part of the mesh the photo spans: x0, x1, y0, y1
 uniform int uSpecies;
 uniform int uPass;          // 0 body, 1 fins
 uniform vec3 uEye;          // local x, y, radius
@@ -547,7 +560,18 @@ void main() {
     float fres = pow(1.0 - abs(dot(n, view)), 2.0);
     vec3 col;
     float alpha = 1.0;
-    if (uPass == 0) {
+    if (uMesh == 1) {
+        // The side photo, projected straight across onto both flanks; the mesh's own
+        // colours where the surface turns away from the side (face, back, belly)
+        vec2 uv = vec2((vLocal.x - uBox.x) / (uBox.y - uBox.x), (uBox.w - vLocal.y) / (uBox.w - uBox.z));
+        vec4 ph = texture(uPhoto, uv);
+        float side = smoothstep(0.45, 0.8, abs(normalize(vLocalN).z)) * ph.a;
+        vec3 alb = mix(vUv, ph.rgb, side) * (0.93 + 0.14 * vSeed);
+        // The photo has its own shading baked in, so light it more gently
+        vec3 lit = shade(alb, n, vWorld, 0.35, 40.0, 0.0);
+        col = mix(lit, alb * (0.55 + 0.6 * depthLight(vWorld.y)), 0.45);
+        col += alb * fres * 0.2 * depthLight(vWorld.y);
+    } else if (uPass == 0) {
         float spec;
         vec3 alb = bodyColor(vUv.x, vUv.y, fres, spec);
         vec2 sq = vec2(vUv.x * 70.0, vUv.y * 16.0);
@@ -656,8 +680,9 @@ def _interp(points, u):
 
 class Species:
     def __init__(self, index, name, count, length, speed, burst, zone, school, wave_k, amp,
-                 beat, turn, profile, eye, iris, fins):
+                 beat, turn, profile, eye, iris, fins, mesh=None):
         self.index = index
+        self.mesh = mesh                # a Reef Glass fish (NAME.mesh + NAME.png in DATA_DIR)
         self.name = name
         self.count = count
         self.length = length            # body length in tank units (1 unit is ~4 cm)
@@ -675,26 +700,28 @@ class Species:
         self.fins = fins
 
     def shape(self, u):
+        if not self.profile:
+            return 0.1, 0.05, 0.0
         h, w, c = _interp(self.profile, u)
         return max(h, 0.002), max(w, 0.002), c
 
 
 SPECIES = [
-    Species(0, "neon tetra", 22, 0.95, 1.05, 2.8, (1.8, 7.5), True, 4.6, 0.075, 2.2, 3.2,
+    Species(0, "neon tetra", 18, 0.95, 1.05, 2.8, (1.8, 7.5), True, 4.6, 0.075, 2.2, 3.2,
             [(0, 0.004, 0.003, 0), (0.02, 0.045, 0.03, 0), (0.1, 0.095, 0.058, 0.0),
              (0.32, 0.125, 0.066, 0.0), (0.58, 0.1, 0.052, -0.005), (0.8, 0.055, 0.03, 0),
              (0.93, 0.04, 0.018, 0), (1.0, 0.045, 0.01, 0)],
             (0.085, 0.3, 0.032), (0.55, 0.65, 0.75),
             dict(tail=(0.26, 0.15, 0.6, 0.0), dorsal=(0.38, 0.52, 0.14, 0.5, 0.25),
                  anal=(0.55, 0.8, 0.09, 0.4, 0.2), pect=(0.2, 0.12))),
-    Species(1, "harlequin rasbora", 12, 1.05, 0.9, 2.4, (2.5, 8.5), True, 4.4, 0.07, 2.0, 3.0,
+    Species(1, "harlequin rasbora", 10, 1.05, 0.9, 2.4, (2.5, 8.5), True, 4.4, 0.07, 2.0, 3.0,
             [(0, 0.004, 0.003, 0), (0.02, 0.05, 0.03, 0), (0.1, 0.11, 0.055, 0.0),
              (0.35, 0.15, 0.06, 0.0), (0.6, 0.12, 0.05, -0.01), (0.82, 0.06, 0.03, 0),
              (0.94, 0.045, 0.016, 0), (1.0, 0.05, 0.01, 0)],
             (0.08, 0.3, 0.03), (0.75, 0.55, 0.35),
             dict(tail=(0.28, 0.17, 0.65, 0.0), dorsal=(0.42, 0.56, 0.15, 0.5, 0.25),
                  anal=(0.55, 0.78, 0.1, 0.4, 0.2), pect=(0.2, 0.12))),
-    Species(2, "dwarf gourami", 3, 1.55, 0.55, 1.6, (2.5, 8.0), False, 3.8, 0.05, 1.5, 1.6,
+    Species(2, "dwarf gourami", 2, 1.55, 0.55, 1.6, (2.5, 8.0), False, 3.8, 0.05, 1.5, 1.6,
             [(0, 0.005, 0.004, 0), (0.03, 0.08, 0.04, 0), (0.15, 0.2, 0.06, 0.0),
              (0.4, 0.24, 0.07, 0.0), (0.65, 0.18, 0.055, 0.0), (0.85, 0.09, 0.03, 0),
              (1.0, 0.065, 0.012, 0)],
@@ -715,7 +742,49 @@ SPECIES = [
             (0.14, 0.42, 0.03), (0.2, 0.2, 0.22),
             dict(tail=(0.26, 0.16, 0.5, 0.0), dorsal=(0.3, 0.42, 0.24, 0.3, 0.2),
                  anal=(0.68, 0.82, 0.08, 0.3, 0.3), pect=(0.18, 0.18))),
+    # Reef Glass's saltwater fish: name, count, length, speed, dash, zone, school,
+    # wave number, wave size, beats a second, turn rate
+    Species(5, "clownfish", 2, 1.85, 0.6, 1.6, (1.5, 7.0), False, 3.6, 0.06, 2.6, 2.4,
+            None, None, None, None, mesh="clown"),
+    Species(6, "blue tang", 1, 2.7, 0.9, 2.2, (2.5, 8.5), False, 3.0, 0.04, 1.8, 1.6,
+            None, None, None, None, mesh="bluetang"),
+    Species(7, "yellow tang", 2, 2.35, 0.8, 2.0, (2.5, 8.5), False, 3.0, 0.04, 2.0, 1.7,
+            None, None, None, None, mesh="yellowtang"),
+    Species(8, "blue damselfish", 6, 1.05, 0.75, 2.4, (2.0, 8.0), True, 4.0, 0.06, 3.0, 3.0,
+            None, None, None, None, mesh="damsel"),
+    Species(9, "royal gramma", 2, 1.15, 0.45, 1.6, (1.0, 5.5), False, 4.0, 0.06, 2.6, 2.6,
+            None, None, None, None, mesh="gramma"),
+    Species(10, "pufferfish", 1, 2.4, 0.35, 0.9, (2.0, 7.5), False, 2.6, 0.02, 2.2, 1.2,
+            None, None, None, None, mesh="puffer"),
 ]
+
+
+
+
+def _mesh_files(sp):
+    return (os.path.join(DATA_DIR, sp.mesh + ".mesh"), os.path.join(DATA_DIR, sp.mesh + ".png"))
+
+
+def active_species():
+    """The built-in fish, plus the Reef Glass ones whose files are installed."""
+    return [sp for sp in SPECIES if not sp.mesh or all(os.path.exists(f) for f in _mesh_files(sp))]
+
+
+def load_mesh(sp):
+    """A prepared Reef Glass fish: (MeshData, photo box)."""
+    path, _png = _mesh_files(sp)
+    with open(path, "rb") as f:
+        raw = f.read()
+    if raw[:4] != b"FTM1":
+        raise ValueError(f"{path}: not a fish mesh")
+    nv, ni = struct.unpack_from("<II", raw, 4)
+    box = struct.unpack_from("<4f", raw, 12)
+    off = 28
+    m = MeshData()
+    m.stride = 9
+    m.verts = array("f", raw[off:off + nv * 36])
+    m.idx = array("I", raw[off + nv * 36:off + nv * 36 + ni * 4])
+    return m, box
 
 
 # ---------------------------------------------------------------- meshes
@@ -1068,10 +1137,11 @@ class Tank:
 
         # Fish
         self.fish = []
-        for sp in SPECIES:
+        self.species = active_species()
+        for sp in self.species:
             for _ in range(sp.count):
                 self.fish.append(Fish(sp, self, rng))
-        self.school_targets = {sp.index: self.random_point(sp, rng) for sp in SPECIES if sp.school}
+        self.school_targets = {sp.index: self.random_point(sp, rng) for sp in self.species if sp.school}
         self.school_timers = {k: rng.uniform(5, 10) for k in self.school_targets}
 
         # Bubbles from an air stone behind a rock; specks drifting everywhere
@@ -1103,7 +1173,7 @@ class Tank:
         for key in self.school_timers:
             self.school_timers[key] -= dt
             if self.school_timers[key] <= 0:
-                sp = SPECIES[key]
+                sp = SPECIES[key]  # (indices match)
                 self.school_targets[key] = self.random_point(sp, rng)
                 self.school_timers[key] = rng.uniform(6, 14)
         fish = self.fish
@@ -1383,8 +1453,15 @@ class _GL:
 
         # Fish, one mesh per species
         self.fish_meshes = []
-        for sp in SPECIES:
-            m, body = fish_mesh(sp)
+        self.textures = []
+        for sp in tank.species:
+            tex, box = None, None
+            if sp.mesh:
+                m, box = load_mesh(sp)
+                body = len(m.idx)
+                tex = self._texture(_mesh_files(sp)[1])
+            else:
+                m, body = fish_mesh(sp)
             vao = self._vao()
             self._buffer(GL.GL_ARRAY_BUFFER, _floats(m.verts))
             self._attr(0, 3, 9, 0)
@@ -1395,7 +1472,7 @@ class _GL:
             self._attr(3, 4, 12, 0, 1)
             self._attr(4, 4, 12, 4, 1)
             self._attr(5, 4, 12, 8, 1)
-            self.fish_meshes.append((vao, inst, body, len(m.idx)))
+            self.fish_meshes.append((sp, vao, inst, body, len(m.idx), tex, box))
 
         # Sprites
         self.sprite_vao = self._vao()
@@ -1405,6 +1482,21 @@ class _GL:
         self._attr(1, 4, 4, 0, 1)
         GL.glBindVertexArray(0)
         self.scene_ready = True
+
+    def _texture(self, path):
+        from PIL import Image
+        im = Image.open(path).convert("RGBA")
+        t = GL.glGenTextures(1)
+        GL.glBindTexture(GL.GL_TEXTURE_2D, t)
+        GL.glTexImage2D(GL.GL_TEXTURE_2D, 0, GL.GL_RGBA8, im.width, im.height, 0, GL.GL_RGBA,
+                        GL.GL_UNSIGNED_BYTE, im.tobytes())
+        GL.glGenerateMipmap(GL.GL_TEXTURE_2D)
+        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MIN_FILTER, GL.GL_LINEAR_MIPMAP_LINEAR)
+        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MAG_FILTER, GL.GL_LINEAR)
+        for k in (GL.GL_TEXTURE_WRAP_S, GL.GL_TEXTURE_WRAP_T):
+            GL.glTexParameteri(GL.GL_TEXTURE_2D, k, GL.GL_CLAMP_TO_EDGE)
+        self.textures.append(t)
+        return t
 
     def ensure_fbo(self, w, h):
         if self.fbo_size == (w, h) and self.fbo is not None:
@@ -1449,6 +1541,8 @@ class _GL:
         self.free_fbo()
         for p in self.programs.values():
             GL.glDeleteProgram(p.id)
+        if getattr(self, "textures", None):
+            GL.glDeleteTextures(len(self.textures), self.textures)
         if self.buffers:
             GL.glDeleteBuffers(len(self.buffers), self.buffers)
         if self.vaos:
@@ -1521,20 +1615,28 @@ class _GL:
                 GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA)
                 GL.glDepthMask(GL.GL_FALSE)
             GL.glUniform1i(p.u("uPass"), pass_)
-            for sp, (vao, inst, body, total) in zip(SPECIES, self.fish_meshes):
+            for sp, vao, inst, body, total, tex, box in self.fish_meshes:
                 data = per.get(sp.index)
-                if not data:
+                if not data or (pass_ and total == body):
                     continue
                 GL.glBindVertexArray(vao)
                 if not pass_:
                     GL.glBindBuffer(GL.GL_ARRAY_BUFFER, inst)
                     raw = _floats(data)
                     GL.glBufferData(GL.GL_ARRAY_BUFFER, len(raw), raw, GL.GL_DYNAMIC_DRAW)
-                h_, w_, c_ = sp.shape(sp.eye[0])
                 GL.glUniform1i(p.u("uSpecies"), sp.index)
                 GL.glUniform1f(p.u("uWaveK"), sp.wave_k)
-                GL.glUniform3f(p.u("uEye"), 0.5 - sp.eye[0], c_ + h_ * sp.eye[1], sp.eye[2])
-                GL.glUniform3f(p.u("uIris"), *sp.iris)
+                GL.glUniform1i(p.u("uMesh"), 1 if tex else 0)
+                if tex:
+                    GL.glActiveTexture(GL.GL_TEXTURE1)
+                    GL.glBindTexture(GL.GL_TEXTURE_2D, tex)
+                    GL.glUniform1i(p.u("uPhoto"), 1)
+                    GL.glUniform4f(p.u("uBox"), *box)
+                    GL.glActiveTexture(GL.GL_TEXTURE0)
+                else:
+                    h_, w_, c_ = sp.shape(sp.eye[0])
+                    GL.glUniform3f(p.u("uEye"), 0.5 - sp.eye[0], c_ + h_ * sp.eye[1], sp.eye[2])
+                    GL.glUniform3f(p.u("uIris"), *sp.iris)
                 n = len(data) // 12
                 if pass_ == 0:
                     GL.glDrawElementsInstanced(GL.GL_TRIANGLES, body, GL.GL_UNSIGNED_INT, None, n)
