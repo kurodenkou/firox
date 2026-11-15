@@ -5,7 +5,10 @@ Each NAME.conf is one screen saver:
     NAME=Aquarium                 shown in the list
     COMMAND=asciiquarium          run full screen in a black terminal
     TERMINAL=false                optional: COMMAND opens its own window
-                                  (make it full screen yourself)
+                                  (make it full screen yourself; include
+                                  --app-id=firox-screensaver in COMMAND so
+                                  it can be found and stopped, as
+                                  fishtank.conf does)
 
 Add your own in ~/.local/share/firox/screensavers/ (just for you) or
 /etc/firox/screensavers/ (everyone). A file with the same name as one here

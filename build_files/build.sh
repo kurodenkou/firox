@@ -133,6 +133,7 @@ PACKAGES=(
     cmatrix
     cbonsai
     vte291                       # screen savers on every monitor; firox-terminal
+    python3-pyopengl             # the Fish Tank screen saver (OpenGL)
     pavucontrol                  # Sounds and Audio Devices
     alsa-tools                   # hda-verb, for `ujust fix-realtek-audio`
     network-manager-applet       # tray icon
