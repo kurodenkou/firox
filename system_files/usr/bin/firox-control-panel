@@ -281,6 +281,24 @@ class DateTimeDialog(Gtk.Dialog):
         subprocess.run(["timedatectl", "set-ntp", "true" if self.ntp.get_active() else "false"])
 
 
+def managed_kv(name):
+    """KEY=VALUE settings a policy (firox-policy) sets: power.conf or
+    desktop.conf in /var/lib/firox/policy ({} when none)."""
+    out = {}
+    try:
+        with open(os.path.join("/var/lib/firox/policy", name)) as fh:
+            for line in fh:
+                k, sep, v = line.strip().partition("=")
+                if sep:
+                    out[k] = v
+    except OSError:
+        pass
+    return out
+
+
+MANAGED_NOTE = "Settings your organization's policy sets are greyed out."
+
+
 class AppearanceDialog(Gtk.Dialog):
     """Pick the desktop theme; the layout stays the same, only the look changes."""
 
@@ -310,6 +328,7 @@ class AppearanceDialog(Gtk.Dialog):
                              f"<small>{GLib.markup_escape_text(conf.get('DESCRIPTION', ''))}</small>")
             radio.add(label)
             radio.set_active(name == current)
+            radio.set_sensitive("Theme" not in managed_kv("desktop.conf"))
             radio.connect("toggled", lambda r, n=name: r.get_active() and setattr(self, "choice", n))
             box.pack_start(radio, False, False, 0)
 
@@ -329,6 +348,10 @@ class AppearanceDialog(Gtk.Dialog):
         hint = Gtk.Label(xalign=0)
         hint.set_markup("<small>Match the look: dark with Modern, light with Classic and Glass.</small>")
         box.pack_start(hint, False, False, 0)
+        if "Theme" in managed_kv("desktop.conf"):
+            note = Gtk.Label(label="Your organization's policy sets the look.", xalign=0)
+            note.get_style_context().add_class("dim-label")
+            box.pack_start(note, False, False, 0)
         self.theme_before = current
         self.show_all()
 
@@ -412,6 +435,9 @@ class ScreenSaverDialog(Gtk.Dialog):
         for m in choices:
             self.wait.append(str(m), minutes_label(m))
         self.wait.set_active_id(str(self.before_wait))
+        if "SCREENSAVER_WAIT" in managed_kv("power.conf"):
+            self.wait.set_sensitive(False)
+            self.wait.set_tooltip_text("Your organization's policy sets this.")
         grid.attach(self.wait, 1, 1, 1, 1)
         box.pack_start(grid, False, False, 0)
 
@@ -1606,6 +1632,11 @@ class PowerDialog(Gtk.Dialog):
         header.pack_start(intro, True, True, 0)
         box.pack_start(header, False, False, 0)
 
+        self.managed = managed_kv("power.conf")
+        if self.managed:
+            note = Gtk.Label(label=MANAGED_NOTE, xalign=0)
+            note.get_style_context().add_class("dim-label")
+            box.pack_start(note, False, False, 0)
         self.values = {}
         for line in run_text(["firox-power"]).splitlines():
             if "=" in line and not line.startswith("#"):
@@ -1632,6 +1663,7 @@ class PowerDialog(Gtk.Dialog):
 
         wake = Gtk.CheckButton(label="Ask for my password when the computer wakes up")
         wake.set_active(self.values.get("LOCK_ON_WAKE", 1) == 1)
+        wake.set_sensitive("LOCK_ON_WAKE" not in self.managed)
         wake.connect("toggled", lambda b: self.values.__setitem__("LOCK_ON_WAKE", int(b.get_active())))
         box.pack_start(wake, False, False, 0)
 
@@ -1683,6 +1715,7 @@ class PowerDialog(Gtk.Dialog):
             c.append(str(m), minutes_label(m))
         c.set_active_id(str(cur))
         c.connect("changed", lambda w: self.values.__setitem__(key, int(w.get_active_id())))
+        c.set_sensitive(key not in self.managed)
         return c
 
     def apply(self):

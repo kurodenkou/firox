@@ -371,7 +371,18 @@ class Daemon:
                 p.terminate()
 
 
+def policy_forbids():
+    """A policy (firox-policy) doesn't allow Sync on this computer."""
+    try:
+        with open("/var/lib/firox/policy/managed.json") as fh:
+            return (json.load(fh).get("settings") or {}).get("sync.allowed") is False
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
 def run_daemon():
+    if policy_forbids():
+        return 0
     import gi
     gi.require_version("Gtk", "3.0")
     from gi.repository import GLib, Gtk
@@ -398,6 +409,9 @@ def poke_daemon():
 
 
 def set_enabled(on):
+    if on and policy_forbids():
+        print("Your organization's policy doesn't allow Sync on this computer.", file=sys.stderr)
+        return False
     conf = load_conf()
     conf["enabled"] = bool(on)
     save_conf(conf)
@@ -437,7 +451,8 @@ def ui():
 
             on_row = Gtk.Box(spacing=10)
             self.switch = Gtk.Switch(valign=Gtk.Align.CENTER)
-            self.switch.set_active(self.conf.get("enabled", False))
+            self.switch.set_active(self.conf.get("enabled", False) and not policy_forbids())
+            self.switch.set_sensitive(not policy_forbids())
             self.switch.connect("notify::active", self.on_switch)
             on_row.pack_start(self.switch, False, False, 0)
             self.on_label = Gtk.Label(xalign=0, wrap=True)
@@ -498,7 +513,8 @@ def ui():
         def sync_enabled_state(self):
             on = self.switch.get_active()
             self.on_label.set_markup(f"<b>Sync is {'on' if on else 'off'}.</b> This computer is "
-                                     f"\"{GLib.markup_escape_text(computer_name())}\".")
+                                     f"\"{GLib.markup_escape_text(computer_name())}\"."
+                                     + (" Your organization's policy doesn't allow Sync here." if policy_forbids() else ""))
             self.body.set_sensitive(on)
 
         def on_switch(self, sw, _p):
@@ -677,6 +693,9 @@ def main(argv):
     if cmd == "daemon":
         return run_daemon()
     if cmd in ("on", "off"):
+        if cmd == "on" and policy_forbids():
+            print("Your organization's policy doesn't allow Sync on this computer.", file=sys.stderr)
+            return 1
         set_enabled(cmd == "on")
         return 0
     if cmd == "status":

@@ -7,6 +7,9 @@ adding a setting means adding one entry here.
 
     kind "bool"     True/False             (On / Off in the editor)
     kind "minutes"  a whole number in [low, high]
+    kind "number"   the same, counting something else (unit says what)
+    kind "choice"   one of choices [(value, label)]
+    kind "timezone" a time zone name, e.g. America/Chicago
     kind "url"      an http:// or https:// address
     kind "image"    an https:// address of a picture, or a path on the computers
 
@@ -39,6 +42,10 @@ FIREFOX_POLICIES = "/etc/firefox/policies/policies.json"
 # there isn't one, the first version seen is kept here
 FIREFOX_DEFAULT = "/usr/etc/firefox/policies/policies.json"
 FIREFOX_SAVED = os.path.join(STATE_DIR, "firefox-policies.default.json")
+FIREFOX_MANAGED = os.path.join(STATE_DIR, "firefox-managed.json")    # each Firefox setting's part
+PWQUALITY = "/etc/security/pwquality.conf.d/50-firox-policy.conf"
+USB_BLOCK = "/etc/modprobe.d/firox-policy-usb-storage.conf"
+ZONEINFO = "/usr/share/zoneinfo"
 MAX_WALLPAPER = 40 << 20
 
 # The same timers Security Center checks (whichever this image has)
@@ -92,6 +99,11 @@ def write_power(key, value):
 def restart_idle_timers():
     """Apply power settings in every graphical session now (firox-power
     start, as each user), rather than at their next login."""
+    run_in_sessions("firox-power", "start")
+
+
+def run_in_sessions(*cmd):
+    """Run a command as each logged-in user, in their desktop session."""
     try:
         out = run("loginctl", "list-sessions", "--no-legend", check=False).stdout
     except (OSError, subprocess.SubprocessError):
@@ -109,15 +121,17 @@ def restart_idle_timers():
         if not sockets:
             continue
         subprocess.run(["runuser", "-u", user, "--", "env", f"XDG_RUNTIME_DIR={runtime}",
-                        f"WAYLAND_DISPLAY={sockets[0]}", "firox-power", "start"],
-                       capture_output=True, timeout=30)
+                        f"WAYLAND_DISPLAY={sockets[0]}",
+                        f"DBUS_SESSION_BUS_ADDRESS=unix:path={runtime}/bus"] + list(cmd),
+                       capture_output=True, timeout=60)
 
 
 class Policy:
     def __init__(self, key, category, title, description, kind, apply, on_label="On", off_label="Off",
-                 low=None, high=None, unit=None, release=None, placeholder=""):
+                 low=None, high=None, unit=None, release=None, placeholder="", choices=()):
         self.key, self.category, self.title, self.description, self.kind = key, category, title, description, kind
         self.placeholder = placeholder
+        self.choices = list(choices)
         self._apply, self._release = apply, release
         self.on_label, self.off_label = on_label, off_label
         self.low, self.high, self.unit = low, high, unit
@@ -127,9 +141,17 @@ class Policy:
         if self.kind == "bool":
             if not isinstance(value, bool):
                 raise PolicyError(f"{self.key} must be true or false")
-        elif self.kind == "minutes":
+        elif self.kind in ("minutes", "number"):
             if not isinstance(value, int) or isinstance(value, bool) or not self.low <= value <= self.high:
                 raise PolicyError(f"{self.key} must be a whole number from {self.low} to {self.high}")
+        elif self.kind == "choice":
+            if value not in [v for v, _l in self.choices]:
+                raise PolicyError(f"{self.key} must be one of " + ", ".join(v for v, _l in self.choices))
+        elif self.kind == "timezone":
+            import re
+            if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_+\-]*(/[A-Za-z0-9_+\-]+)*", value) \
+                    or not os.path.isfile(os.path.join(ZONEINFO, value)):
+                raise PolicyError(f"{self.key} must be a time zone such as America/Chicago")
         elif self.kind == "url":
             if not isinstance(value, str) or not value.startswith(("https://", "http://")) or len(value) > 2000 \
                     or any(c.isspace() for c in value):
@@ -143,8 +165,12 @@ class Policy:
     def describe(self, value):
         if self.kind == "bool":
             return self.on_label if value else self.off_label
-        if self.kind in ("url", "image"):
+        if self.kind in ("url", "image", "timezone"):
             return str(value)
+        if self.kind == "choice":
+            return dict(self.choices).get(value, str(value))
+        if value == 0 and self.low == 0 and self.kind == "minutes":
+            return "Never"
         return f"{value} {self.unit or ''}".strip()
 
     def apply(self, value):
@@ -259,35 +285,181 @@ def firefox_default():
         return {"policies": {}}, None
 
 
-def apply_homepage(url):
-    """Firefox's enterprise policy: the image's policies plus a locked home
-    page. Rebuilt from the image's copy each time, so its updates still
-    arrive. Firefox reads it when it starts."""
+def firefox_part(key, part):
+    """Set (or with None, drop) one policy setting's part of Firefox's
+    enterprise policies, then rebuild the file: the image's policies plus
+    every part in force. With no parts left it's the image's own file again,
+    byte for byte, so updates to it keep arriving. Firefox reads it when it
+    starts."""
     import json
-    base, _src = firefox_default()
-    policies = dict(base.get("policies") or {})
-    policies["Homepage"] = {"URL": url, "Locked": True, "StartPage": "homepage"}
+    import shutil
+    try:
+        with open(FIREFOX_MANAGED) as fh:
+            parts = json.load(fh)
+    except (OSError, ValueError):
+        parts = {}
+    if part is None:
+        parts.pop(key, None)
+    else:
+        parts[key] = part
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(FIREFOX_MANAGED, "w") as fh:
+        json.dump(parts, fh, indent=1)
+    base, src = firefox_default()
     os.makedirs(os.path.dirname(FIREFOX_POLICIES), exist_ok=True)
+    if not parts:
+        if src:
+            shutil.copyfile(src, FIREFOX_POLICIES)
+            os.chmod(FIREFOX_POLICIES, 0o644)
+        return
+    policies = json.loads(json.dumps(base.get("policies") or {}))     # a copy
+    for k in sorted(parts):
+        for name, value in parts[k].items():
+            if isinstance(value, dict) and isinstance(policies.get(name), dict):
+                policies[name] = dict(policies[name], **value)        # e.g. ExtensionSettings
+            else:
+                policies[name] = value
     tmp = FIREFOX_POLICIES + ".tmp"
     with open(tmp, "w") as fh:
         json.dump(dict(base, policies=policies), fh, indent=2)
         fh.write("\n")
     os.chmod(tmp, 0o644)
     os.replace(tmp, FIREFOX_POLICIES)
+
+
+def firefox_policy(key, title, description, make, on_label="Allowed", off_label="Not allowed"):
+    """A Firefox setting: make(value) is its part of Firefox's policies."""
+    def apply(value):
+        firefox_part(key, make(value))
+        return f"Firefox: {title.lower()} {on_label.lower() if value else off_label.lower()} (at its next start)"
+    return Policy(key, "Applications/Firefox", title, description, "bool", apply,
+                  on_label=on_label, off_label=off_label, release=lambda: firefox_part(key, None))
+
+
+def apply_homepage(url):
+    firefox_part("firefox.homepage", {"Homepage": {"URL": url, "Locked": True, "StartPage": "homepage"}})
     return f"Firefox home page {url} (at Firefox's next start)"
 
 
 def release_homepage():
-    """Back to the image's own file, byte for byte (so updates to it keep
-    arriving)."""
-    import shutil
-    _base, src = firefox_default()
-    if src:
-        shutil.copyfile(src, FIREFOX_POLICIES)
-        os.chmod(FIREFOX_POLICIES, 0o644)
+    firefox_part("firefox.homepage", None)
+
+
+# ---- more settings
+
+def power_setting(*keys):
+    """Minutes (0 = never) for firox-power's keys, over Settings."""
+    def apply(minutes):
+        for k in keys:
+            write_power(k, minutes)
+        restart_idle_timers()
+        return ", ".join(keys) + f" = {minutes}"
+
+    def release():
+        for k in keys:
+            write_power(k, None)
+        restart_idle_timers()
+    return apply, release
+
+
+def apply_lock_on_wake(on):
+    write_power("LOCK_ON_WAKE", 1 if on else 0)
+    restart_idle_timers()
+    return "locks when waking from sleep" if on else "doesn't lock on waking"
+
+
+def release_lock_on_wake():
+    write_power("LOCK_ON_WAKE", None)
+    restart_idle_timers()
+
+
+def apply_timezone(zone):
+    run("timedatectl", "set-timezone", zone)
+    return f"time zone {zone}"
+
+
+def apply_ntp(on):
+    run("timedatectl", "set-ntp", "true" if on else "false")
+    return "network time on" if on else "network time off"
+
+
+def apply_password_length(n):
+    os.makedirs(os.path.dirname(PWQUALITY), exist_ok=True)
+    with open(PWQUALITY, "w") as fh:
+        fh.write(f"# Set by a Firox policy (firox-policy)\nminlen = {n}\n")
+    os.chmod(PWQUALITY, 0o644)
+    return f"new passwords need {n} characters"
+
+
+def release_password_length():
+    try:
+        os.unlink(PWQUALITY)
+    except OSError:
+        pass
+
+
+def apply_usb_storage(allowed):
+    if allowed:
+        release_usb_storage()
+        return "USB drives allowed"
+    os.makedirs(os.path.dirname(USB_BLOCK), exist_ok=True)
+    with open(USB_BLOCK, "w") as fh:
+        fh.write("# Set by a Firox policy (firox-policy): no USB drives\n"
+                 "install usb_storage /bin/false\ninstall uas /bin/false\n")
+    os.chmod(USB_BLOCK, 0o644)
+    # Drives already plugged in keep working until they're unplugged
+    run("modprobe", "-r", "uas", "usb_storage", check=False)
+    return "USB drives blocked (from the next one plugged in)"
+
+
+def release_usb_storage():
+    try:
+        os.unlink(USB_BLOCK)
+    except OSError:
+        pass
+
+
+def apply_bluetooth(on):
+    if not unit_exists("bluetooth.service"):
+        raise PolicyError("no Bluetooth service on this computer")
+    return set_unit("bluetooth.service", on)
+
+
+def apply_virus_definitions(on):
+    if not unit_exists("clamav-freshclam.service"):
+        raise PolicyError("no virus definition service on this computer")
+    return set_unit("clamav-freshclam.service", on)
+
+
+def apply_theme(name):
+    write_kv(MANAGED_DESKTOP, "Theme", name)
+    run_in_sessions("firox-theme", "set", name)
+    return f"the {name} look"
+
+
+def release_theme():
+    write_kv(MANAGED_DESKTOP, "Theme", None)
+    # Everyone's own look again
+    run_in_sessions("sh", "-c", 'firox-theme set "$(firox-theme)"')
+
+
+def apply_sync(allowed):
+    if not allowed:
+        run("pkill", "-f", "firox-sync daemon", check=False)
+    return "allowed" if allowed else "not allowed (running syncs stopped)"
+
+
+SCREENSAVER = power_setting("SCREENSAVER_WAIT")
+MONITOR = power_setting("MONITOR_AC", "MONITOR_BATTERY")
+SLEEP = power_setting("SLEEP_AC", "SLEEP_BATTERY")
 
 
 POLICIES = [
+    Policy("time.timezone", "System", "Time zone",
+           "The computers' time zone, e.g. America/Chicago or Europe/London.",
+           "timezone", apply_timezone, placeholder="America/Chicago"),
+    Policy("time.ntp", "System", "Network time",
+           "Keep the clock right by asking time servers on the internet.", "bool", apply_ntp),
     Policy("updates.automatic", "System", "Automatic updates",
            "Download and install Firox Linux updates by itself. Off is for computers you update by hand.",
            "bool", apply_updates),
@@ -301,6 +473,34 @@ POLICIES = [
            "Lock the screen after this many minutes without use. People can't make it longer or turn it "
            "off in Settings.",
            "minutes", apply_lock, low=1, high=240, unit="minutes", release=release_lock),
+    Policy("screen.lock_on_wake", "Security", "Lock when waking from sleep",
+           "Ask for the password when the computer wakes up.", "bool", apply_lock_on_wake,
+           release=release_lock_on_wake),
+    Policy("password.min_length", "Security", "Minimum password length",
+           "New passwords must be at least this long (when people change their password).",
+           "number", apply_password_length, low=6, high=64, unit="characters", release=release_password_length),
+    Policy("virus.definitions", "Security", "Virus definition updates",
+           "Keep Virus Scan's virus definitions up to date (downloaded every two hours).",
+           "bool", apply_virus_definitions),
+    Policy("power.screensaver_minutes", "Power", "Screen saver",
+           "Start the screen saver after this many idle minutes (0 = never). People can't change it.",
+           "minutes", SCREENSAVER[0], low=0, high=240, unit="minutes", release=SCREENSAVER[1]),
+    Policy("power.monitor_off_minutes", "Power", "Turn off the screen",
+           "Turn the screen off after this many idle minutes (0 = never), plugged in or on battery.",
+           "minutes", MONITOR[0], low=0, high=480, unit="minutes", release=MONITOR[1]),
+    Policy("power.sleep_minutes", "Power", "Sleep",
+           "Put the computer to sleep after this many idle minutes (0 = never), plugged in or on battery.",
+           "minutes", SLEEP[0], low=0, high=1440, unit="minutes", release=SLEEP[1]),
+    Policy("devices.usb_storage", "Devices", "USB drives",
+           "Whether USB drives (memory sticks, external disks) can be used. Blocked takes effect from the "
+           "next drive plugged in; keyboards, mice and other USB devices aren't affected.",
+           "bool", apply_usb_storage, on_label="Allowed", off_label="Blocked", release=release_usb_storage),
+    Policy("devices.bluetooth", "Devices", "Bluetooth",
+           "Turn Bluetooth on or off (headphones, mice, phones).", "bool", apply_bluetooth),
+    Policy("desktop.theme", "Desktop", "Look",
+           "The desktop's look for everyone. People can't switch it in Settings.",
+           "choice", apply_theme, release=release_theme,
+           choices=[("classic", "Classic"), ("modern", "Modern"), ("glass", "Glass")]),
     Policy("desktop.wallpaper", "Desktop", "Wallpaper",
            "The desktop and lock screen picture. People can't change it. An https:// address is downloaded "
            "by each computer; a path must already be on them (e.g. /usr/share/backgrounds/...).",
@@ -310,6 +510,29 @@ POLICIES = [
            "The page Firefox opens at start and with the Home button. People can't change it. Firefox "
            "picks it up the next time it starts.",
            "url", apply_homepage, release=release_homepage, placeholder="https://intranet.example.com"),
+    firefox_policy("firefox.private_browsing", "Private browsing",
+                   "Whether Firefox's private windows can be opened.",
+                   lambda v: {"DisablePrivateBrowsing": not v}),
+    firefox_policy("firefox.about_config", "about:config",
+                   "Whether Firefox's advanced settings page (about:config) can be opened.",
+                   lambda v: {"BlockAboutConfig": not v}),
+    firefox_policy("firefox.password_manager", "Saving passwords",
+                   "Whether Firefox offers to save passwords.",
+                   lambda v: {"PasswordManagerEnabled": v, "OfferToSaveLogins": v}),
+    firefox_policy("firefox.developer_tools", "Developer tools",
+                   "Whether Firefox's developer tools can be opened.",
+                   lambda v: {"DisableDeveloperTools": not v}),
+    firefox_policy("firefox.addons", "Installing add-ons",
+                   "Whether people can install Firefox add-ons. Firox's own (web apps) stays either way.",
+                   lambda v: {"ExtensionSettings": {"*": {"installation_mode": "allowed"} if v else {
+                       "installation_mode": "blocked",
+                       "blocked_install_message": "Your organization's policy doesn't allow installing add-ons."}}}),
+    firefox_policy("firefox.dns_over_https", "DNS over HTTPS",
+                   "Whether Firefox looks up web addresses over an encrypted connection. Locked either way.",
+                   lambda v: {"DNSOverHTTPS": {"Enabled": v, "Locked": True}}, on_label="On", off_label="Off"),
+    Policy("sync.allowed", "Applications/Firox Sync", "Syncing folders",
+           "Whether Firox Sync can keep folders the same between computers. Not allowed turns it off and "
+           "keeps it off.", "bool", apply_sync, on_label="Allowed", off_label="Not allowed"),
     Policy("stream.allowed", "Applications/Firox Stream", "Hosting",
            "Whether other computers may stream this one with Firox Stream. Not allowed turns it off and "
            "keeps it off; allowed leaves it to each person.",

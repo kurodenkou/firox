@@ -25,10 +25,16 @@ APPS_VERSION=2
 APPS_STAMP="${XDG_STATE_HOME:-$HOME/.local/state}/firox/theme-applied"
 DEFAULT_THEME="$(cat /etc/firox/theme 2>/dev/null || echo classic)"
 APPS_FILE="$CONF/firox/apps"
+MANAGED=/var/lib/firox/policy/desktop.conf     # a policy (firox-policy) may set the look
+
+managed_theme() {
+    sed -n 's/^Theme=//p' "$MANAGED" 2>/dev/null | tail -n1
+}
 
 current() {
     local t
-    t="$(cat "$STATE_FILE" 2>/dev/null || echo "$DEFAULT_THEME")"
+    t="$(managed_theme)"
+    [ -n "$t" ] || t="$(cat "$STATE_FILE" 2>/dev/null || echo "$DEFAULT_THEME")"
     [ -d "$THEMES/$t" ] || t=classic
     echo "$t"
 }
@@ -180,6 +186,11 @@ case "${1:-get}" in
         if [ -z "$t" ] || [ ! -d "$THEMES/$t" ]; then
             echo "usage: firox-theme set {$(ls -1 "$THEMES" | paste -sd '|')}" >&2
             exit 2
+        fi
+        m="$(managed_theme)"
+        if [ -n "$m" ] && [ "$t" != "$m" ]; then
+            echo "Your organization's policy sets the $m look." >&2
+            exit 1
         fi
         mkdir -p "$(dirname "$STATE_FILE")"
         echo "$t" > "$STATE_FILE"

@@ -232,7 +232,15 @@ def run(fp):
 
             off = Gtk.RadioButton.new_with_label(None, "Not configured (left to each person)")
             self.detail.add(off)
-            if pol.kind == "bool":
+            if pol.kind == "choice":
+                for v, label in pol.choices:
+                    b = Gtk.RadioButton.new_with_label_from_widget(off, label)
+                    b.set_active(value == v)
+                    b.connect("toggled", lambda b, v=v: b.get_active() and set_value(v))
+                    self.detail.add(b)
+                if value is None:
+                    off.set_active(True)
+            elif pol.kind == "bool":
                 on_b = Gtk.RadioButton.new_with_label_from_widget(off, pol.on_label)
                 off_b = Gtk.RadioButton.new_with_label_from_widget(off, pol.off_label)
                 self.detail.add(on_b)
@@ -244,7 +252,7 @@ def run(fp):
                 row = Gtk.Box(spacing=6)
                 set_b = Gtk.RadioButton.new_with_label_from_widget(off, "Set to")
                 row.add(set_b)
-                if pol.kind == "minutes":
+                if pol.kind in ("minutes", "number"):
                     field = Gtk.SpinButton.new_with_range(pol.low, pol.high, 1)
                     field.set_value(value if isinstance(value, int) else min(max(10, pol.low), pol.high))
                     current = lambda: int(field.get_value())       # noqa: E731
@@ -278,7 +286,7 @@ def run(fp):
                     field.connect("changed", typed)
                     row.add(field)
                 self.detail.add(row)
-                if pol.kind not in ("bool", "minutes"):
+                if pol.kind not in ("bool", "minutes", "number"):
                     self.detail.add(note)
                 set_b.set_active(value is not None)
                 field.set_sensitive(value is not None)
@@ -288,7 +296,7 @@ def run(fp):
                     if b.get_active():
                         v = current()
                         set_value(v)
-                        if pol.kind not in ("bool", "minutes"):
+                        if pol.kind not in ("bool", "minutes", "number"):
                             field.grab_focus()
                 set_b.connect("toggled", chosen)
             off.connect("toggled", lambda b: b.get_active() and set_value(None))
