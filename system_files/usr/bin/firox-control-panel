@@ -49,7 +49,7 @@ import firox_wallpaper  # noqa: E402
 APPLETS = [
     ("preferences-desktop-display", "Display", "Main display, resolution, scaling and multiple monitors",
      ["@display"]),
-    ("preferences-desktop-screensaver", "Screen Saver", "Aquarium, Matrix, Bonsai and more when idle",
+    ("preferences-desktop-screensaver", "Screen Saver", "Fish Tank, Matrix, Bonsai and more when idle",
      ["@screensaver"]),
     ("org.kde.plasma.clipboard", "Clipboard", "Copy and paste history (Super+V)", ["@clipboard"]),
     ("preferences-system-power", "Power Options", "Turn off the monitor and sleep when idle", ["@power"]),

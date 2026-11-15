@@ -1,0 +1,179 @@
+#!/usr/bin/python3
+"""
+Fish Tank: a planted aquarium drawn live with OpenGL (Control Panel > Screen
+Saver). Every monitor gets its own tank, laid out differently each time.
+
+    fishtank            full screen on every monitor, above everything
+    fishtank --window   in an ordinary window (for trying it out)
+
+firox-screensaver starts it with --app-id=firox-screensaver so that it can
+find and stop it. If OpenGL isn't available it shows the text aquarium
+(asciiquarium) instead.
+"""
+
+import os
+import sys
+
+WAYLAND = bool(os.environ.get("WAYLAND_DISPLAY")) and os.environ.get("GDK_BACKEND", "wayland") != "x11"
+if WAYLAND:
+    os.environ.setdefault("PYOPENGL_PLATFORM", "egl")      # GTK uses EGL on Wayland
+sys.path.insert(0, "/usr/lib/firox/python")
+
+import gi  # noqa: E402
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+from gi.repository import Gdk, GLib, Gtk  # noqa: E402
+
+try:
+    gi.require_version("GtkLayerShell", "0.1")
+    from gi.repository import GtkLayerShell  # noqa: E402
+except (ValueError, ImportError):
+    GtkLayerShell = None
+
+TEXT_SAVER = "/usr/libexec/firox/screensaver-window"
+
+
+def text_aquarium(reason):
+    print(f"fishtank: {reason}; showing the text aquarium instead", file=sys.stderr)
+    if os.access(TEXT_SAVER, os.X_OK):
+        os.execv(TEXT_SAVER, [TEXT_SAVER, "asciiquarium"])
+    sys.exit(1)
+
+
+try:
+    from OpenGL import GL  # noqa: E402
+    import firox_fishtank  # noqa: E402
+except ImportError as e:
+    text_aquarium(f"can't load OpenGL ({e})")
+
+
+class TankView(Gtk.GLArea):
+    def __init__(self, saver):
+        super().__init__()
+        self.saver = saver
+        self.tank = firox_fishtank.Tank()
+        self.ok = False
+        self.last = None
+        self.set_required_version(3, 3)
+        self.set_has_depth_buffer(False)
+        self.set_auto_render(False)
+        self.connect("realize", self.on_realize)
+        self.connect("unrealize", self.on_unrealize)
+        self.connect("render", self.on_render)
+        self.add_tick_callback(self.on_tick)
+
+    def on_realize(self, _area):
+        self.make_current()
+        if self.get_error() is not None:
+            self.saver.failed(f"no OpenGL 3.3 ({self.get_error().message})")
+            return
+        try:
+            self.tank.gl_init()
+            self.ok = True
+        except Exception as e:      # shader compile errors, missing extensions
+            self.saver.failed(f"OpenGL setup failed ({e})")
+
+    def on_unrealize(self, _area):
+        self.make_current()
+        if self.get_error() is None:
+            self.tank.gl_free()
+        self.ok = False
+
+    def on_tick(self, _widget, clock):
+        now = clock.get_frame_time() / 1e6
+        if self.last is not None:
+            self.tank.step(now - self.last)
+        self.last = now
+        if self.ok:
+            self.queue_render()
+        return GLib.SOURCE_CONTINUE
+
+    def on_render(self, _area, _ctx):
+        if not self.ok:
+            return True
+        scale = self.get_scale_factor()
+        self.tank.resize(self.get_allocated_width() * scale, self.get_allocated_height() * scale)
+        try:
+            target = GL.glGetIntegerv(GL.GL_DRAW_FRAMEBUFFER_BINDING)
+            self.tank.render(int(target))
+        except Exception as e:
+            self.ok = False
+            self.saver.failed(f"drawing failed ({e})")
+        return True
+
+
+class Saver:
+    def __init__(self, windowed):
+        self.windows = {}
+        self.views = []
+        display = Gdk.Display.get_default()
+        if display is None:
+            sys.exit("fishtank: no display")
+        layer = (not windowed and GtkLayerShell is not None and WAYLAND
+                 and GtkLayerShell.is_supported())
+        if windowed:
+            self.add(None, layer=False, windowed=True)
+            return
+        display.connect("monitor-added", lambda _d, m: self.add(m, layer))
+        display.connect("monitor-removed", lambda _d, m: self.remove(m))
+        for i in range(display.get_n_monitors()):
+            self.add(display.get_monitor(i), layer)
+
+    def add(self, monitor, layer, windowed=False):
+        win = Gtk.Window(title="Fish Tank")
+        if layer:
+            GtkLayerShell.init_for_window(win)
+            GtkLayerShell.set_namespace(win, "firox-screensaver")
+            GtkLayerShell.set_layer(win, GtkLayerShell.Layer.OVERLAY)
+            GtkLayerShell.set_monitor(win, monitor)
+            for edge in (GtkLayerShell.Edge.TOP, GtkLayerShell.Edge.BOTTOM,
+                         GtkLayerShell.Edge.LEFT, GtkLayerShell.Edge.RIGHT):
+                GtkLayerShell.set_anchor(win, edge, True)
+            GtkLayerShell.set_exclusive_zone(win, -1)
+            GtkLayerShell.set_keyboard_mode(win, GtkLayerShell.KeyboardMode.NONE)
+        elif windowed:
+            win.set_default_size(1280, 720)
+            win.connect("destroy", Gtk.main_quit)
+        else:
+            geo = monitor.get_geometry()
+            win.move(geo.x, geo.y)
+            win.set_default_size(geo.width, geo.height)
+            win.fullscreen()
+        view = TankView(self)
+        win.add(view)
+        if not windowed:
+            win.connect("realize", lambda w: w.get_window().set_cursor(
+                Gdk.Cursor.new_from_name(w.get_display(), "none")))
+        win.show_all()
+        self.windows[monitor] = win
+        self.views.append(view)
+
+    def remove(self, monitor):
+        win = self.windows.pop(monitor, None)
+        if win is not None:
+            win.destroy()
+
+    def failed(self, reason):
+        # One monitor that can't draw stays black; if none can, fall back
+        print(f"fishtank: {reason}", file=sys.stderr)
+        GLib.idle_add(self.check_any)
+
+    def check_any(self):
+        if not any(v.ok for v in self.views):
+            text_aquarium("OpenGL isn't working")
+        return False
+
+
+def main(argv):
+    args = [a for a in argv[1:] if not a.startswith("--app-id")]
+    if args and args[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        return 0
+    Saver(windowed="--window" in args)
+    Gtk.main()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
