@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Policy Editor
+GenericName=Group Policy
+Comment=Manage your Firox computers from one place with signed policies
+Exec=firox-policy
+Icon=preferences-system
+Categories=System;Settings;
+Keywords=policy;group policy;gpo;admin;manage;fleet;enroll;
+StartupNotify=false

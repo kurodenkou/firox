@@ -1463,7 +1463,19 @@ def notify(summary, body):
         pass
 
 
+def policy_forbids():
+    """A policy (firox-policy) doesn't allow streaming this computer."""
+    try:
+        with open("/var/lib/firox/policy/managed.json") as fh:
+            settings = json.load(fh).get("settings") or {}
+        return settings.get("stream.allowed") is False
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
 def run_daemon():
+    if policy_forbids():
+        return 0
     if not load_conf().get("enabled") and os.environ.get("FIROX_STREAM_FORCE") != "1":
         return 0
     os.makedirs(STATE_DIR, exist_ok=True)
@@ -1548,6 +1560,9 @@ def open_firewall(port):
 
 
 def set_enabled(on):
+    if on and policy_forbids():
+        print("Your organization's policy doesn't allow streaming this computer.", file=sys.stderr)
+        return False
     conf = load_conf()
     conf["enabled"] = bool(on)
     save_conf(conf)
@@ -2371,7 +2386,8 @@ def client_ui(address=None):
             box.add(self.status)
             box.add(Gtk.Separator(margin_top=6, margin_bottom=6))
             self.allow = Gtk.CheckButton(label="Let other computers stream this one")
-            self.allow.set_active(bool(load_conf().get("enabled")))
+            self.allow.set_active(bool(load_conf().get("enabled")) and not policy_forbids())
+            self.allow.set_sensitive(not policy_forbids())
             self.allow.connect("toggled", self.on_allow)
             box.add(self.allow)
             self.allow_note = Gtk.Label(xalign=0, wrap=True, max_width_chars=50)
@@ -2412,7 +2428,10 @@ def client_ui(address=None):
         def update_note(self):
             conf = load_conf()
             n = len(conf.get("clients", {}))
-            if conf.get("enabled"):
+            if policy_forbids():
+                self.allow_note.set_text("Your organization's policy doesn't allow other computers to stream "
+                                         "this one.")
+            elif conf.get("enabled"):
                 self.allow_note.set_text(
                     "Computers you've paired can stream this one whenever you're logged in. "
                     f"Paired: {n}. A new one needs the PIN this computer shows.")
@@ -2560,6 +2579,9 @@ def main(argv):
     if cmd == "daemon":
         return run_daemon()
     if cmd in ("on", "off"):
+        if cmd == "on" and policy_forbids():
+            print("Your organization's policy doesn't allow streaming this computer.", file=sys.stderr)
+            return 1
         set_enabled(cmd == "on")
         print(f"Streaming this computer is {cmd}.")
         return 0

@@ -190,6 +190,8 @@ def c_lock():
     title, icon = "Screen lock", "system-lock-screen"
     conf = kv_file("/etc/firox/power.conf")
     conf.update(kv_file(os.path.join(CONFIG, "power.conf")))
+    managed = kv_file("/var/lib/firox/policy/power.conf")      # set by a policy (firox-policy)
+    conf.update(managed)
 
     def num(k):
         try:
@@ -207,6 +209,9 @@ def c_lock():
                      "The screen locks when the computer goes to sleep, but not when it's left idle.", action)
     text = f"The screen locks after {mins} minute{'s' if mins != 1 else ''} without use"
     text += " and when the computer sleeps." if wake else "."
+    if "LOCK" in managed:
+        text += " Your organization's policy sets this."
+        action = []
     if mins > 30:
         return check("lock", title, icon, WARN, f"After {mins} min", text + " That's quite long.", action)
     return check("lock", title, icon, OK, "On", text + " Press Super+L to lock it yourself.")
@@ -348,7 +353,30 @@ def c_virus():
                  "or right-click them in Firox Explorer." + scanned, scan)
 
 
-CHECKS = [c_firewall, c_updates, c_virus, c_backup, c_lock, c_remote, c_encryption, c_secureboot, c_selinux]
+def c_policy():
+    """Managed by a policy (firox-policy): who, and whether it's up to date."""
+    status = None
+    try:
+        with open("/var/lib/firox/policy/managed.json") as fh:
+            status = json.load(fh)
+    except (OSError, ValueError):
+        pass
+    if not status:
+        return None
+    title, icon = "Managed by your organization", "preferences-system"
+    org = status.get("organization") or "your organization"
+    n = len(status.get("settings") or {})
+    text = (f"{org} manages {n} setting{'s' if n != 1 else ''} on this computer with a signed policy; "
+            "you can't change those yourself.")
+    actions = [("Details…", ["firox-terminal", "--title=Policy", "--hold", "-x", "firox-policy", "status"])]
+    if status.get("error"):
+        return check("policy", title, icon, WARN, "Check failed",
+                     f"{text} The last check for a new policy failed: {status['error']} "
+                     "The policy already applied stays in force.", actions)
+    return check("policy", title, icon, INFO, f"By {org}", text, actions)
+
+
+CHECKS = [c_policy, c_firewall, c_updates, c_virus, c_backup, c_lock, c_remote, c_encryption, c_secureboot, c_selinux]
 
 
 def ignored():
@@ -373,6 +401,8 @@ def all_checks():
         except Exception as err:  # noqa: BLE001
             name = fn.__name__[2:]
             r = check(name, name.title(), "dialog-question", INFO, "Unknown", f"Couldn't check: {err}")
+        if r is None:                       # doesn't apply here (e.g. not managed)
+            continue
         if r["state"] == WARN:
             if r["key"] in skip:
                 r["state"], r["ignored"] = INFO, True

@@ -500,6 +500,23 @@
 
 <div class="feature">
     <div class="feature-text">
+        <h3>Policy Editor: manage your computers from one place</h3>
+        <p>Set things once for every Firox computer you look after, without a server or a directory service.</p>
+<ul>
+    <li><b>Settings:</b> automatic updates, the firewall, remote login, how soon the screen locks, the wallpaper, Firefox's home page, and whether Firox Stream may be used, each either set and locked or left to each person. Sorted into folders like Group Policy, and more can be added later.</li>
+    <li><b>Signed:</b> computers apply only policies signed with your admin key, and never an older one, so a fake or replayed policy is refused.</li>
+    <li><b>Publish anywhere:</b> a web server, a git repository or a shared folder. Computers check every 30 minutes.</li>
+    <li><b>Private if you like:</b> policies can also be encrypted so only your computers can read them.</li>
+</ul>
+        <p class="tech">firox-policy: GnuPG-signed JSON (optionally encrypted), a systemd timer, firox_policies.py for the settings</p>
+    </div>
+    <figure>
+    <img src="screenshots/policy-editor.png" alt="The Policy Editor" loading="lazy">
+</figure>
+</div>
+
+<div class="feature">
+    <div class="feature-text">
         <h3>Firox Stream: play another computer from this one</h3>
         <p>Play the games on your desktop PC from a laptop on the sofa, or use one Firox computer from another.</p>
 <ul>

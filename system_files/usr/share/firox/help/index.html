@@ -46,6 +46,7 @@
   <a href="#backup">Backing up</a>
   <a href="#sync">Sync</a>
   <a href="#stream">Firox Stream</a>
+  <a href="#policy">Managing several computers</a>
   <a href="#restore">System Restore</a>
   <a href="#taskmgr">Task Manager</a>
   <a href="#terminal">Command Prompt</a>
@@ -182,6 +183,15 @@
 <p>Connecting wakes the other computer's screen: its monitors come back on and its screen saver goes away. While it's being streamed, its screen saver, lock, monitor-off and sleep timers wait, and they start again when you stop. <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>W</kbd> wakes its screen again if you need to.</p>
 <p>If the other computer is locked, Firox Stream says so. Press <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>U</kbd> and type the password of the account locked there: its lock screen checks it exactly as if you'd typed it at that computer (a wrong one waits a moment before you can try again). You can also click its password box in the picture and type.</p>
 <p>While streaming, <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>F</kbd> switches full screen on and off and <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>Q</kbd> stops. It works best over a wired network. <b>Forget Paired Computers</b> makes every computer need a PIN again. Ticking <b>Let other computers stream this one</b> also opens Firox Stream's port (TCP 48300) in the firewall if it's closed, which asks for your password; if the other computer says the connection was turned away, untick and tick it again. If the picture never arrives, the other computer's log is <code>~/.local/state/firox/stream.log</code>.</p>
+
+<h2 id="policy">Managing several computers (Policy Editor)</h2>
+<p>The <b>Policy Editor</b> (Settings &rarr; Policy Editor) sets things once for all your Firox computers: automatic updates, the firewall, remote login (SSH), how soon the screen locks, the desktop wallpaper, Firefox's home page, and whether Firox Stream may be used. Like Windows' Group Policy editor, the settings are sorted into folders on the left; pick one on the right and choose <b>Not configured</b> or a value below. A wallpaper can be an <code>https://</code> address (each computer downloads it) or a picture already on the computers; Firefox picks up a new home page the next time it starts. Settings left <b>Not configured</b> stay up to each person; the rest are locked (Security Center says "Managed by" and who).</p>
+<ol>
+  <li><b>Create Admin Key&hellip;</b> once. It signs your policies, and your computers trust only it, so keep a backup of <code>~/.local/share/firox/policy-admin</code> somewhere safe.</li>
+  <li>Choose settings, then <b>Save and Sign&hellip;</b>. Put the file where your computers can fetch it: a web server (<code>https://&hellip;</code>), a git repository (<code>git+https://host/repo.git#policy.firoxpol</code>) or a shared folder.</li>
+  <li><b>Enrollment File&hellip;</b> makes a file with that address and your key. On each computer, run <code>sudo firox-policy enroll FILE</code> once.</li>
+</ol>
+<p>Enrolled computers check for a new policy when they start and every 30 minutes (<code>sudo firox-policy update</code> checks now; <code>firox-policy status</code> shows what's in force). They apply only policies signed with your key, and never one older than the last, so nobody can slip them a fake or an old policy. <b>Encrypt the policy</b> also hides its contents from anyone but your computers; the enrollment file then holds the key to read it, so keep it to yourself. <code>sudo firox-policy unenroll</code> stops following policies: the settings stay as they were, but people can change them again.</p>
 
 <h2 id="restore">Going back after an update (System Restore)</h2>
 <p>Each update installs a complete new version of Firox Linux and keeps the one you used before. If something stopped working after an update, open <b>Settings &rarr; System Restore</b>, pick <b>Previous version</b> and click <b>Restore this version</b>; it starts the next time you restart (<b>Undo</b> changes your mind). Your files, settings and apps aren't touched.</p>

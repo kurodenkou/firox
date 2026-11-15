@@ -11,6 +11,9 @@ thing), falling back to /etc/xdg/pcmanfm-qt/firox/settings.conf. [Desktop]:
     FgColor=#ffffff  ShadowColor=#000000     icon labels
     DesktopShortcuts=Computer,Home,Network,Trash
     DesktopIconSize=48
+
+A policy (firox-policy) can set the wallpaper for everyone:
+/var/lib/firox/policy/desktop.conf (Wallpaper=...) wins over both files.
 """
 
 import configparser
@@ -26,6 +29,7 @@ from gi.repository import Gdk, GdkPixbuf, GLib  # noqa: E402
 CFG = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
 USER_CONF = os.path.join(CFG, "pcmanfm-qt", "firox", "settings.conf")
 SYS_CONF = "/etc/xdg/pcmanfm-qt/firox/settings.conf"
+MANAGED_CONF = "/var/lib/firox/policy/desktop.conf"     # set by a policy
 MODES = [("zoom", "Fill"), ("fit", "Fit"), ("stretch", "Stretch"), ("center", "Center"), ("tile", "Tile")]
 SHORTCUTS = [("Computer", "Computer"), ("Home", "Home folder"), ("Network", "Network"), ("Trash", "Recycle Bin")]
 DEFAULTS = {"Wallpaper": "", "WallpaperMode": "zoom", "BgColor": "#3a3c3f", "FgColor": "#ffffff",
@@ -52,6 +56,27 @@ def read():
         out.update(p["Desktop"])
     if p.has_option("Behavior", "SingleClick"):
         out["SingleClick"] = p["Behavior"]["SingleClick"]
+    m = managed()
+    if m:
+        out.update(m)
+        try:                # a new picture under the same name redraws too
+            out["ManagedStamp"] = str(os.stat(MANAGED_CONF).st_mtime)
+        except OSError:
+            pass
+    return out
+
+
+def managed():
+    """Desktop settings a policy sets ({} when none)."""
+    out = {}
+    try:
+        with open(MANAGED_CONF) as fh:
+            for line in fh:
+                key, sep, value = line.rstrip("\n").partition("=")
+                if sep and key in DEFAULTS:
+                    out[key] = value
+    except OSError:
+        pass
     return out
 
 

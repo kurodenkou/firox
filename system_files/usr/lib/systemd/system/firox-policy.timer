@@ -1,0 +1,12 @@
+[Unit]
+Description=Check for a new Firox policy every 30 minutes
+ConditionPathExists=/etc/firox/policy/enrollment.json
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=30min
+RandomizedDelaySec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
