@@ -157,6 +157,7 @@ tr:last-child td { border-bottom: none; }
 td:first-child { white-space: nowrap; }
 /* Under the hood: the piece's name heads each row */
 tbody th[scope=row] { background: none; white-space: nowrap; }
+tbody tr.group th { background: var(--surface-2); font-size: 0.95em; letter-spacing: 0.02em; }
 @media (max-width: 600px) { tbody th[scope=row] { white-space: normal; } }
 
 .note {

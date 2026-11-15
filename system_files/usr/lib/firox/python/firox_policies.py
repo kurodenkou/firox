@@ -10,6 +10,10 @@ adding a setting means adding one entry here.
     kind "number"   the same, counting something else (unit says what)
     kind "choice"   one of choices [(value, label)]
     kind "timezone" a time zone name, e.g. America/Chicago
+    kind "notice"   {"title": ..., "text": ...}
+    kind "records"  a list of {field: value}, the fields described by fields=
+                    [Field(...)]; passwords never reach managed.json
+    kind "addresses" a list of IP addresses
     kind "url"      an http:// or https:// address
     kind "image"    an https:// address of a picture, or a path on the computers
 
@@ -46,6 +50,13 @@ FIREFOX_MANAGED = os.path.join(STATE_DIR, "firefox-managed.json")    # each Fire
 PWQUALITY = "/etc/security/pwquality.conf.d/50-firox-policy.conf"
 USB_BLOCK = "/etc/modprobe.d/firox-policy-usb-storage.conf"
 ZONEINFO = "/usr/share/zoneinfo"
+BANNER_JSON = os.path.join(MANAGED_DIR, "banner.json")     # the login screen (firox-welcome)
+BANNER_TXT = os.path.join(MANAGED_DIR, "banner.txt")       # SSH
+SSHD_BANNER = "/etc/ssh/sshd_config.d/10-firox-policy-banner.conf"
+NM_CONNECTIONS = "/etc/NetworkManager/system-connections"
+NM_PREFIX = "firox-policy-"
+NM_DNS = "/etc/NetworkManager/conf.d/50-firox-policy-dns.conf"
+PRINTERS_STATE = os.path.join(STATE_DIR, "printers.json")
 MAX_WALLPAPER = 40 << 20
 
 # The same timers Security Center checks (whichever this image has)
@@ -126,12 +137,30 @@ def run_in_sessions(*cmd):
                        capture_output=True, timeout=60)
 
 
+class Field:
+    """One field of a "records" setting (a Wi-Fi network, a printer...)."""
+
+    def __init__(self, key, label, kind="text", required=True, choices=(), show_if=None, placeholder="",
+                 check=None):
+        self.key, self.label, self.kind, self.required = key, label, kind, required
+        self.choices = list(choices)        # kind "choice": [(value, label)]
+        self.show_if = show_if              # (other field, [values]) it's only used for
+        self.placeholder = placeholder
+        self.check = check                  # check(value, record) -> error text or None
+
+    def used(self, record):
+        return self.show_if is None or record.get(self.show_if[0]) in self.show_if[1]
+
+
 class Policy:
     def __init__(self, key, category, title, description, kind, apply, on_label="On", off_label="Off",
-                 low=None, high=None, unit=None, release=None, placeholder="", choices=()):
+                 low=None, high=None, unit=None, release=None, placeholder="", choices=(), fields=(),
+                 noun=("item", "items")):
         self.key, self.category, self.title, self.description, self.kind = key, category, title, description, kind
         self.placeholder = placeholder
         self.choices = list(choices)
+        self.fields = list(fields)
+        self.noun = noun
         self._apply, self._release = apply, release
         self.on_label, self.off_label = on_label, off_label
         self.low, self.high, self.unit = low, high, unit
@@ -152,6 +181,26 @@ class Policy:
             if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_+\-]*(/[A-Za-z0-9_+\-]+)*", value) \
                     or not os.path.isfile(os.path.join(ZONEINFO, value)):
                 raise PolicyError(f"{self.key} must be a time zone such as America/Chicago")
+        elif self.kind == "notice":
+            if not isinstance(value, dict) or not str(value.get("text", "")).strip() or \
+                    len(str(value.get("title", ""))) > 200 or len(str(value.get("text", ""))) > 8000:
+                raise PolicyError(f"{self.key} needs a message (and at most a 200-character title)")
+        elif self.kind == "addresses":
+            import ipaddress
+            if not isinstance(value, list) or not value or len(value) > 8:
+                raise PolicyError(f"{self.key} must list 1 to 8 IP addresses")
+            for a in value:
+                try:
+                    ipaddress.ip_address(str(a))
+                except ValueError:
+                    raise PolicyError(f"{a} isn't an IP address") from None
+        elif self.kind == "records":
+            if not isinstance(value, list) or len(value) > 100:
+                raise PolicyError(f"{self.key} must be a list (of at most 100)")
+            for rec in value:
+                err = self.record_error(rec)
+                if err:
+                    raise PolicyError(err)
         elif self.kind == "url":
             if not isinstance(value, str) or not value.startswith(("https://", "http://")) or len(value) > 2000 \
                     or any(c.isspace() for c in value):
@@ -162,7 +211,47 @@ class Policy:
                 raise PolicyError(f"{self.key} must be an https:// address or a path starting with /")
         return value
 
+    def record_error(self, rec):
+        """What's wrong with one record, or None."""
+        if not isinstance(rec, dict):
+            return "each entry must be a set of fields"
+        for f in self.fields:
+            v = rec.get(f.key)
+            if not f.used(rec):
+                continue
+            if f.kind == "bool":
+                if v is not None and not isinstance(v, bool):
+                    return f"{f.label} must be true or false"
+                continue
+            if v in (None, ""):
+                if f.required:
+                    return f"{f.label} is missing"
+                continue
+            if not isinstance(v, str) or "\n" in v or len(v) > 500:
+                return f"{f.label} isn't valid"
+            if f.kind == "choice" and v not in [c for c, _l in f.choices]:
+                return f"{f.label} must be one of " + ", ".join(c for c, _l in f.choices)
+            if f.check:
+                err = f.check(v, rec)
+                if err:
+                    return err
+        return None
+
+    def public(self, value):
+        """The value without secrets, for managed.json and status."""
+        if self.kind == "records":
+            return [{k: ("••••••" if any(f.key == k and f.kind == "password" for f in self.fields) and v else v)
+                     for k, v in rec.items()} for rec in value]
+        return value
+
     def describe(self, value):
+        if self.kind == "records":
+            n = len(value)
+            return f"{n} {self.noun[0] if n == 1 else self.noun[1]}" if n else "None (removes the policy's)"
+        if self.kind == "notice":
+            return value.get("title") or value.get("text", "").strip().splitlines()[0][:60]
+        if self.kind == "addresses":
+            return ", ".join(value)
         if self.kind == "bool":
             return self.on_label if value else self.off_label
         if self.kind in ("url", "image", "timezone"):
@@ -449,12 +538,226 @@ def apply_sync(allowed):
     return "allowed" if allowed else "not allowed (running syncs stopped)"
 
 
+def write_file(path, text, mode=0o644):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(text)
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def remove(*paths):
+    for path in paths:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+# Login banner: the login screen shows it (and waits for OK) before anyone
+# logs in; SSH shows it before the password
+
+def apply_banner(value):
+    import json
+    title, text = str(value.get("title", "")).strip(), str(value["text"]).strip()
+    write_file(BANNER_JSON, json.dumps({"title": title, "text": text}))
+    write_file(BANNER_TXT, (title + "\n\n" if title else "") + text + "\n")
+    write_file(SSHD_BANNER, f"# Set by a Firox policy (firox-policy)\nBanner {BANNER_TXT}\n")
+    run("systemctl", "try-reload-or-restart", "sshd.service", check=False)
+    return "login banner set (login screen and SSH)"
+
+
+def release_banner():
+    remove(BANNER_JSON, BANNER_TXT, SSHD_BANNER)
+    run("systemctl", "try-reload-or-restart", "sshd.service", check=False)
+
+
+# Wi-Fi networks: NetworkManager connections for everyone
+
+def nm_escape(text):
+    return text.replace("\\", "\\\\")
+
+
+def wifi_file(rec):
+    import hashlib
+    import re
+    import uuid
+    ssid = rec["ssid"]
+    slug = re.sub(r"[^A-Za-z0-9_-]+", "_", ssid)[:40] + "-" + hashlib.sha256(ssid.encode()).hexdigest()[:6]
+    path = os.path.join(NM_CONNECTIONS, f"{NM_PREFIX}{slug}.nmconnection")
+    sec = rec.get("security") or "wpa-psk"
+    lines = ["# Set by a Firox policy (firox-policy)", "[connection]", f"id={nm_escape(ssid)}",
+             f"uuid={uuid.uuid5(uuid.NAMESPACE_URL, 'firox-policy-wifi:' + ssid)}", "type=wifi",
+             "autoconnect=true", "", "[wifi]", "mode=infrastructure", f"ssid={nm_escape(ssid)}",
+             f"hidden={'true' if rec.get('hidden') else 'false'}", ""]
+    if sec in ("wpa-psk", "sae"):
+        lines += ["[wifi-security]", f"key-mgmt={sec}", f"psk={nm_escape(rec['password'])}", ""]
+    elif sec == "wpa-eap":
+        lines += ["[wifi-security]", "key-mgmt=wpa-eap", "", "[802-1x]", "eap=peap;",
+                  f"identity={nm_escape(rec['identity'])}", f"password={nm_escape(rec['password'])}",
+                  "phase2-auth=mschapv2"]
+        if rec.get("domain"):
+            lines += [f"domain-suffix-match={nm_escape(rec['domain'])}", "system-ca-certs=true"]
+        lines.append("")
+    lines += ["[ipv4]", "method=auto", "", "[ipv6]", "method=auto", ""]
+    return path, "\n".join(lines)
+
+
+def apply_wifi(networks):
+    keep = set()
+    for rec in networks:
+        path, text = wifi_file(rec)
+        write_file(path, text, 0o600)       # holds the password: root only, as NetworkManager wants
+        keep.add(path)
+    removed = remove_wifi(keep)
+    run("nmcli", "connection", "reload", check=False)
+    out = f"{len(networks)} Wi-Fi network{'s' if len(networks) != 1 else ''}"
+    return out + (f" ({removed} removed)" if removed else "")
+
+
+def remove_wifi(keep=()):
+    n = 0
+    try:
+        names = os.listdir(NM_CONNECTIONS)
+    except OSError:
+        return 0
+    for name in names:
+        path = os.path.join(NM_CONNECTIONS, name)
+        if name.startswith(NM_PREFIX) and name.endswith(".nmconnection") and path not in keep:
+            remove(path)
+            n += 1
+    return n
+
+
+def release_wifi():
+    remove_wifi()
+    run("nmcli", "connection", "reload", check=False)
+
+
+def check_ssid(v, _rec):
+    return None if 1 <= len(v.encode()) <= 32 else "a network name is 1 to 32 characters"
+
+
+def check_wifi_password(v, rec):
+    if rec.get("security") in ("wpa-psk", "sae") and not 8 <= len(v) <= 63:
+        return f"the password for {rec.get('ssid')} must be 8 to 63 characters"
+    return None
+
+
+WIFI_FIELDS = [
+    Field("ssid", "Network name", check=check_ssid, placeholder="Office Wi-Fi"),
+    Field("security", "Security", "choice", choices=[
+        ("wpa-psk", "WPA/WPA2 Personal"), ("sae", "WPA3 Personal"), ("wpa-eap", "WPA2 Enterprise (PEAP)"),
+        ("none", "Open (no password)")]),
+    Field("identity", "Username", show_if=("security", ["wpa-eap"])),
+    Field("password", "Password", "password", show_if=("security", ["wpa-psk", "sae", "wpa-eap"]),
+          check=check_wifi_password),
+    Field("domain", "Server domain", required=False,
+          show_if=("security", ["wpa-eap"]), placeholder="radius.example.com (its certificate is checked)"),
+    Field("hidden", "Hidden network (doesn't broadcast its name)", "bool", required=False),
+]
+
+
+# Printers: CUPS queues, driverless (IPP Everywhere)
+
+def check_printer_name(v, _rec):
+    import re
+    return None if re.fullmatch(r"[A-Za-z0-9_-]{1,64}", v) else \
+        "a printer name uses letters, digits, - and _ (no spaces)"
+
+
+def check_printer_uri(v, _rec):
+    ok = v.split(":", 1)[0] in ("ipp", "ipps", "http", "https", "lpd", "socket", "smb", "dnssd")
+    return None if ok and "://" in v else "the address must look like ipp://printer.example.com/ipp/print"
+
+
+def apply_printers(printers):
+    import json
+    try:
+        with open(PRINTERS_STATE) as fh:
+            before = set(json.load(fh))
+    except (OSError, ValueError):
+        before = set()
+    done, failed = [], []
+    for rec in printers:
+        cmd = ["lpadmin", "-p", rec["name"], "-E", "-v", rec["uri"], "-m", "everywhere"]
+        if rec.get("description"):
+            cmd += ["-D", rec["description"]]
+        if rec.get("location"):
+            cmd += ["-L", rec["location"]]
+        p = run(*cmd, check=False)
+        (done if p.returncode == 0 else failed).append(rec["name"])
+        if p.returncode == 0 and rec.get("default"):
+            run("lpadmin", "-d", rec["name"], check=False)
+    for name in before - {r["name"] for r in printers}:
+        run("lpadmin", "-x", name, check=False)
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(PRINTERS_STATE, "w") as fh:
+        json.dump([r["name"] for r in printers if r["name"] in done] + [n for n in before if n in failed], fh)
+    if failed:
+        raise PolicyError(f"couldn't add {', '.join(failed)} (is it switched on and reachable?); "
+                          f"added {len(done)}")
+    return f"{len(done)} printer{'s' if len(done) != 1 else ''}"
+
+
+def release_printers():
+    apply_printers([])
+
+
+PRINTER_FIELDS = [
+    Field("name", "Name", check=check_printer_name, placeholder="Office-Laser"),
+    Field("uri", "Address", check=check_printer_uri, placeholder="ipp://printer.example.com/ipp/print"),
+    Field("description", "Description", required=False, placeholder="Second floor laser printer"),
+    Field("location", "Location", required=False, placeholder="Room 204"),
+    Field("default", "Make it the default printer", "bool", required=False),
+]
+
+
+# DNS servers for every connection
+
+def apply_dns(servers):
+    write_file(NM_DNS, "# Set by a Firox policy (firox-policy)\n[global-dns-domain-*]\n"
+               f"servers={','.join(servers)}\n")
+    run("systemctl", "try-reload-or-restart", "NetworkManager.service", check=False)
+    return "DNS servers " + ", ".join(servers)
+
+
+def release_dns():
+    remove(NM_DNS)
+    run("systemctl", "try-reload-or-restart", "NetworkManager.service", check=False)
+
+
+# Firefox bookmarks: a managed folder on the bookmarks toolbar
+
+def check_bookmark_url(v, _rec):
+    return None if v.startswith(("https://", "http://")) else "a bookmark address starts with https://"
+
+
+def apply_bookmarks(bookmarks):
+    part = {"ManagedBookmarks": [{"toplevel_name": "From your organization"}] +
+            [{"name": b["name"], "url": b["url"]} for b in bookmarks]} if bookmarks else None
+    firefox_part("firefox.bookmarks", part)
+    return f"{len(bookmarks)} Firefox bookmark{'s' if len(bookmarks) != 1 else ''} (at its next start)"
+
+
+BOOKMARK_FIELDS = [
+    Field("name", "Name", placeholder="Intranet"),
+    Field("url", "Address", check=check_bookmark_url, placeholder="https://intranet.example.com"),
+]
+
+
 SCREENSAVER = power_setting("SCREENSAVER_WAIT")
 MONITOR = power_setting("MONITOR_AC", "MONITOR_BATTERY")
 SLEEP = power_setting("SLEEP_AC", "SLEEP_BATTERY")
 
 
 POLICIES = [
+    Policy("login.banner", "System", "Login banner",
+           "A notice everyone must acknowledge on the login screen before logging in (and that SSH shows "
+           "before the password), e.g. an acceptable-use statement.",
+           "notice", apply_banner, release=release_banner),
     Policy("time.timezone", "System", "Time zone",
            "The computers' time zone, e.g. America/Chicago or Europe/London.",
            "timezone", apply_timezone, placeholder="America/Chicago"),
@@ -491,6 +794,18 @@ POLICIES = [
     Policy("power.sleep_minutes", "Power", "Sleep",
            "Put the computer to sleep after this many idle minutes (0 = never), plugged in or on battery.",
            "minutes", SLEEP[0], low=0, high=1440, unit="minutes", release=SLEEP[1]),
+    Policy("network.wifi", "Network", "Wi-Fi networks",
+           "Wi-Fi networks every computer knows and joins by itself. Passwords are kept for the system, "
+           "readable only by root. Encrypt policies that hold Wi-Fi passwords.",
+           "records", apply_wifi, release=release_wifi, fields=WIFI_FIELDS, noun=("network", "networks")),
+    Policy("network.dns", "Network", "DNS servers",
+           "The DNS servers every connection uses, instead of the ones the network offers. Separate "
+           "them with commas.", "addresses", apply_dns, release=release_dns,
+           placeholder="9.9.9.9, 149.112.112.112"),
+    Policy("devices.printers", "Devices", "Printers",
+           "Printers every computer has, added driverless (IPP Everywhere): most network printers "
+           "made in the last ten years work.", "records", apply_printers, release=release_printers,
+           fields=PRINTER_FIELDS, noun=("printer", "printers")),
     Policy("devices.usb_storage", "Devices", "USB drives",
            "Whether USB drives (memory sticks, external disks) can be used. Blocked takes effect from the "
            "next drive plugged in; keyboards, mice and other USB devices aren't affected.",
@@ -510,6 +825,11 @@ POLICIES = [
            "The page Firefox opens at start and with the Home button. People can't change it. Firefox "
            "picks it up the next time it starts.",
            "url", apply_homepage, release=release_homepage, placeholder="https://intranet.example.com"),
+    Policy("firefox.bookmarks", "Applications/Firefox", "Bookmarks",
+           "Bookmarks in a \u201cFrom your organization\u201d folder on Firefox's bookmarks toolbar. People "
+           "can't change them.", "records", apply_bookmarks,
+           release=lambda: firefox_part("firefox.bookmarks", None), fields=BOOKMARK_FIELDS,
+           noun=("bookmark", "bookmarks")),
     firefox_policy("firefox.private_browsing", "Private browsing",
                    "Whether Firefox's private windows can be opened.",
                    lambda v: {"DisablePrivateBrowsing": not v}),
