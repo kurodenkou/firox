@@ -137,6 +137,16 @@ def theme_name(arg=None):
 
 # --------------------------------------------------------------------- UI --
 
+def login_banner():
+    """The notice a policy (firox-policy) shows before logging in, or None."""
+    try:
+        with open("/var/lib/firox/policy/banner.json") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) and str(data.get("text", "")).strip() else None
+    except (OSError, ValueError):
+        return None
+
+
 class Tile(Gtk.EventBox):
     """One person: picture + name; expands to a password box when chosen."""
 
@@ -232,7 +242,14 @@ class Welcome(Gtk.Window):
 
         middle = Gtk.Box()
         middle.set_name("middle")
-        root.pack_start(middle, True, True, 0)
+        # A login banner (a policy, firox-policy) comes first: the user list
+        # only after OK, like Windows' logon notice
+        self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE)
+        banner = login_banner()
+        if banner:
+            self.stack.add_named(self.notice(banner), "notice")
+        self.stack.add_named(middle, "users")
+        root.pack_start(self.stack, True, True, 0)
 
         left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         left.set_name("left")
@@ -300,6 +317,55 @@ class Welcome(Gtk.Window):
         self.show_all()
         for t in self.tiles + [self.other]:
             t.expand(False)
+        if banner:
+            self.stack.set_visible_child_name("notice")
+            GLib.idle_add(lambda: self.banner_ok.grab_focus() and False)
+        elif len(self.tiles) == 1:
+            GLib.idle_add(lambda: self.select(self.tiles[0]) and False)
+
+    def notice(self, banner):
+        """The login banner page: its title, its text, and OK."""
+        css = Gtk.CssProvider()
+        css.load_from_data(b"#banner-title { font-size: 26px; font-weight: bold; }"
+                           b"#banner-text { font-size: 15px; }"
+                           b"#banner-ok { min-width: 110px; padding: 6px 18px; }")
+        Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), css,
+                                                 Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 1)
+        page = Gtk.Box()
+        page.set_name("middle")
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18, halign=Gtk.Align.CENTER,
+                      valign=Gtk.Align.CENTER)
+        box.set_size_request(640, -1)
+        if banner.get("title"):
+            title = Gtk.Label(label=banner["title"], xalign=0, wrap=True)
+            title.set_name("banner-title")
+            box.pack_start(title, False, False, 0)
+        text = Gtk.Label(label=banner["text"], xalign=0, wrap=True, max_width_chars=80)
+        text.set_name("banner-text")
+        text.set_size_request(640, -1)
+        if len(banner["text"]) > 1200 or banner["text"].count("\n") > 14:
+            # A long notice scrolls (a wrapped label can't size a scroller itself)
+            scroll = Gtk.ScrolledWindow()
+            scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+            scroll.set_min_content_height(380)
+            scroll.add(text)
+            box.pack_start(scroll, False, False, 0)
+        else:
+            box.pack_start(text, False, False, 0)
+        self.banner_ok = Gtk.Button(label="OK", halign=Gtk.Align.END)
+        self.banner_ok.set_name("banner-ok")
+        self.banner_ok.connect("clicked", lambda _b: self.banner_seen())
+        box.pack_start(self.banner_ok, False, False, 0)
+        page.pack_start(box, True, True, 0)
+        # The theme's text colour (the "To begin…" hint's)
+        color = Gtk.CssProvider()
+        color.load_from_data(b"#banner-title, #banner-text { color: #ffffff; }")
+        Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), color,
+                                                 Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        return page
+
+    def banner_seen(self):
+        self.stack.set_visible_child_name("users")
         if len(self.tiles) == 1:
             GLib.idle_add(lambda: self.select(self.tiles[0]) and False)
 

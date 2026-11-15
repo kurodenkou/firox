@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Policy · Firox Linux</title>
+<meta name="description" content="Manage your Firox computers from one place: signed policies for updates, security, Wi-Fi, printers, the login banner, Firefox and more, with no server or directory service.">
+<meta property="og:title" content="Policy · Firox Linux">
+<meta property="og:description" content="Manage your Firox computers from one place: signed policies for updates, security, Wi-Fi, printers, the login banner, Firefox and more, with no server or directory service.">
+<meta property="og:image" content="screenshots/policy-editor.png">
+<link rel="icon" href="assets/firox-orb.svg" type="image/svg+xml">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<header class="site-header">
+    <div class="wrap">
+        <a class="brand" href="index.html"><img src="assets/firox-orb.svg" alt=""><span>firox</span> Linux</a>
+        <nav class="nav" aria-label="Site">
+        <a href="index.html">Home</a>
+        <a href="looks.html">Looks</a>
+        <a href="features.html">Features</a>
+        <a href="policy.html" aria-current="page">Policy</a>
+        <a href="install.html">Install</a>
+        <a href="guide.html">Guide</a>
+        <a href="https://github.com/kurodenkou/firox">GitHub</a>
+        </nav>
+    </div>
+</header>
+<section class="hero page-hero">
+    <div class="wrap">
+        <h1>Manage your Firox computers from one place</h1>
+        <p class="lead">Group-policy style management with nothing to run: sign a policy on one computer, publish the file, and every Firox computer you've enrolled applies it.</p>
+    </div>
+</section>
+<main>
+<div class="wrap">
+
+<ul class="toc">
+    <li><a href="#why">Why it's built this way</a></li>
+    <li><a href="#start">Getting started</a></li>
+    <li><a href="#settings">The 30 settings</a></li>
+    <li><a href="#computers">On managed computers</a></li>
+    <li><a href="#security">Security</a></li>
+    <li><a href="#reference">Command reference</a></li>
+    <li><a href="#formats">File formats</a></li>
+    <li><a href="#extend">Adding a setting</a></li>
+</ul>
+
+<div class="feature">
+    <div class="feature-text">
+        <h3>Policy Editor</h3>
+        <p>Settings are sorted into folders, like Group Policy: pick one on the left, a setting on the right, and choose <b>Not configured</b> (left to each person) or a value. <b>Save and Sign</b> writes the signed policy; <b>Enrollment File</b> makes the file each computer is enrolled with.</p>
+        <p>It's in the Start menu and in Settings, or run <code>firox-policy</code>.</p>
+    </div>
+    <figure>
+    <img src="screenshots/policy-editor.png" alt="The Policy Editor: folders of settings, with the Wi-Fi networks list" loading="lazy">
+</figure>
+</div>
+
+<h2 id="why">Why it's built this way</h2>
+<div class="grid three">
+    <div class="card">
+        <div class="icon">🗝️</div>
+        <h3>No server, no directory</h3>
+        <p>There's no Active Directory, no management server and no agent to license. A policy is one small signed file you put anywhere your computers can reach: a web server, a git repository, or a shared folder.</p>
+    </div>
+    <div class="card">
+        <div class="icon">✍️</div>
+        <h3>Signed, so it can't be faked</h3>
+        <p>Computers trust exactly one admin key, pinned when they're enrolled. A policy signed by anyone else, changed after signing, or older than the last one is refused.</p>
+    </div>
+    <div class="card">
+        <div class="icon">🔒</div>
+        <h3>Private when it needs to be</h3>
+        <p>Policies can also be encrypted so only your computers can read them: do this when they hold Wi-Fi passwords. Ordinary users never see secrets either way.</p>
+    </div>
+</div>
+
+<h2 id="start">Getting started</h2>
+<ol>
+    <li><b>Make your admin key.</b> Open the Policy Editor and click <b>Create Admin Key…</b>. Give it a passphrase; you'll type it each time you sign. Keep a backup of <code>~/.local/share/firox/policy-admin</code>: it's the only key your computers will trust.</li>
+    <li><b>Choose settings</b> and click <b>Save and Sign…</b>. Tick <b>Encrypt the policy</b> first if it holds Wi-Fi passwords.</li>
+    <li><b>Publish the file</b> where your computers can fetch it:
+        <ul>
+            <li>a web server: <code>https://example.com/policy.firoxpol</code></li>
+            <li>a git repository: <code>git+https://git.example.com/it/policy.git#policy.firoxpol</code></li>
+            <li>a file or network share: <code>/mnt/share/policy.firoxpol</code></li>
+        </ul>
+    </li>
+    <li><b>Make an enrollment file</b> (<b>Enrollment File…</b>) with that address, and on each computer run:
+        <div class="code"><pre><code>sudo firox-policy enroll firox.firoxenroll</code></pre></div>
+    </li>
+</ol>
+<p>That's it. Computers check for a new policy when they start and every 30 minutes. To change something, edit, sign and publish again.</p>
+<div class="note"><b>Encrypted policies</b> need an enrollment file made after you turn encryption on: it carries the key computers decrypt with. Copy it only to the computers you enroll.</div>
+
+<h2 id="settings">The 30 settings</h2>
+<p>Each setting is either <b>Not configured</b>, and left to each person, or set and locked: people can't change it in Settings, and the computer puts it back if it's changed some other way, at the next check.</p>
+<div class="table-wrap">
+<table class="internals">
+    <thead><tr><th scope="col">Setting</th><th scope="col">What it does</th><th scope="col">Value</th></tr></thead>
+    <tbody>
+        <tr class="group"><th colspan="3">System</th></tr>
+        <tr><th scope="row">Login banner<br><code>login.banner</code></th><td>A notice everyone must acknowledge on the login screen before logging in (and that SSH shows before the password), e.g. an acceptable-use statement.</td><td>a title and a message</td></tr>
+        <tr><th scope="row">Time zone<br><code>time.timezone</code></th><td>The computers' time zone, e.g. America/Chicago or Europe/London.</td><td>a time zone, e.g. America/Chicago</td></tr>
+        <tr><th scope="row">Network time<br><code>time.ntp</code></th><td>Keep the clock right by asking time servers on the internet.</td><td>On / Off</td></tr>
+        <tr><th scope="row">Automatic updates<br><code>updates.automatic</code></th><td>Download and install Firox Linux updates by itself. Off is for computers you update by hand.</td><td>On / Off</td></tr>
+        <tr class="group"><th colspan="3">Security</th></tr>
+        <tr><th scope="row">Firewall<br><code>firewall.enabled</code></th><td>Keep the firewall on, so only the services Firox opens can be reached from the network.</td><td>On / Off</td></tr>
+        <tr><th scope="row">Remote login (SSH)<br><code>ssh.enabled</code></th><td>Let people log in to this computer over the network with SSH.</td><td>Allowed / Not allowed</td></tr>
+        <tr><th scope="row">Lock the screen when idle<br><code>screen.lock_minutes</code></th><td>Lock the screen after this many minutes without use. People can't make it longer or turn it off in Settings.</td><td>1–240 minutes</td></tr>
+        <tr><th scope="row">Lock when waking from sleep<br><code>screen.lock_on_wake</code></th><td>Ask for the password when the computer wakes up.</td><td>On / Off</td></tr>
+        <tr><th scope="row">Minimum password length<br><code>password.min_length</code></th><td>New passwords must be at least this long (when people change their password).</td><td>6–64 characters</td></tr>
+        <tr><th scope="row">Virus definition updates<br><code>virus.definitions</code></th><td>Keep Virus Scan's virus definitions up to date (downloaded every two hours).</td><td>On / Off</td></tr>
+        <tr class="group"><th colspan="3">Power</th></tr>
+        <tr><th scope="row">Screen saver<br><code>power.screensaver_minutes</code></th><td>Start the screen saver after this many idle minutes (0 = never). People can't change it.</td><td>0–240 minutes (0 = never)</td></tr>
+        <tr><th scope="row">Turn off the screen<br><code>power.monitor_off_minutes</code></th><td>Turn the screen off after this many idle minutes (0 = never), plugged in or on battery.</td><td>0–480 minutes (0 = never)</td></tr>
+        <tr><th scope="row">Sleep<br><code>power.sleep_minutes</code></th><td>Put the computer to sleep after this many idle minutes (0 = never), plugged in or on battery.</td><td>0–1440 minutes (0 = never)</td></tr>
+        <tr class="group"><th colspan="3">Network</th></tr>
+        <tr><th scope="row">Wi-Fi networks<br><code>network.wifi</code></th><td>Wi-Fi networks every computer knows and joins by itself. Passwords are kept for the system, readable only by root. Encrypt policies that hold Wi-Fi passwords.</td><td>a list of networks</td></tr>
+        <tr><th scope="row">DNS servers<br><code>network.dns</code></th><td>The DNS servers every connection uses, instead of the ones the network offers. Separate them with commas.</td><td>IP addresses</td></tr>
+        <tr class="group"><th colspan="3">Devices</th></tr>
+        <tr><th scope="row">Printers<br><code>devices.printers</code></th><td>Printers every computer has, added driverless (IPP Everywhere): most network printers made in the last ten years work.</td><td>a list of printers</td></tr>
+        <tr><th scope="row">USB drives<br><code>devices.usb_storage</code></th><td>Whether USB drives (memory sticks, external disks) can be used. Blocked takes effect from the next drive plugged in; keyboards, mice and other USB devices aren't affected.</td><td>Allowed / Blocked</td></tr>
+        <tr><th scope="row">Bluetooth<br><code>devices.bluetooth</code></th><td>Turn Bluetooth on or off (headphones, mice, phones).</td><td>On / Off</td></tr>
+        <tr class="group"><th colspan="3">Desktop</th></tr>
+        <tr><th scope="row">Look<br><code>desktop.theme</code></th><td>The desktop's look for everyone. People can't switch it in Settings.</td><td>Classic / Modern / Glass</td></tr>
+        <tr><th scope="row">Wallpaper<br><code>desktop.wallpaper</code></th><td>The desktop and lock screen picture. People can't change it. An https:// address is downloaded by each computer; a path must already be on them (e.g. /usr/share/backgrounds/...).</td><td>an https:// picture or a path</td></tr>
+        <tr class="group"><th colspan="3">Firefox</th></tr>
+        <tr><th scope="row">Home page<br><code>firefox.homepage</code></th><td>The page Firefox opens at start and with the Home button. People can't change it. Firefox picks it up the next time it starts.</td><td>an https:// address</td></tr>
+        <tr><th scope="row">Bookmarks<br><code>firefox.bookmarks</code></th><td>Bookmarks in a “From your organization” folder on Firefox's bookmarks toolbar. People can't change them.</td><td>a list of bookmarks</td></tr>
+        <tr><th scope="row">Private browsing<br><code>firefox.private_browsing</code></th><td>Whether Firefox's private windows can be opened.</td><td>Allowed / Not allowed</td></tr>
+        <tr><th scope="row">about:config<br><code>firefox.about_config</code></th><td>Whether Firefox's advanced settings page (about:config) can be opened.</td><td>Allowed / Not allowed</td></tr>
+        <tr><th scope="row">Saving passwords<br><code>firefox.password_manager</code></th><td>Whether Firefox offers to save passwords.</td><td>Allowed / Not allowed</td></tr>
+        <tr><th scope="row">Developer tools<br><code>firefox.developer_tools</code></th><td>Whether Firefox's developer tools can be opened.</td><td>Allowed / Not allowed</td></tr>
+        <tr><th scope="row">Installing add-ons<br><code>firefox.addons</code></th><td>Whether people can install Firefox add-ons. Firox's own (web apps) stays either way.</td><td>Allowed / Not allowed</td></tr>
+        <tr><th scope="row">DNS over HTTPS<br><code>firefox.dns_over_https</code></th><td>Whether Firefox looks up web addresses over an encrypted connection. Locked either way.</td><td>On / Off</td></tr>
+        <tr class="group"><th colspan="3">Firox Sync</th></tr>
+        <tr><th scope="row">Syncing folders<br><code>sync.allowed</code></th><td>Whether Firox Sync can keep folders the same between computers. Not allowed turns it off and keeps it off.</td><td>Allowed / Not allowed</td></tr>
+        <tr class="group"><th colspan="3">Firox Stream</th></tr>
+        <tr><th scope="row">Hosting<br><code>stream.allowed</code></th><td>Whether other computers may stream this one with Firox Stream. Not allowed turns it off and keeps it off; allowed leaves it to each person.</td><td>Allowed / Not allowed</td></tr>
+    </tbody>
+</table>
+</div>
+
+<h2 id="computers">On managed computers</h2>
+<ul>
+    <li><b>Security Center</b> shows "Managed by" and your organization's name, and warns if the last check for a new policy failed (the last policy stays in force meanwhile).</li>
+    <li><b>Settings</b> greys out what a policy sets, with a note: Power Options, Screen Saver, Appearance and Desktop Background.</li>
+    <li><b>The login banner</b> appears on the login screen before the user list; people click OK to go on. SSH shows it before asking for a password.</li>
+    <li><code>firox-policy status</code> shows anyone what's in force, from whom, and when it was last checked. Passwords are shown as dots.</li>
+    <li><code>sudo firox-policy unenroll</code> stops following policies: the settings stay as they are, but people can change them again.</li>
+</ul>
+
+<h2 id="security">Security</h2>
+<ul>
+    <li><b>The signature is what counts.</b> Each policy is signed with your admin key (Ed25519). Encryption alone would prove nothing, since anyone can encrypt to a public key.</li>
+    <li><b>One trusted key.</b> Enrollment pins your key's full fingerprint. A key with the same name but a different fingerprint is refused.</li>
+    <li><b>No replays.</b> Each policy's number is the time it was signed, and a computer refuses one older than the last it applied.</li>
+    <li><b>Fetching:</b> HTTPS certificates are checked, and plain <code>http://</code> isn't accepted. The policy is signed anyway, so a file share or git mirror is just as safe.</li>
+    <li><b>Secrets stay hidden.</b> Wi-Fi passwords are written only to files root can read, and never to the status ordinary users can see.</li>
+    <li><b>Your key stays home.</b> It never leaves the editor's computer. Its passphrase is asked for at every signing and never cached.</li>
+</ul>
+
+<h2 id="reference">Command reference</h2>
+<div class="table-wrap">
+<table class="internals">
+    <tbody>
+        <tr><th scope="row"><code>firox-policy</code></th><td>Open the Policy Editor</td></tr>
+        <tr><th scope="row"><code>firox-policy status</code></th><td>What policy this computer follows, and what's in force</td></tr>
+        <tr><th scope="row"><code>sudo firox-policy enroll FILE</code></th><td>Follow the policies an enrollment file describes</td></tr>
+        <tr><th scope="row"><code>sudo firox-policy update</code></th><td>Fetch and apply the policy now (the timer does this every 30 minutes)</td></tr>
+        <tr><th scope="row"><code>sudo firox-policy apply FILE</code></th><td>Apply a policy file once, from here (still checks the signature)</td></tr>
+        <tr><th scope="row"><code>sudo firox-policy unenroll</code></th><td>Stop following policies</td></tr>
+    </tbody>
+</table>
+</div>
+
+<h2 id="formats">File formats</h2>
+<p>A policy is JSON, signed (and optionally encrypted) with GnuPG:</p>
+<div class="code"><pre><code>{
+  "format": "firox-policy", "version": 1,
+  "organization": "Home Lab",
+  "serial": 1794706138,
+  "issued": "2026-11-15T01:28:58Z",
+  "settings": {
+    "screen.lock_minutes": 10,
+    "firefox.homepage": "https://intranet.example.com",
+    "network.wifi": [{"ssid": "Office", "security": "wpa-psk", "password": "…"}]
+  }
+}</code></pre></div>
+<p>An enrollment file (<code>.firoxenroll</code>) is JSON holding the organization, the policy's address, your key's fingerprint and public key, and, for encrypted policies, the machines key. On an enrolled computer, <code>/etc/firox/policy/</code> holds the enrollment and its keyring (root only); <code>/var/lib/firox/policy/</code> holds what's in force.</p>
+
+<h2 id="extend">Adding a setting</h2>
+<p>Every setting is one entry in <code>/usr/lib/firox/python/firox_policies.py</code>, which both the editor and the computers read:</p>
+<div class="code"><pre><code>Policy("devices.bluetooth", "Devices", "Bluetooth",
+       "Turn Bluetooth on or off (headphones, mice, phones).",
+       "bool", apply_bluetooth)</code></pre></div>
+<p>A setting has a key, a folder for the editor's tree, a title, a description, a kind of value (on/off, a number, a choice, text, an address, a list…) and the function that applies it, plus one that releases it when a policy no longer sets it. A computer that meets a setting it doesn't know yet reports it and carries on, so newer policies work with older Firox versions.</p>
+
+</div>
+</main>
+<footer class="site-footer">
+    <div class="wrap">
+        <span>Firox Linux, built on <a href="https://universal-blue.org/">Universal Blue</a> (Fedora Atomic). Themes, icons, wallpapers and the Start menu are original work; no Microsoft assets are used.</span>
+        <span><a href="https://github.com/kurodenkou/firox">Source on GitHub</a> · <a href="https://github.com/kurodenkou/firox/issues">Report a problem</a></span>
+    </div>
+</footer>
+<script src="assets/site.js"></script>
+</body>
+</html>

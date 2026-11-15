@@ -145,13 +145,19 @@ def run(fp):
             self.view.append_column(state_col)
             self.view.get_selection().connect("changed", lambda *_a: self.show_setting())
             top = Gtk.ScrolledWindow(shadow_type=Gtk.ShadowType.IN, vexpand=True)
-            top.set_min_content_height(150)
+            top.set_min_content_height(110)
             top.add(self.view)
             right.pack_start(top, True, True, 0)
             self.detail = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
             self.detail.set_margin_start(6)
             self.detail.set_margin_top(4)
-            right.pack_start(self.detail, False, False, 0)
+            self.detail.set_margin_end(6)
+            # The selected setting: scrolls rather than stretching the window
+            detail_scroll = Gtk.ScrolledWindow()
+            detail_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+            detail_scroll.set_min_content_height(230)
+            detail_scroll.add(self.detail)
+            right.pack_start(detail_scroll, False, False, 0)
             paned.pack2(right, True, False)
             outer.add(paned)
             self.cats.get_selection().select_path(Gtk.TreePath(0))
@@ -248,6 +254,10 @@ def run(fp):
                 (on_b if value is True else off_b if value is False else off).set_active(True)
                 on_b.connect("toggled", lambda b: b.get_active() and set_value(True))
                 off_b.connect("toggled", lambda b: b.get_active() and set_value(False))
+            elif pol.kind == "notice":
+                self.notice_editor(pol, value, off, set_value)
+            elif pol.kind == "records":
+                self.records_editor(pol, value, off, set_value)
             else:
                 row = Gtk.Box(spacing=6)
                 set_b = Gtk.RadioButton.new_with_label_from_widget(off, "Set to")
@@ -261,12 +271,15 @@ def run(fp):
                     if pol.unit:
                         row.add(Gtk.Label(label=pol.unit))
                 else:
-                    field = Gtk.Entry(hexpand=True, text=value or "", placeholder_text=pol.placeholder)
+                    shown = ", ".join(value) if isinstance(value, list) else (value or "")
+                    field = Gtk.Entry(hexpand=True, text=shown, placeholder_text=pol.placeholder)
                     note = Gtk.Label(xalign=0)
                     note.get_style_context().add_class("dim-label")
 
                     def current():
                         text = field.get_text().strip()
+                        if pol.kind == "addresses":
+                            text = [a.strip() for a in text.replace(" ", ",").split(",") if a.strip()]
                         try:
                             pol.check(text)
                             note.set_text("")
@@ -301,6 +314,193 @@ def run(fp):
                 set_b.connect("toggled", chosen)
             off.connect("toggled", lambda b: b.get_active() and set_value(None))
             self.detail.show_all()
+
+        def notice_editor(self, pol, value, off, set_value):
+            """A login banner: a title and a message."""
+            set_b = Gtk.RadioButton.new_with_label_from_widget(off, "Show this notice")
+            self.detail.add(set_b)
+            grid = Gtk.Grid(row_spacing=6, column_spacing=8, margin_start=24)
+            grid.attach(Gtk.Label(label="Title:", xalign=1), 0, 0, 1, 1)
+            title = Gtk.Entry(hexpand=True, text=(value or {}).get("title", ""),
+                              placeholder_text="Authorized use only")
+            grid.attach(title, 1, 0, 1, 1)
+            grid.attach(Gtk.Label(label="Message:", xalign=1, valign=Gtk.Align.START), 0, 1, 1, 1)
+            text = Gtk.TextView(wrap_mode=Gtk.WrapMode.WORD_CHAR)
+            text.get_buffer().set_text((value or {}).get("text", ""))
+            scroll = Gtk.ScrolledWindow(shadow_type=Gtk.ShadowType.IN, hexpand=True)
+            scroll.set_min_content_height(90)
+            scroll.add(text)
+            grid.attach(scroll, 1, 1, 1, 1)
+            self.detail.add(grid)
+
+            def current():
+                buf = text.get_buffer()
+                body = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False).strip()
+                return {"title": title.get_text().strip(), "text": body} if body else None
+
+            def changed(*_a):
+                if set_b.get_active():
+                    set_value(current())
+            title.connect("changed", changed)
+            text.get_buffer().connect("changed", changed)
+            set_b.set_active(value is not None)
+            grid.set_sensitive(value is not None)
+
+            def chosen(b):
+                grid.set_sensitive(b.get_active())
+                if b.get_active():
+                    set_value(current())
+                    text.grab_focus()
+            set_b.connect("toggled", chosen)
+
+        def records_editor(self, pol, value, off, set_value):
+            """A list (Wi-Fi networks, printers, bookmarks) with Add/Edit/Remove."""
+            records = [dict(r) for r in (value or [])]
+            set_b = Gtk.RadioButton.new_with_label_from_widget(off, f"Use this list of {pol.noun[1]}")
+            self.detail.add(set_b)
+            store = Gtk.ListStore(str)
+            view = Gtk.TreeView(model=store, headers_visible=False)
+            view.append_column(Gtk.TreeViewColumn("", Gtk.CellRendererText(ellipsize=3), text=0))
+            scroll = Gtk.ScrolledWindow(shadow_type=Gtk.ShadowType.IN, hexpand=True)
+            scroll.set_min_content_height(80)
+            scroll.add(view)
+            buttons = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+            box = Gtk.Box(spacing=6, margin_start=24)
+            box.pack_start(scroll, True, True, 0)
+            box.pack_start(buttons, False, False, 0)
+            self.detail.add(box)
+
+            def summary(rec):
+                parts = []
+                for f in pol.fields[:2]:
+                    v = rec.get(f.key)
+                    if f.kind == "choice":
+                        v = dict(f.choices).get(v, v)
+                    if v not in (None, "") and f.kind != "password":
+                        parts.append(str(v))
+                return " \u2014 ".join(parts)
+
+            def refill():
+                store.clear()
+                for rec in records:
+                    store.append([summary(rec)])
+
+            def changed():
+                refill()
+                if set_b.get_active():
+                    set_value([dict(r) for r in records])
+
+            def selected():
+                _m, it = view.get_selection().get_selected()
+                return store.get_path(it).get_indices()[0] if it is not None else None
+
+            def add(_b):
+                rec = self.record_dialog(pol, {})
+                if rec is not None:
+                    records.append(rec)
+                    changed()
+
+            def edit(*_a):
+                i = selected()
+                if i is not None:
+                    rec = self.record_dialog(pol, records[i])
+                    if rec is not None:
+                        records[i] = rec
+                        changed()
+
+            def delete(_b):
+                i = selected()
+                if i is not None:
+                    del records[i]
+                    changed()
+
+            for label, handler in (("Add\u2026", add), ("Edit\u2026", edit), ("Remove", delete)):
+                b = Gtk.Button(label=label)
+                b.connect("clicked", handler)
+                buttons.pack_start(b, False, False, 0)
+            view.connect("row-activated", edit)
+            refill()
+            set_b.set_active(value is not None)
+            box.set_sensitive(value is not None)
+
+            def chosen(b):
+                box.set_sensitive(b.get_active())
+                if b.get_active():
+                    set_value([dict(r) for r in records])
+            set_b.connect("toggled", chosen)
+
+        def record_dialog(self, pol, rec):
+            """Add or edit one entry: its fields, checked. None if cancelled."""
+            dlg = Gtk.Dialog(title=pol.title, transient_for=self, modal=True)
+            dlg.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "OK", Gtk.ResponseType.OK)
+            dlg.set_default_response(Gtk.ResponseType.OK)
+            area = dlg.get_content_area()
+            margins(area)
+            grid = Gtk.Grid(row_spacing=8, column_spacing=10)
+            area.add(grid)
+            widgets = {}
+            rows = {}
+            for i, f in enumerate(pol.fields):
+                v = rec.get(f.key)
+                if f.kind == "bool":
+                    w = Gtk.CheckButton(label=f.label, active=bool(v))
+                    grid.attach(w, 1, i, 1, 1)
+                    label = None
+                else:
+                    label = Gtk.Label(label=f.label + ":", xalign=1)
+                    grid.attach(label, 0, i, 1, 1)
+                    if f.kind == "choice":
+                        w = Gtk.ComboBoxText()
+                        for c, l in f.choices:
+                            w.append(c, l)
+                        w.set_active_id(v or f.choices[0][0])
+                    else:
+                        w = Gtk.Entry(text=v or "", hexpand=True, width_chars=34, activates_default=True,
+                                      placeholder_text=f.placeholder, visibility=f.kind != "password")
+                    grid.attach(w, 1, i, 1, 1)
+                widgets[f.key] = w
+                rows[f.key] = (label, w)
+            note = Gtk.Label(xalign=0, wrap=True, max_width_chars=50)
+            note.get_style_context().add_class("dim-label")
+            area.add(note)
+
+            def read():
+                out = {}
+                for f in pol.fields:
+                    w = widgets[f.key]
+                    if f.kind == "bool":
+                        out[f.key] = w.get_active()
+                    elif f.kind == "choice":
+                        out[f.key] = w.get_active_id()
+                    else:
+                        out[f.key] = w.get_text().strip() if f.kind != "password" else w.get_text()
+                # Fields that don't apply (e.g. a username for a WPA2 Personal network) are left out
+                return {k: v for k, v in out.items()
+                        if next(f for f in pol.fields if f.key == k).used(out) and v not in ("", False)}
+
+            def visibility(*_a):
+                current = {f.key: (widgets[f.key].get_active_id() if f.kind == "choice" else None)
+                           for f in pol.fields}
+                for f in pol.fields:
+                    show = f.used(current)
+                    for w in rows[f.key]:
+                        if w is not None:
+                            w.set_visible(show)
+            for f in pol.fields:
+                if f.kind == "choice":
+                    widgets[f.key].connect("changed", visibility)
+            area.show_all()
+            visibility()
+            result = None
+            while dlg.run() == Gtk.ResponseType.OK:
+                candidate = read()
+                err = pol.record_error(candidate)
+                if not err:
+                    result = candidate
+                    break
+                note.set_text(err[:1].upper() + err[1:] + ".")
+            dlg.destroy()
+            return result
 
         def load(self, settings, organization=None):
             if organization is not None:
@@ -373,6 +573,23 @@ def run(fp):
         def on_sign(self, _b):
             self.keep_draft()
             settings = self.values()
+            secrets_in = any(r.get("password") for r in settings.get("network.wifi") or [])
+            if secrets_in and not self.encrypt.get_active():
+                dlg = Gtk.MessageDialog(transient_for=self, modal=True, message_type=Gtk.MessageType.WARNING,
+                                        buttons=Gtk.ButtonsType.NONE,
+                                        text="This policy holds Wi-Fi passwords")
+                dlg.format_secondary_text("Anyone who can fetch the policy file could read them. Encrypt it so "
+                                          "only your enrolled computers can (they need an enrollment file "
+                                          "made after turning encryption on).")
+                dlg.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Sign Without Encrypting", 2,
+                                "Encrypt", Gtk.ResponseType.OK)
+                dlg.set_default_response(Gtk.ResponseType.OK)
+                answer = dlg.run()
+                dlg.destroy()
+                if answer == Gtk.ResponseType.OK:
+                    self.encrypt.set_active(True)
+                elif answer != 2:
+                    return
             if not settings and not self.org.get_text().strip():
                 message(self, Gtk.MessageType.INFO, "Nothing to sign",
                         "Set at least one setting (or give your organization a name).")
