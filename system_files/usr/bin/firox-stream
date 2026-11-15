@@ -1075,15 +1075,8 @@ class Host:
         self.publish()
         GLib.timeout_add_seconds(30, self.watchdog)
         log(f"listening on port {self.port}")
-        threading.Thread(target=self.check_firewall, daemon=True).start()
-
-    def check_firewall(self):
-        closed = firewall_closed(self.port)
-        if closed:
-            log(f"the firewall blocks port {self.port}/tcp in: {', '.join(closed)}")
-            notify("Other computers can't stream this one",
-                   f"The firewall blocks Firox Stream's port. Open Firox Stream and untick and tick "
-                   f"\u201cLet other computers stream this one\u201d to open it.")
+        # (No firewall check here: asking firewalld needs the password,
+        # which mustn't pop up at every login. Turning streaming on checks.)
 
     def publish(self):
         try:
@@ -1502,61 +1495,43 @@ def run_daemon():
     return 0
 
 
-def firewall_closed(port):
-    """The active firewall zones that don't let the port in ([] when
-    firewalld isn't running or the port is open everywhere)."""
-    try:
-        out = subprocess.run(["firewall-cmd", "--get-active-zones"], capture_output=True, text=True, timeout=10)
-    except (OSError, subprocess.SubprocessError):
-        return []
-    if out.returncode != 0:
-        return []
-    # "public (default)\n  interfaces: enp3s0": zone names start a line
-    zones = [line.split()[0] for line in out.stdout.splitlines() if line.strip() and not line[0].isspace()]
-    if not zones:
-        try:
-            zones = [subprocess.run(["firewall-cmd", "--get-default-zone"], capture_output=True, text=True,
-                                    timeout=10).stdout.strip()]
-        except (OSError, subprocess.SubprocessError):
-            return []
-    closed = []
-    for zone in zones:
-        if not zone.replace("-", "").replace("_", "").isalnum():
-            continue
-        try:
-            q = subprocess.run(["firewall-cmd", f"--zone={zone}", f"--query-port={port}/tcp"],
-                               capture_output=True, text=True, timeout=10)
-        except (OSError, subprocess.SubprocessError):
-            continue
-        if q.returncode != 1:               # open (0), or couldn't ask
-            continue
-        # A zone that lets everything in (trusted, e.g. Waydroid's) needs no port
-        try:
-            info = subprocess.run(["firewall-cmd", f"--zone={zone}", "--list-all"], capture_output=True,
-                                  text=True, timeout=10).stdout
-        except (OSError, subprocess.SubprocessError):
-            info = ""
-        if any(line.split() == ["target:", "ACCEPT"] for line in info.splitlines()):
-            continue
-        closed.append(zone)
-    return closed
+# Run as root by open_firewall: let the port in on every active zone that
+# doesn't already (zones whose target is ACCEPT, like trusted, let
+# everything in). Asking firewalld anything needs the password, so it's one
+# script, asked for once.
+FIREWALL_SCRIPT = r"""
+port="$1"
+zones=$(firewall-cmd --get-active-zones 2>/dev/null | grep -v '^[[:space:]]' | cut -d' ' -f1)
+[ -n "$zones" ] || zones=$(firewall-cmd --get-default-zone)
+for z in $zones; do
+    [ "$(firewall-cmd --permanent --zone="$z" --get-target 2>/dev/null)" = ACCEPT ] && continue
+    if ! firewall-cmd --permanent --zone="$z" --query-port="$port/tcp" >/dev/null 2>&1; then
+        firewall-cmd --permanent --zone="$z" --add-port="$port/tcp" >/dev/null || exit 3
+    fi
+    if ! firewall-cmd --zone="$z" --query-port="$port/tcp" >/dev/null 2>&1; then
+        firewall-cmd --zone="$z" --add-port="$port/tcp" >/dev/null || exit 3
+    fi
+done
+"""
 
 
 def open_firewall(port):
-    """Let other computers reach the port (asks for the password). An image
-    update doesn't bring the port to a zone whose settings were changed on
-    this computer (by an old Sunshine install, for example), so check here."""
-    closed = firewall_closed(port)
-    if not closed:
-        return True
-    script = "; ".join(f"firewall-cmd --permanent --zone={z} --add-port={port}/tcp && "
-                       f"firewall-cmd --zone={z} --add-port={port}/tcp" for z in closed)
+    """Let other computers reach the port: one password prompt (when
+    streaming is turned on). An image update doesn't bring the port to a
+    zone whose settings were changed on this computer (by an old Sunshine
+    install, for example), so it's done here. True when it's open (or
+    there's no firewall running)."""
     try:
-        ok = subprocess.run(["pkexec", "sh", "-c", script], stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL).returncode == 0
-    except OSError:
-        ok = False
-    return ok and not firewall_closed(port)
+        running = subprocess.run(["systemctl", "is-active", "--quiet", "firewalld"], timeout=10).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        running = False
+    if not running:
+        return True
+    try:
+        return subprocess.run(["pkexec", "sh", "-c", FIREWALL_SCRIPT, "firox-stream", str(int(port))],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=300).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
 
 
 def set_enabled(on):
