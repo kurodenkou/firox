@@ -99,8 +99,15 @@ def check(key, title, icon, state, status, text, actions=()):
 def c_firewall():
     active = run(["systemctl", "is-active", "firewalld"]) == "active"
     if active:
-        zone = run(["firewall-cmd", "--get-default-zone"], 5) or ""
-        extra = f" (zone: {zone})" if zone and "\n" not in zone else ""
+        # (Not `firewall-cmd`: asking firewalld can need the password, which
+        # mustn't pop up after login. Its config file, when it's readable.)
+        zone = ""
+        try:
+            with open("/etc/firewalld/firewalld.conf") as fh:
+                zone = next((l.split("=", 1)[1].strip() for l in fh if l.startswith("DefaultZone=")), "")
+        except OSError:
+            pass
+        extra = f" (zone: {zone})" if zone else ""
         return check("firewall", "Firewall", "firewall-config", OK, "On",
                      "The firewall blocks connections to this computer that you haven't allowed" + extra + ".")
     if run(["systemctl", "cat", "firewalld"]) in (None, ""):
