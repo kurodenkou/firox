@@ -24,9 +24,8 @@ All programs share one Windows "C: drive" (a Wine prefix) in
 ~/.local/share/firox/windows. You can change any of this with the usual
 variables: WINEPREFIX (another C: drive), PROTONPATH (a Proton folder, or
 GE-Proton / UMU-Proton), GAMEID (a umu game ID, for its game fixes; default
-umu-default), PROTON_ENABLE_WAYLAND (0 by default: XWayland; 1 for Wine's
-native Wayland driver, which still gets the mouse wrong in many games),
-UMU_CONTAINER_NSENTER (1 by
+umu-default), PROTON_ENABLE_WAYLAND (1 by default: Wine's native Wayland
+driver instead of XWayland; 0 for XWayland), UMU_CONTAINER_NSENTER (1 by
 default: programs started while another is running join its container, so
 several can run at once on the same C: drive).
 
@@ -73,9 +72,9 @@ def environment():
     env.setdefault("WINEPREFIX", PREFIX)
     env.setdefault("PROTONPATH", "GE-Proton")
     env.setdefault("GAMEID", "umu-default")
-    # XWayland. Wine's native Wayland driver (PROTON_ENABLE_WAYLAND=1) still
-    # loses clicks and confines the pointer to the wrong area in many games
-    env.setdefault("PROTON_ENABLE_WAYLAND", "0")
+    # Wine's native Wayland driver rather than XWayland (Proton-GE only uses
+    # it when WAYLAND_DISPLAY is set); PROTON_ENABLE_WAYLAND=0 turns it off
+    env.setdefault("PROTON_ENABLE_WAYLAND", "1")
     # More than one program at once: each umu-run normally starts its own
     # Steam Runtime container, and a second container on the same C: drive
     # fights the first one's wineserver, so the second program won't start.
