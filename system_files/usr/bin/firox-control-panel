@@ -85,6 +85,7 @@ APPLETS = [
     ("system-users", "User Accounts", "Change your picture or password", ["@accounts"]),
     ("utilities-system-monitor", "Task Manager", "Running programs and performance", ["firox-open", "task-manager"]),
     ("security-high", "Security Center", "Firewall, updates, backups and other protections", ["firox-security"]),
+    ("preferences-system", "Policy Editor", "Manage your Firox computers from one place with signed policies", ["firox-policy"]),
     ("utilities-log-viewer", "Event Viewer", "Errors, warnings, sign-ins and crashes the system has logged",
      ["firox-eventvwr"]),
     ("computer", "System", "About this computer", ["@system"]),

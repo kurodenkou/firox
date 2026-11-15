@@ -25,12 +25,14 @@
 #   BATTERY_ACTION                  then do BATTERY_ACTION_KIND:
 #   BATTERY_ACTION_KIND             0 nothing, 1 sleep, 2 hibernate, 3 shut down
 # Settings live in ~/.config/firox/power.conf (defaults: /etc/firox/power.conf).
+# Settings a policy sets (/var/lib/firox/policy/power.conf) win over both.
 # Apps that play video or are full screen keep the screen on (idle inhibit),
 # and so does another computer streaming this one (Firox Stream).
 set -u
 
 SYS_CONF=/etc/firox/power.conf
 USER_CONF="${XDG_CONFIG_HOME:-$HOME/.config}/firox/power.conf"
+MANAGED_CONF=/var/lib/firox/policy/power.conf     # set by a policy (firox-policy)
 KEYS="MONITOR_AC MONITOR_BATTERY LOCK SLEEP_AC SLEEP_BATTERY LOCK_ON_WAKE SCREENSAVER_WAIT BATTERY_LOW BATTERY_CRITICAL BATTERY_ACTION BATTERY_ACTION_KIND"
 PS="${FIROX_POWER_SUPPLY:-/sys/class/power_supply}"
 AWAKE="${XDG_RUNTIME_DIR:-/tmp}/firox-stay-awake"
@@ -39,7 +41,9 @@ STREAM_AWAKE="${XDG_RUNTIME_DIR:-/tmp}/firox-stream-awake"
 
 get() {
     local v=""
-    [ -f "$USER_CONF" ] && v="$(sed -n "s/^$1=//p" "$USER_CONF" | tail -n1)"
+    # A policy (firox-policy) wins over Settings
+    [ -f "$MANAGED_CONF" ] && v="$(sed -n "s/^$1=//p" "$MANAGED_CONF" | tail -n1)"
+    [ -n "$v" ] || { [ -f "$USER_CONF" ] && v="$(sed -n "s/^$1=//p" "$USER_CONF" | tail -n1)"; }
     [ -n "$v" ] || v="$(sed -n "s/^$1=//p" "$SYS_CONF" 2>/dev/null | tail -n1)"
     case "$v" in ''|*[!0-9]*) v=0 ;; esac
     echo "$v"
