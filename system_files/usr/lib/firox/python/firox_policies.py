@@ -13,6 +13,7 @@ adding a setting means adding one entry here.
     kind "notice"   {"title": ..., "text": ...}
     kind "records"  a list of {field: value}, the fields described by fields=
                     [Field(...)]; passwords never reach managed.json
+    kind "form"     one {field: value} with those fields (joining a domain)
     kind "addresses" a list of IP addresses
     kind "url"      an http:// or https:// address
     kind "image"    an https:// address of a picture, or a path on the computers
@@ -57,6 +58,11 @@ NM_CONNECTIONS = "/etc/NetworkManager/system-connections"
 NM_PREFIX = "firox-policy-"
 NM_DNS = "/etc/NetworkManager/conf.d/50-firox-policy-dns.conf"
 PRINTERS_STATE = os.path.join(STATE_DIR, "printers.json")
+DOMAIN_STATE = os.path.join(STATE_DIR, "domain.json")
+SSSD_DOMAIN = "/etc/sssd/conf.d/50-firox-policy-domain.conf"
+SSSD_HOMES = "/etc/sssd/conf.d/60-firox-policy-homes.conf"
+NFS_STATE = os.path.join(STATE_DIR, "nfs-homes.json")
+SYSTEMD_DIR = "/etc/systemd/system"
 MAX_WALLPAPER = 40 << 20
 
 # The same timers Security Center checks (whichever this image has)
@@ -201,6 +207,10 @@ class Policy:
                 err = self.record_error(rec)
                 if err:
                     raise PolicyError(err)
+        elif self.kind == "form":
+            err = self.record_error(value)
+            if err:
+                raise PolicyError(err)
         elif self.kind == "url":
             if not isinstance(value, str) or not value.startswith(("https://", "http://")) or len(value) > 2000 \
                     or any(c.isspace() for c in value):
@@ -237,11 +247,20 @@ class Policy:
                     return err
         return None
 
+    def secret(self, key):
+        return any(f.key == key and f.kind == "password" for f in self.fields)
+
+    def has_secrets(self, value):
+        """Whether this value holds a password (the editor warns: encrypt the policy)."""
+        recs = value if self.kind == "records" else [value] if self.kind == "form" else []
+        return any(isinstance(r, dict) and any(self.secret(k) and v for k, v in r.items()) for r in recs)
+
     def public(self, value):
         """The value without secrets, for managed.json and status."""
         if self.kind == "records":
-            return [{k: ("••••••" if any(f.key == k and f.kind == "password" for f in self.fields) and v else v)
-                     for k, v in rec.items()} for rec in value]
+            return [{k: ("••••••" if self.secret(k) and v else v) for k, v in rec.items()} for rec in value]
+        if self.kind == "form":
+            return {k: ("••••••" if self.secret(k) and v else v) for k, v in value.items()}
         return value
 
     def describe(self, value):
@@ -250,6 +269,9 @@ class Policy:
             return f"{n} {self.noun[0] if n == 1 else self.noun[1]}" if n else "None (removes the policy's)"
         if self.kind == "notice":
             return value.get("title") or value.get("text", "").strip().splitlines()[0][:60]
+        if self.kind == "form":
+            return " \u2014 ".join(str(value.get(f.key)) for f in self.fields[:2]
+                                    if value.get(f.key) not in (None, "") and f.kind != "password")
         if self.kind == "addresses":
             return ", ".join(value)
         if self.kind == "bool":
@@ -753,6 +775,302 @@ MONITOR = power_setting("MONITOR_AC", "MONITOR_BATTERY")
 SLEEP = power_setting("SLEEP_AC", "SLEEP_BATTERY")
 
 
+# Active Directory: joined with realmd (adcli + sssd), as `realm join` would.
+# The join account's password is used once and never kept on the computer
+# outside the (root-only) policy; managed.json shows it as dots.
+
+def check_domain(v, _rec):
+    import re
+    if not re.fullmatch(r"(?=.{1,253}$)([A-Za-z0-9-]{1,63}\.)+[A-Za-z0-9-]{2,63}", v):
+        return f"{v} isn't a domain name such as corp.example.com"
+    return None
+
+
+def check_join_user(v, _rec):
+    import re
+    if not re.fullmatch(r"[^\s\\/:*?\"<>|@][^\\/:*?\"<>|]{0,63}(@[A-Za-z0-9.-]+)?", v):
+        return f"{v} isn't an account name"
+    return None
+
+
+def check_ou(v, _rec):
+    import re
+    if not re.fullmatch(r"(OU|CN)=[^,=]+(,(OU|CN|DC)=[^,=]+)*", v, re.IGNORECASE):
+        return "The OU must be written like OU=Workstations,DC=corp,DC=example,DC=com"
+    return None
+
+
+def check_computer_name(v, _rec):
+    import re
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,14}", v):
+        return "A computer name is 1 to 15 letters, digits or dashes (the AD limit)"
+    return None
+
+
+def check_groups(v, _rec):
+    groups = [g.strip() for g in v.split(",") if g.strip()]
+    if not groups or any(len(g) > 256 or any(c in g for c in "\n:") for g in groups):
+        return "List the groups separated by commas"
+    return None
+
+
+DOMAIN_FIELDS = [
+    Field("domain", "Domain", placeholder="corp.example.com", check=check_domain),
+    Field("user", "Join account", placeholder="an account allowed to join computers", check=check_join_user),
+    Field("password", "Its password", kind="password"),
+    Field("ou", "Put computers in (OU)", required=False, placeholder="OU=Workstations,DC=corp,DC=example,DC=com",
+          check=check_ou),
+    Field("computer_name", "Computer name", required=False,
+          placeholder="leave empty to use each computer's own name", check=check_computer_name),
+    Field("groups", "Who may log in", required=False,
+          placeholder="groups, e.g. Domain Users, IT Staff (empty: everyone in the domain)", check=check_groups),
+    Field("short_names", "Log in with just the user name (jsmith, not jsmith@corp.example.com)", kind="bool",
+          required=False),
+    Field("posix", "Use the UID and GID numbers set in Active Directory (uidNumber/gidNumber), e.g. for NFS",
+          kind="bool", required=False),
+]
+
+
+def read_json_file(path, default):
+    import json
+    try:
+        with open(path) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return default
+
+
+def write_json_file(path, data):
+    import json
+    write_file(path, json.dumps(data, indent=1), 0o600)
+
+
+def joined_domains():
+    """The realms this computer is joined to (lower case)."""
+    out = run("realm", "list", "--name-only", check=False).stdout
+    return [l.strip().lower() for l in out.splitlines() if l.strip()]
+
+
+def authselect_current():
+    """The authselect profile and features now (to put back when leaving)."""
+    p = run("authselect", "current", "--raw", check=False)
+    return p.stdout.strip() if p.returncode == 0 else ""
+
+
+def apply_domain(value):
+    domain = value["domain"].lower()
+    state = read_json_file(DOMAIN_STATE, {})
+    done = []
+    joined = joined_domains()
+    for other in joined:
+        if other != domain:
+            run("realm", "leave", other, check=False)
+            done.append(f"left {other}")
+    if domain not in joined:
+        if "previous_auth" not in state:
+            state["previous_auth"] = authselect_current() or "local"
+        cmd = ["realm", "join", "--verbose", f"--user={value['user']}", "--membership-software=adcli",
+               "--client-software=sssd"]
+        if value.get("ou"):
+            cmd.append(f"--computer-ou={value['ou']}")
+        if value.get("computer_name"):
+            cmd.append(f"--computer-name={value['computer_name']}")
+        cmd.append(domain)
+        # The password goes in on standard input, never on a command line
+        p = subprocess.run(cmd, input=value["password"] + "\n", capture_output=True, text=True, timeout=300)
+        if p.returncode != 0:
+            lines = [l for l in (p.stderr or p.stdout).splitlines() if l.strip()
+                     and not l.startswith((" *", "Password for"))]
+            raise PolicyError(f"couldn't join {domain}: " + (lines[-1] if lines else "realm join failed"))
+        done.append(f"joined {domain}")
+    # sssd settings for the domain: how names look, where homes are, which IDs
+    short = bool(value.get("short_names"))
+    lines = [f"[domain/{domain}]",
+             f"use_fully_qualified_names = {'False' if short else 'True'}",
+             f"fallback_homedir = /home/{'%u' if short else '%u@%d'}"]
+    if value.get("posix"):
+        lines.append("ldap_id_mapping = False")
+    text = "# Written by firox-policy (accounts.domain); changes here are overwritten.\n" + \
+        "\n".join(lines) + "\n"
+    if read_text(SSSD_DOMAIN) != text:
+        write_file(SSSD_DOMAIN, text, 0o600)
+        restart_sssd()
+        done.append("sssd settings")
+    # Home folders made at the first login
+    if "with-mkhomedir" not in authselect_current().split():
+        run("authselect", "select", "sssd", "with-mkhomedir", "--force")
+    if unit_exists("oddjobd.service"):
+        run("systemctl", "enable", "--now", "oddjobd.service", check=False)
+    # Who may log in
+    groups = [g.strip() for g in (value.get("groups") or "").split(",") if g.strip()]
+    if groups != state.get("groups"):
+        if groups:
+            run("realm", "deny", "--all")
+            run("realm", "permit", "--groups", *groups)
+        else:
+            run("realm", "permit", "--all")
+        done.append("logins: " + (", ".join(groups) if groups else "everyone in the domain"))
+    state.update(domain=domain, groups=groups)
+    write_json_file(DOMAIN_STATE, state)
+    return "; ".join(done) if done else f"joined to {domain}"
+
+
+def read_text(path):
+    try:
+        with open(path) as fh:
+            return fh.read()
+    except OSError:
+        return None
+
+
+def restart_sssd():
+    if unit_exists("sssd.service"):
+        run("systemctl", "restart", "sssd.service", check=False)
+
+
+def release_domain():
+    state = read_json_file(DOMAIN_STATE, {})
+    for d in joined_domains():
+        run("realm", "leave", d, check=False)
+    remove(SSSD_DOMAIN)
+    previous = (state.get("previous_auth") or "local").split()
+    run("authselect", "select", *previous, "--force", check=False)
+    remove(DOMAIN_STATE)
+
+
+# NFS home folders: the export mounted on demand (systemd automount, no
+# autofs), and optionally where domain users' home folders are
+
+def check_host(v, _rec):
+    import ipaddress
+    import re
+    try:
+        ipaddress.ip_address(v.strip("[]"))
+        return None
+    except ValueError:
+        pass
+    if not re.fullmatch(r"(?=.{1,253}$)[A-Za-z0-9]([A-Za-z0-9-]{0,62})(\.[A-Za-z0-9-]{1,63})*", v):
+        return f"{v} isn't a server name or IP address"
+    return None
+
+
+def check_export(v, _rec):
+    import re
+    if not v.startswith("/") or ".." in v.split("/") or not re.fullmatch(r"/[A-Za-z0-9._/@+-]*", v):
+        return "The export is a path on the server, e.g. /export/home"
+    return None
+
+
+NFS_PLACES = ("/var/", "/mnt/", "/srv/")
+NFS_NOT = ("/var/home", "/var/lib", "/var/log", "/var/cache", "/var/tmp", "/var/roothome", "/var/usrlocal",
+           "/var/opt", "/var/mnt", "/var/srv")
+
+
+def check_mount_at(v, _rec):
+    import re
+    p = os.path.normpath(v)
+    if not re.fullmatch(r"/[A-Za-z0-9._/-]+", v) or ".." in v.split("/") or \
+            not p.startswith(NFS_PLACES) or any(p == n or p.startswith(n + "/") for n in NFS_NOT):
+        return ("Mount it in a folder of its own under /var, /mnt or /srv (the rest of the system is "
+                "read-only), e.g. /var/nethome; not over the local home folders")
+    return None
+
+
+def check_options(v, _rec):
+    import re
+    if not re.fullmatch(r"[A-Za-z0-9_=.,:-]+", v):
+        return "Extra options are separated by commas, e.g. noatime,rsize=1048576"
+    return None
+
+
+NFS_FIELDS = [
+    Field("server", "Server", placeholder="files.corp.example.com", check=check_host),
+    Field("export", "Export", placeholder="/export/home", check=check_export),
+    Field("mount_at", "Mount at", required=False, placeholder="/var/nethome", check=check_mount_at),
+    Field("version", "NFS version", kind="choice",
+          choices=[("4.2", "NFS 4.2"), ("4.1", "NFS 4.1"), ("4", "NFS 4.0"), ("3", "NFS 3")]),
+    Field("security", "Security", kind="choice",
+          choices=[("sys", "User IDs (sec=sys)"), ("krb5", "Kerberos (sec=krb5, needs the domain)"),
+                   ("krb5i", "Kerberos with integrity (krb5i)"), ("krb5p", "Kerberos, encrypted (krb5p)")]),
+    Field("options", "Extra mount options", required=False, placeholder="noatime", check=check_options),
+    Field("homes", "Domain users' home folders are here (MOUNT/username)", kind="bool", required=False),
+]
+
+
+def nfs_units(where):
+    name = run("systemd-escape", "--path", where).stdout.strip()
+    return f"{name}.mount", f"{name}.automount"
+
+
+def apply_nfs_homes(value):
+    where = os.path.normpath(value.get("mount_at") or "/var/nethome")
+    old = read_json_file(NFS_STATE, {})
+    if old.get("where") and old["where"] != where:
+        release_nfs_homes(keep_homes=True)
+    mount, automount = nfs_units(where)
+    server = value["server"]
+    if ":" in server and not server.startswith("["):
+        server = f"[{server}]"                     # an IPv6 address
+    sec = value.get("security") or "sys"
+    opts = [f"vers={value.get('version') or '4.2'}", f"sec={sec}", "_netdev", "nosuid", "nodev"]
+    opts += [o for o in (value.get("options") or "").split(",") if o]
+    source = f"{server}:{value['export']}"
+    units = {
+        mount: "# Written by firox-policy (storage.nfs_homes)\n[Unit]\n"
+               f"Description=Home folders from {source} (firox-policy)\n"
+               "Wants=network-online.target\nAfter=network-online.target\n\n"
+               f"[Mount]\nWhat={source}\nWhere={where}\nType=nfs\nOptions={','.join(opts)}\n"
+               "TimeoutSec=30\n",
+        automount: "# Written by firox-policy (storage.nfs_homes)\n[Unit]\n"
+                   f"Description=Home folders from {source}, mounted when used (firox-policy)\n\n"
+                   f"[Automount]\nWhere={where}\nTimeoutIdleSec=0\n\n"
+                   "[Install]\nWantedBy=remote-fs.target\n",
+    }
+    changed = False
+    for name, text in units.items():
+        path = os.path.join(SYSTEMD_DIR, name)
+        if read_text(path) != text:
+            write_file(path, text)
+            changed = True
+    os.makedirs(where, mode=0o755, exist_ok=True)
+    if sec.startswith("krb5"):
+        # Kerberos needs the host's keytab (from joining the domain) and gssd
+        run("systemctl", "enable", "--now", "rpc-gssd.service", check=False)
+    if changed:
+        run("systemctl", "daemon-reload")
+        run("systemctl", "stop", mount, check=False)
+        run("systemctl", "enable", automount)
+        run("systemctl", "restart", automount)
+    # Domain users' home folders
+    homes = bool(value.get("homes"))
+    text = ("# Written by firox-policy (storage.nfs_homes)\n[nss]\n"
+            f"override_homedir = {where}/%u\n") if homes else None
+    if read_text(SSSD_HOMES) != text:
+        if text:
+            write_file(SSSD_HOMES, text, 0o600)
+        else:
+            remove(SSSD_HOMES)
+        restart_sssd()
+    write_json_file(NFS_STATE, {"where": where, "units": [mount, automount]})
+    what = f"{source} at {where}" + (" (mounted when used)" if changed else "")
+    return what + ("; domain users' home folders are there" if homes else "")
+
+
+def release_nfs_homes(keep_homes=False):
+    state = read_json_file(NFS_STATE, {})
+    units = state.get("units") or []
+    for unit in reversed(units):
+        run("systemctl", "disable", "--now", unit, check=False)
+    for unit in units:
+        remove(os.path.join(SYSTEMD_DIR, unit))
+    if units:
+        run("systemctl", "daemon-reload", check=False)
+    if not keep_homes and read_text(SSSD_HOMES) is not None:
+        remove(SSSD_HOMES)
+        restart_sssd()
+    remove(NFS_STATE)
+
+
 POLICIES = [
     Policy("login.banner", "System", "Login banner",
            "A notice everyone must acknowledge on the login screen before logging in (and that SSH shows "
@@ -802,6 +1120,19 @@ POLICIES = [
            "The DNS servers every connection uses, instead of the ones the network offers. Separate "
            "them with commas.", "addresses", apply_dns, release=release_dns,
            placeholder="9.9.9.9, 149.112.112.112"),
+    Policy("accounts.domain", "Network/Domain", "Active Directory",
+           "Join every computer to an Active Directory domain (realmd, with SSSD), so people log in with "
+           "their domain accounts: on the login screen, click Other user\u2026 and type the user name. Home "
+           "folders are made at the first login. The join account's password is used only to join; "
+           "encrypt policies that hold it. Removing this setting leaves the domain.",
+           "form", apply_domain, release=release_domain, fields=DOMAIN_FIELDS),
+    Policy("storage.nfs_homes", "Network/Domain", "NFS home folders",
+           "Mount home folders from an NFS server on every computer, when they're first used (systemd "
+           "automount). With \u201cDomain users' home folders are here\u201d, people who log in with a "
+           "domain account get MOUNT/username as their home folder; it has to exist on the server and "
+           "belong to them. Kerberos security needs Active Directory set too; with user IDs (sec=sys), "
+           "use the UID numbers from Active Directory so they match the server's.",
+           "form", apply_nfs_homes, release=release_nfs_homes, fields=NFS_FIELDS),
     Policy("devices.printers", "Devices", "Printers",
            "Printers every computer has, added driverless (IPP Everywhere): most network printers "
            "made in the last ten years work.", "records", apply_printers, release=release_printers,
