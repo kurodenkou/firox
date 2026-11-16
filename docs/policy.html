@@ -38,7 +38,8 @@
 <ul class="toc">
     <li><a href="#why">Why it's built this way</a></li>
     <li><a href="#start">Getting started</a></li>
-    <li><a href="#settings">The 30 settings</a></li>
+    <li><a href="#settings">The 32 settings</a></li>
+    <li><a href="#domain">Active Directory and NFS home folders</a></li>
     <li><a href="#computers">On managed computers</a></li>
     <li><a href="#security">Security</a></li>
     <li><a href="#reference">Command reference</a></li>
@@ -53,7 +54,7 @@
         <p>It's in the Start menu and in Settings, or run <code>firox-policy</code>.</p>
     </div>
     <figure>
-    <img src="screenshots/policy-editor.png" alt="The Policy Editor: folders of settings, with the Wi-Fi networks list" loading="lazy">
+    <img src="screenshots/policy-editor.png" alt="The Policy Editor: folders of settings, with the Firefox home page selected" loading="lazy">
 </figure>
 </div>
 
@@ -94,7 +95,7 @@
 <p>That's it. Computers check for a new policy when they start and every 30 minutes. To change something, edit, sign and publish again.</p>
 <div class="note"><b>Encrypted policies</b> need an enrollment file made after you turn encryption on: it carries the key computers decrypt with. Copy it only to the computers you enroll.</div>
 
-<h2 id="settings">The 30 settings</h2>
+<h2 id="settings">The 32 settings</h2>
 <p>Each setting is either <b>Not configured</b>, and left to each person, or set and locked: people can't change it in Settings, and the computer puts it back if it's changed some other way, at the next check.</p>
 <div class="table-wrap">
 <table class="internals">
@@ -119,6 +120,9 @@
         <tr class="group"><th colspan="3">Network</th></tr>
         <tr><th scope="row">Wi-Fi networks<br><code>network.wifi</code></th><td>Wi-Fi networks every computer knows and joins by itself. Passwords are kept for the system, readable only by root. Encrypt policies that hold Wi-Fi passwords.</td><td>a list of networks</td></tr>
         <tr><th scope="row">DNS servers<br><code>network.dns</code></th><td>The DNS servers every connection uses, instead of the ones the network offers. Separate them with commas.</td><td>IP addresses</td></tr>
+        <tr class="group"><th colspan="3">Network/Domain</th></tr>
+        <tr><th scope="row">Active Directory<br><code>accounts.domain</code></th><td>Join every computer to an Active Directory domain (realmd, with SSSD), so people log in with their domain accounts: on the login screen, click Other user… and type the user name. Home folders are made at the first login. The join account's password is used only to join; encrypt policies that hold it. Removing this setting leaves the domain.</td><td>domain, join account, its password, put computers in, computer name, who may log in</td></tr>
+        <tr><th scope="row">NFS home folders<br><code>storage.nfs_homes</code></th><td>Mount home folders from an NFS server on every computer, when they're first used (systemd automount). With “Domain users' home folders are here”, people who log in with a domain account get MOUNT/username as their home folder; it has to exist on the server and belong to them. Kerberos security needs Active Directory set too; with user IDs (sec=sys), use the UID numbers from Active Directory so they match the server's.</td><td>server, export, mount at, nfs version, security, extra mount options</td></tr>
         <tr class="group"><th colspan="3">Devices</th></tr>
         <tr><th scope="row">Printers<br><code>devices.printers</code></th><td>Printers every computer has, added driverless (IPP Everywhere): most network printers made in the last ten years work.</td><td>a list of printers</td></tr>
         <tr><th scope="row">USB drives<br><code>devices.usb_storage</code></th><td>Whether USB drives (memory sticks, external disks) can be used. Blocked takes effect from the next drive plugged in; keyboards, mice and other USB devices aren't affected.</td><td>Allowed / Blocked</td></tr>
@@ -142,6 +146,14 @@
     </tbody>
 </table>
 </div>
+
+<h2 id="domain">Active Directory and NFS home folders</h2>
+<p>Two settings in <b>Network &rsaquo; Domain</b> turn a group of Firox computers into domain members, much like joining Windows PCs to a domain:</p>
+<ul>
+    <li><b>Active Directory</b> joins every computer to your domain with realmd (adcli and SSSD, as <code>realm join</code> would), so people log in with their domain account: on the login screen they click <b>Other user&hellip;</b> and type their user name, and the lock screen takes their domain password too. Home folders are made at the first login. You can put the computers in an OU, name them, choose which groups may log in, let people log in with just their user name, and use the UID and GID numbers set in Active Directory. The join account's password is used only to join (typed into <code>realm</code>, never on a command line) and shows as dots everywhere people can look; the editor asks you to encrypt policies that hold it. Removing the setting leaves the domain and puts the computer's login settings back as they were.</li>
+    <li><b>NFS home folders</b> mounts an export on every computer when it's first used (a systemd automount: nothing waits for the server at startup), with the NFS version and security you choose: user IDs (<code>sec=sys</code>) or Kerberos (<code>krb5</code>, <code>krb5i</code>, <code>krb5p</code>, which use the computer's domain account). Ticked, <b>Domain users' home folders are here</b> gives everyone who logs in with a domain account <i>mount</i>/<i>username</i> as their home folder; local accounts keep theirs. With <code>sec=sys</code>, also tick <b>Use the UID and GID numbers set in Active Directory</b> so files belong to the same people on every computer and on the server.</li>
+</ul>
+<p>The mount point must be under <code>/var</code>, <code>/mnt</code> or <code>/srv</code> (Firox's system folders are read-only), and can't be the local home folders. Computers need Firox with these packages (sssd-ad, adcli, krb5-workstation, oddjob-mkhomedir), which are in the image.</p>
 
 <h2 id="computers">On managed computers</h2>
 <ul>

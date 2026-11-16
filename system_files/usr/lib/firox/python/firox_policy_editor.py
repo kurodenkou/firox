@@ -258,6 +258,8 @@ def run(fp):
                 self.notice_editor(pol, value, off, set_value)
             elif pol.kind == "records":
                 self.records_editor(pol, value, off, set_value)
+            elif pol.kind == "form":
+                self.form_editor(pol, value, off, set_value)
             else:
                 row = Gtk.Box(spacing=6)
                 set_b = Gtk.RadioButton.new_with_label_from_widget(off, "Set to")
@@ -429,6 +431,57 @@ def run(fp):
                     set_value([dict(r) for r in records])
             set_b.connect("toggled", chosen)
 
+        def form_editor(self, pol, value, off, set_value):
+            """One set of fields (joining a domain, NFS home folders): a summary
+            and Edit… (the same dialog as a list's entries)."""
+            current = {"value": dict(value) if value else None}
+            set_b = Gtk.RadioButton.new_with_label_from_widget(off, "Use these settings")
+            self.detail.add(set_b)
+            box = Gtk.Box(spacing=8, margin_start=24)
+            summary = Gtk.Label(xalign=0, wrap=True, max_width_chars=48)
+            box.pack_start(summary, True, True, 0)
+            edit = Gtk.Button(label="Edit\u2026", valign=Gtk.Align.START)
+            box.pack_start(edit, False, False, 0)
+            self.detail.add(box)
+
+            def show():
+                v = current["value"]
+                if not v:
+                    summary.set_text("Not filled in yet.")
+                    return
+                lines = []
+                for f in pol.fields:
+                    x = v.get(f.key)
+                    if f.kind == "bool":
+                        if x:
+                            lines.append("\u2713 " + f.label)
+                    elif x not in (None, ""):
+                        shown = "\u2022" * 8 if f.kind == "password" else dict(f.choices).get(x, x) \
+                            if f.kind == "choice" else x
+                        lines.append(f"{f.label}: {shown}")
+                summary.set_text("\n".join(lines))
+
+            def do_edit(*_a):
+                rec = self.record_dialog(pol, current["value"] or {})
+                if rec is not None:
+                    current["value"] = rec
+                    show()
+                    set_b.set_active(True)
+                    set_value(dict(rec))
+            edit.connect("clicked", do_edit)
+            show()
+            set_b.set_active(value is not None)
+            box.set_sensitive(value is not None)
+
+            def chosen(b):
+                box.set_sensitive(b.get_active())
+                if b.get_active():
+                    if current["value"]:
+                        set_value(dict(current["value"]))
+                    else:
+                        GLib.idle_add(do_edit)
+            set_b.connect("toggled", chosen)
+
         def record_dialog(self, pol, rec):
             """Add or edit one entry: its fields, checked. None if cancelled."""
             dlg = Gtk.Dialog(title=pol.title, transient_for=self, modal=True)
@@ -573,11 +626,12 @@ def run(fp):
         def on_sign(self, _b):
             self.keep_draft()
             settings = self.values()
-            secrets_in = any(r.get("password") for r in settings.get("network.wifi") or [])
-            if secrets_in and not self.encrypt.get_active():
+            holding = [P.BY_KEY[k].title for k, v in settings.items()
+                       if k in P.BY_KEY and P.BY_KEY[k].has_secrets(v)]
+            if holding and not self.encrypt.get_active():
                 dlg = Gtk.MessageDialog(transient_for=self, modal=True, message_type=Gtk.MessageType.WARNING,
                                         buttons=Gtk.ButtonsType.NONE,
-                                        text="This policy holds Wi-Fi passwords")
+                                        text="This policy holds passwords (" + ", ".join(holding) + ")")
                 dlg.format_secondary_text("Anyone who can fetch the policy file could read them. Encrypt it so "
                                           "only your enrolled computers can (they need an enrollment file "
                                           "made after turning encryption on).")

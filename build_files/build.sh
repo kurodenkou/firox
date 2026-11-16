@@ -127,6 +127,12 @@ PACKAGES=(
     avahi-tools                  # finding computers on the network
     clamav                       # Virus Scan (firox-virusscan): clamscan
     clamav-freshclam             # ... and its virus definitions, kept up to date
+    # --- Active Directory and NFS home folders (firox-policy: accounts.domain, storage.nfs_homes) ---
+    sssd-ad                      # logging in with domain accounts (realmd joins with it)
+    sssd-krb5
+    adcli                        # joining the domain
+    krb5-workstation             # kinit/klist, Kerberos for sec=krb5 NFS
+    oddjob-mkhomedir             # home folders made at the first login
 
     # --- Screen savers (Control Panel > Screen Saver) ---
     asciiquarium
