@@ -1628,12 +1628,36 @@ class Bell(Indicator):
         self.mon.connect("changed", lambda *_a: self.update())
         self.update()
 
+    def unread(self):
+        """How many notifications arrived since the panel was last opened
+        (firox-notifications keeps the history and the last one seen)."""
+        try:
+            with open(os.path.join(STATE, "notifications.json")) as fh:
+                items = json.load(fh)
+        except (OSError, ValueError):
+            return 0
+        try:
+            with open(os.path.join(STATE, "notifications-seen")) as fh:
+                seen = int(fh.read().strip() or 0)
+        except (OSError, ValueError):
+            seen = 0
+        if not isinstance(items, list):
+            return 0
+        return sum(1 for n in items if isinstance(n, dict) and n.get("seq", 0) > seen)
+
     def update(self):
         dnd = os.path.exists(os.path.join(STATE, "do-not-disturb"))
+        new = self.unread()
+        if dnd:
+            tip, cls = "Do Not Disturb is on", "dnd"
+        elif new:
+            tip, cls = f"{new} new notification{'s' if new != 1 else ''}", "unread"
+        else:
+            tip, cls = "Notifications", "read"
+        if dnd and new:
+            tip += f" ({new} new)"
         self.set(FA_BELL_OFF if dnd else FA_BELL,
-                 ("Do Not Disturb is on" if dnd else "Notifications")
-                 + "\nClick to open. Right-click for Do Not Disturb.",
-                 ["dnd"] if dnd else ["read"])
+                 tip + "\nClick to open. Right-click for Do Not Disturb.", [cls])
 
     def left(self):
         spawn(["firox-notifications", "toggle"])

@@ -156,6 +156,8 @@ button.quick-launch:active {
 
 /* Do Not Disturb */
 #custom-notifications.dnd { color: #b8d4ff; }
+/* notifications you haven't opened yet */
+#custom-notifications.unread { color: #ffd83a; text-shadow: 0 0 4px rgba(255, 216, 58, 0.75); }
 
 /* update waiting for a restart (firox-updates) */
 #custom-updates.pending { color: #fff6a8; }

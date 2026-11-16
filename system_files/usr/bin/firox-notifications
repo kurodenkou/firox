@@ -144,9 +144,13 @@ def when(ts):
 # -------------------------------------------------------------------- status --
 
 def status():
-    """The bell: just Do Not Disturb on or off (no count of new ones)."""
+    """The bell: Do Not Disturb, or lit while there are notifications you
+    haven't opened the panel to see (no count on the bell itself)."""
+    new = len(unread(load()))
     if dnd_on():
         text, cls, tip = BELL_OFF, "dnd", "Do Not Disturb is on"
+    elif new:
+        text, cls, tip = BELL, "unread", f"{new} new notification{'s' if new != 1 else ''}"
     else:
         text, cls, tip = BELL, "read", "Notifications"
     tip += "\nClick to open. Right-click for Do Not Disturb."
