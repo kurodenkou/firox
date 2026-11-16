@@ -102,7 +102,9 @@ def shared_container(env):
     import hashlib
     from pathlib import Path
     pfx = str(Path(env["WINEPREFIX"]).expanduser().resolve(strict=False))
-    name = "com.steampowered.App" + hashlib.md5(pfx.encode()).hexdigest()
+    # umu-launcher names the service after the MD5 of the prefix path; this has
+    # to match it, so it stays MD5 (an identifier, not a security check)
+    name = "com.steampowered.App" + hashlib.md5(pfx.encode(), usedforsecurity=False).hexdigest()
     try:
         r = subprocess.run(["gdbus", "call", "--session", "--dest", "org.freedesktop.DBus",
                             "--object-path", "/org/freedesktop/DBus",

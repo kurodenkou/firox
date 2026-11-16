@@ -41,12 +41,30 @@ try:
 except (ValueError, ImportError):
     Secret = None
 
-CONFIG = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "firox")
+
+
+def xdg_dir(var, default):
+    """An XDG base folder from the environment. The spec says relative
+    paths are to be ignored, so only an absolute one counts."""
+    value = os.environ.get(var, "")
+    return os.path.normpath(value) if os.path.isabs(value) else default
+
+
+CONFIG = os.path.join(xdg_dir("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "firox")
 STORE = os.path.join(CONFIG, "connections.json")
-LOGDIR = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
-                      "firox", "mounts")
-RUNTIME = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+LOGDIR = os.path.join(xdg_dir("XDG_STATE_HOME", os.path.expanduser("~/.local/state")), "firox", "mounts")
+RUNTIME = xdg_dir("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
 MOUNTS = os.path.join(RUNTIME, "firox-mounts")
+
+
+def inside(folder, name):
+    """folder/name, made sure to be a direct child of folder (symlinks
+    resolved): a name can't step out of it. ValueError if it would."""
+    base = os.path.realpath(folder)
+    path = os.path.realpath(os.path.join(base, name))
+    if os.path.dirname(path) != base or os.path.basename(path) in ("", ".", ".."):
+        raise ValueError(f"{name!r} isn't a plain name in {folder}")
+    return path
 
 # kind: (label, icon, backend, default port)
 KINDS = {
@@ -189,9 +207,14 @@ def rclone_unit(conn):
 
 
 def mountpoint(conn):
-    """Where an S3/B2 connection appears (private to you)."""
-    safe = re.sub(r"[/\0]", "-", conn.get("name") or conn["id"]).strip() or conn["id"]
-    return os.path.join(MOUNTS, safe)
+    """Where an S3/B2 connection appears (private to you): a folder named
+    after it in MOUNTS, never anywhere else."""
+    fallback = re.sub(r"[^a-zA-Z0-9_-]", "-", conn["id"]) or "connection"
+    safe = re.sub(r"[/\0]", "-", conn.get("name") or "").strip().lstrip(".") or fallback
+    try:
+        return inside(MOUNTS, safe)
+    except ValueError:
+        return inside(MOUNTS, fallback)
 
 
 def rclone_env(conn, secret):
@@ -217,8 +240,10 @@ def rclone_env(conn, secret):
 
 
 def log_path(conn, suffix=""):
+    """A connection's log, in LOGDIR (the name can't step out of it)."""
     os.makedirs(LOGDIR, mode=0o700, exist_ok=True)
-    return os.path.join(LOGDIR, re.sub(r"[^a-zA-Z0-9_.-]", "-", conn["id"]) + suffix + ".log")
+    name = re.sub(r"[^a-zA-Z0-9_-]", "-", conn["id"] + suffix).lstrip("-") or "connection"
+    return inside(LOGDIR, name + ".log")
 
 
 def log_problem(path, fallback):
@@ -269,8 +294,9 @@ def mount_rclone(conn, secret, done):
     unit = rclone_unit(conn)
     log = log_path(conn)
     try:
-        os.remove(log)                    # rclone appends; one log per connect
-    except OSError:
+        if os.path.isfile(log):           # rclone appends; one log per connect
+            os.remove(inside(LOGDIR, os.path.basename(log)))
+    except (OSError, ValueError):
         pass
     rclone_args = ["rclone", "mount", rclone_target(conn), point,
                    "--vfs-cache-mode", "writes", "--dir-cache-time", "30s", "--umask", "077",

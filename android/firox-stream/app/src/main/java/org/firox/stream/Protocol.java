@@ -21,14 +21,16 @@ import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.SecureRandom;
-import java.security.cert.Certificate;
+import java.security.cert.CertificateException;
 import java.security.cert.X509Certificate;
 import java.util.ArrayList;
+import java.util.Iterator;
 import java.util.List;
 
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLHandshakeException;
 import javax.net.ssl.SSLSocket;
 import javax.net.ssl.TrustManager;
 import javax.net.ssl.X509TrustManager;
@@ -191,20 +193,101 @@ public final class Protocol {
         JSONObject get(String fingerprint);
 
         void put(String fingerprint, JSONObject host);
+
+        /**
+         * The certificate fingerprint a computer at this address must have
+         * (one paired before there), or null: then any certificate is
+         * accepted, and pairing with the PIN shown on that computer proves
+         * which one it is.
+         */
+        String pinned(String host, int port);
+    }
+
+    /**
+     * The computer answered with a different certificate from the one it had
+     * when this device paired with it. Nothing is sent to it.
+     */
+    public static final class IdentityChangedException extends IOException {
+        public final String expected, actual;
+
+        IdentityChangedException(String expected, String actual) {
+            super("Its identity has changed since this device paired with it.");
+            this.expected = expected;
+            this.actual = actual;
+        }
+    }
+
+    /**
+     * The host's certificate is self-signed, so it can't be checked against
+     * certificate authorities. Instead it's pinned: once paired, a computer
+     * must always present the same certificate (by SHA-256 fingerprint),
+     * checked here during the TLS handshake, before anything is sent.
+     */
+    static final class PinningTrustManager implements X509TrustManager {
+        private final String expected;
+        volatile String fingerprint;
+        volatile boolean mismatch;
+
+        PinningTrustManager(String expected) {
+            this.expected = expected;
+        }
+
+        @Override
+        public void checkClientTrusted(X509Certificate[] chain, String auth) throws CertificateException {
+            throw new CertificateException("this app never accepts connections");
+        }
+
+        @Override
+        public void checkServerTrusted(X509Certificate[] chain, String auth) throws CertificateException {
+            if (chain == null || chain.length == 0) {
+                throw new CertificateException("no certificate");
+            }
+            try {
+                fingerprint = hex(MessageDigest.getInstance("SHA-256").digest(chain[0].getEncoded()));
+            } catch (Exception e) {
+                throw new CertificateException(e);
+            }
+            if (expected != null && !expected.equalsIgnoreCase(fingerprint)) {
+                mismatch = true;
+                throw new CertificateException("certificate changed");
+            }
+        }
+
+        @Override
+        public X509Certificate[] getAcceptedIssuers() {
+            return new X509Certificate[0];
+        }
     }
 
     /** Connect and pair if needed. Blocking: call from a background thread. */
-    public static Session connect(Context ctx, String host, int port, Questions ask) throws Exception {
+    public static Session connect(Context ctx, String host, int port, String fingerprint, Questions ask)
+            throws Exception {
         Context app = ctx.getApplicationContext();
         return connect(host, port, deviceName(app), ask, new Store() {
-            public JSONObject get(String fingerprint) {
-                return hosts(app).optJSONObject(fingerprint);
+            public JSONObject get(String fp) {
+                return hosts(app).optJSONObject(fp);
             }
 
-            public void put(String fingerprint, JSONObject h) {
+            public String pinned(String h, int p) {
+                if (fingerprint != null) {
+                    return fingerprint;         // picked from the list of paired computers
+                }
+                JSONObject all = hosts(app);
+                for (Iterator<String> it = all.keys(); it.hasNext(); ) {
+                    String fp = it.next();
+                    JSONObject e = all.optJSONObject(fp);
+                    if (e != null && h.equalsIgnoreCase(e.optString("address"))
+                            && p == e.optInt("port", PORT)) {
+                        return fp;
+                    }
+                }
+                return null;
+            }
+
+            public void put(String fp, JSONObject h) {
                 try {
                     JSONObject all = hosts(app);
-                    all.put(fingerprint, h);
+                    all.put(fp, h);
                     saveHosts(app, all);
                 } catch (JSONException ignored) {
                 }
@@ -218,25 +301,25 @@ public final class Protocol {
         raw.connect(new InetSocketAddress(host, port), 10000);
         raw.setTcpNoDelay(true);
         raw.setKeepAlive(true);
+        String expected = store.pinned(host, port);
+        PinningTrustManager trust = new PinningTrustManager(expected);
         SSLContext tls = SSLContext.getInstance("TLS");
-        // The host's certificate is self-signed: it's checked by its fingerprint
-        // (paired hosts are remembered by it), as the desktop client does
-        tls.init(null, new TrustManager[]{new X509TrustManager() {
-            public void checkClientTrusted(X509Certificate[] chain, String auth) {
-            }
-
-            public void checkServerTrusted(X509Certificate[] chain, String auth) {
-            }
-
-            public X509Certificate[] getAcceptedIssuers() {
-                return new X509Certificate[0];
-            }
-        }}, new SecureRandom());
+        tls.init(null, new TrustManager[]{trust}, new SecureRandom());
         SSLSocket sock = (SSLSocket) tls.getSocketFactory().createSocket(raw, host, port, true);
+        sock.setEnabledProtocols(tlsVersions(sock.getSupportedProtocols()));
         try {
-            sock.startHandshake();
-            Certificate[] chain = sock.getSession().getPeerCertificates();
-            String fingerprint = hex(MessageDigest.getInstance("SHA-256").digest(chain[0].getEncoded()));
+            try {
+                sock.startHandshake();
+            } catch (SSLHandshakeException e) {
+                if (trust.mismatch) {
+                    throw new IdentityChangedException(expected, trust.fingerprint);
+                }
+                throw e;
+            }
+            String fingerprint = trust.fingerprint;
+            if (fingerprint == null) {
+                throw new IOException("The other computer didn't identify itself.");
+            }
             DataInputStream in = new DataInputStream(new BufferedInputStream(sock.getInputStream(), 1 << 16));
             OutputStream out = new BufferedOutputStream(sock.getOutputStream(), 1 << 16);
 
@@ -320,6 +403,17 @@ public final class Protocol {
             }
             throw e;
         }
+    }
+
+    /** TLS 1.2 and 1.3 only (the host's Python offers both). */
+    static String[] tlsVersions(String[] supported) {
+        List<String> out = new ArrayList<>();
+        for (String v : supported) {
+            if (v.equals("TLSv1.3") || v.equals("TLSv1.2")) {
+                out.add(v);
+            }
+        }
+        return out.isEmpty() ? supported : out.toArray(new String[0]);
     }
 
     static void send(OutputStream out, byte[] data) throws IOException {

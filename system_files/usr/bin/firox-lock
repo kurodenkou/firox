@@ -65,7 +65,7 @@ def blurred_wallpaper(path, width, height, level):
         st = os.stat(path)
     except OSError:
         return None
-    key = hashlib.sha1(f"{path}|{st.st_mtime_ns}|{st.st_size}|{width}x{height}|{level}|1".encode()).hexdigest()[:16]
+    key = hashlib.sha256(f"{path}|{st.st_mtime_ns}|{st.st_size}|{width}x{height}|{level}|1".encode()).hexdigest()[:16]
     out = os.path.join(CACHE, f"lock-wallpaper-{key}.jpg")
     if os.path.exists(out):
         return out
