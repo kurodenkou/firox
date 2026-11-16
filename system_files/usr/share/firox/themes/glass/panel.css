@@ -123,6 +123,7 @@ button.quick-launch:hover {
 #clock { padding: 0 10px 0 6px; font-weight: bold; }
 
 #custom-notifications.read, #custom-notifications.dnd { color: #6e6e73; }
+#custom-notifications.unread { color: #e0a400; text-shadow: 0 0 4px rgba(255, 196, 0, 0.55); }
 #custom-updates.pending { color: #0a64d6; }
 
 /* the battery's percentage: normal text after the icon */

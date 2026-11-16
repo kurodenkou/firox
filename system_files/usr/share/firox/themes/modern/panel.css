@@ -102,6 +102,7 @@ button.quick-launch:hover { background-color: rgba(255, 255, 255, 0.12); }
 #clock { padding: 0 12px 0 8px; }
 
 #custom-notifications.read, #custom-notifications.dnd { color: #a8a8a8; }
+#custom-notifications.unread { color: #ffd23f; text-shadow: 0 0 4px rgba(255, 210, 63, 0.7); }
 
 /* update waiting for a restart (firox-updates) */
 #custom-updates.pending { color: #ffffff; }
