@@ -15,8 +15,10 @@ The computer being streamed (the host) captures its main display through the
 desktop portal (screen sharing), encodes it as H.264 with GStreamer (the
 graphics card's encoder when there is one, x264 otherwise) and its sound as
 Opus, and sends both to the other computer over one TLS connection (TCP port
-48300). The other computer plays them and sends its keyboard and mouse back;
-the host types and clicks them through virtual devices (uinput).
+48300). The other computer plays them and sends its keyboard, mouse and game
+controllers back; the host types and clicks them through virtual devices
+(uinput), and each controller becomes a virtual Xbox 360 controller there,
+rumble included.
 
 Computers on the network that allow streaming announce themselves with Avahi
 as _firox-stream._tcp. The first time, pairing takes a 4-digit PIN shown on
@@ -30,6 +32,10 @@ motion).
     Ctrl+Alt+Shift+Z  release the mouse     Ctrl+Alt+Shift+M  capture on click on/off
     Ctrl+Alt+Shift+F  full screen           Ctrl+Alt+Shift+Q  stop
     Ctrl+Alt+Shift+U  unlock it (its password)  Ctrl+Alt+Shift+W  wake its screen
+
+Game controllers plugged into this computer (Xbox, PlayStation, Switch Pro,
+8BitDo and most others, through SDL's controller database) work on the other
+computer while the stream window is in front, up to four at a time.
 
 Connecting wakes the other computer's screen (monitors back on, screen saver
 off), and its screen saver, lock, monitor-off and sleep timers wait while
@@ -848,6 +854,207 @@ class Capture:
         self.video = self.audio = None
 
 
+class Gamepad:
+    """One virtual Xbox 360 controller on this computer (uinput), driven by
+    a controller on the other computer. It looks like the real thing to
+    games, Steam and SDL (same name and USB IDs, the xpad driver's buttons
+    and axes), and takes rumble, which goes back to the real controller."""
+
+    # The wire format (Pads on the other side): SDL's button numbers
+    A, B, X, Y, BACK, GUIDE, START, LSTICK, RSTICK, LB, RB, UP, DOWN, LEFT, RIGHT = range(15)
+
+    def __init__(self):
+        from evdev import AbsInfo, UInput
+        from evdev import ecodes as e
+        self.e = e
+        # xpad's codes: X is BTN_X (= BTN_NORTH) and Y is BTN_Y (= BTN_WEST)
+        self.keys = {self.A: e.BTN_SOUTH, self.B: e.BTN_EAST, self.X: e.BTN_NORTH, self.Y: e.BTN_WEST,
+                     self.LB: e.BTN_TL, self.RB: e.BTN_TR, self.BACK: e.BTN_SELECT,
+                     self.START: e.BTN_START, self.GUIDE: e.BTN_MODE,
+                     self.LSTICK: e.BTN_THUMBL, self.RSTICK: e.BTN_THUMBR}
+        stick = AbsInfo(0, -32768, 32767, 16, 128, 0)
+        trigger = AbsInfo(0, 0, 255, 0, 0, 0)
+        hat = AbsInfo(0, -1, 1, 0, 0, 0)
+        self.ui = UInput({
+            e.EV_KEY: sorted(self.keys.values()),
+            e.EV_ABS: [(e.ABS_X, stick), (e.ABS_Y, stick), (e.ABS_RX, stick), (e.ABS_RY, stick),
+                       (e.ABS_Z, trigger), (e.ABS_RZ, trigger), (e.ABS_HAT0X, hat), (e.ABS_HAT0Y, hat)],
+            e.EV_FF: [e.FF_RUMBLE, e.FF_PERIODIC, e.FF_SQUARE, e.FF_TRIANGLE, e.FF_SINE, e.FF_GAIN],
+        }, name="Microsoft X-Box 360 pad", vendor=0x045E, product=0x028E, version=0x0114,
+            bustype=e.BUS_USB, max_effects=16)
+        self.buttons = 0
+        self.axes = [0, 0, 0, 0, 0, 0, 0, 0]       # LX LY RX RY LT RT hatX hatY
+        self.effects = {}                           # id -> (strong, weak, ms)
+        self.gain = 1.0
+
+    def set(self, state):
+        """state: [buttons, lx, ly, rx, ry, lt, rt] (sticks -32768..32767,
+        y down; triggers 0..32767)."""
+        e = self.e
+        buttons = int(state[0]) & 0x7FFF
+        clamp = lambda v, lo, hi: max(lo, min(hi, int(v)))
+        axes = [clamp(state[1], -32768, 32767), clamp(state[2], -32768, 32767),
+                clamp(state[3], -32768, 32767), clamp(state[4], -32768, 32767),
+                clamp(state[5], 0, 32767) * 255 // 32767, clamp(state[6], 0, 32767) * 255 // 32767,
+                ((buttons >> self.RIGHT) & 1) - ((buttons >> self.LEFT) & 1),
+                ((buttons >> self.DOWN) & 1) - ((buttons >> self.UP) & 1)]
+        changed = False
+        for bit, code in self.keys.items():
+            now = (buttons >> bit) & 1
+            if now != (self.buttons >> bit) & 1:
+                self.ui.write(e.EV_KEY, code, now)
+                changed = True
+        codes = (e.ABS_X, e.ABS_Y, e.ABS_RX, e.ABS_RY, e.ABS_Z, e.ABS_RZ, e.ABS_HAT0X, e.ABS_HAT0Y)
+        for i, code in enumerate(codes):
+            if axes[i] != self.axes[i]:
+                self.ui.write(e.EV_ABS, code, axes[i])
+                changed = True
+        self.buttons, self.axes = buttons, axes
+        if changed:
+            self.ui.syn()
+
+    def neutral(self):
+        self.set([0, 0, 0, 0, 0, 0, 0])
+
+    def rumble_events(self):
+        """Rumble the game asked for since last time: [(strong, weak, ms)],
+        (0, 0, 0) meaning stop."""
+        e = self.e
+        out = []
+        while True:
+            try:
+                ev = self.ui.read_one()
+            except (BlockingIOError, OSError):
+                break
+            if ev is None:
+                break
+            if ev.type == e.EV_UINPUT and ev.code == e.UI_FF_UPLOAD:
+                up = self.ui.begin_upload(ev.value)
+                eff = up.effect
+                if eff.type == e.FF_RUMBLE:
+                    r = eff.u.ff_rumble_effect
+                    strong, weak = r.strong_magnitude, r.weak_magnitude
+                elif eff.type == e.FF_PERIODIC:
+                    strong = weak = min(abs(eff.u.ff_periodic_effect.magnitude) * 2, 0xFFFF)
+                else:
+                    strong = weak = 0
+                self.effects[eff.id] = (strong, weak, eff.ff_replay.length)
+                up.retval = 0
+                self.ui.end_upload(up)
+            elif ev.type == e.EV_UINPUT and ev.code == e.UI_FF_ERASE:
+                er = self.ui.begin_erase(ev.value)
+                self.effects.pop(er.effect_id, None)
+                er.retval = 0
+                self.ui.end_erase(er)
+            elif ev.type == e.EV_FF and ev.code == e.FF_GAIN:
+                self.gain = max(0, min(ev.value, 0xFFFF)) / 0xFFFF
+            elif ev.type == e.EV_FF and ev.code in self.effects:
+                strong, weak, ms = self.effects[ev.code]
+                if ev.value:
+                    out.append((int(strong * self.gain), int(weak * self.gain), ms or 5000))
+                else:
+                    out.append((0, 0, 0))
+        return out
+
+    def close(self):
+        try:
+            self.neutral()
+        finally:
+            self.ui.close()
+
+
+class Gamepads:
+    """The virtual controllers of everyone watching: each viewer's
+    controllers get their own (up to four), made when one first sends its
+    state and removed when it's unplugged or the viewer leaves. A thread
+    passes rumble back to the controller it belongs to."""
+
+    PER_VIEWER = 4
+
+    def __init__(self, send):
+        self.send = send                    # send(channel, kind, payload)
+        self.lock = threading.Lock()
+        self.pads = {}                      # (channel, slot) -> Gamepad
+        self.broken = False
+        self.running = True
+        threading.Thread(target=self._rumble_loop, daemon=True).start()
+
+    def handle(self, channel, msg):
+        slot = int(msg.get("p", -1))
+        if not 0 <= slot < self.PER_VIEWER or self.broken:
+            return
+        key = (channel, slot)
+        if msg.get("gone"):
+            with self.lock:
+                pad = self.pads.pop(key, None)
+            if pad:
+                pad.close()
+                log(f"controller {slot + 1} unplugged")
+            return
+        state = msg.get("s")
+        if not isinstance(state, list) or len(state) != 7:
+            return
+        with self.lock:
+            pad = self.pads.get(key)
+        if pad is None:
+            try:
+                pad = Gamepad()
+            except Exception as e:          # no /dev/uinput access
+                log(f"game controllers unavailable: {e}")
+                self.broken = True
+                return
+            with self.lock:
+                self.pads[key] = pad
+            log(f"controller {slot + 1} connected: {msg.get('name') or 'a controller'}")
+        pad.set(state)
+
+    def neutral(self, channel=None):
+        """Let go of everything (a viewer's window went to the background)."""
+        with self.lock:
+            pads = [p for (ch, _s), p in self.pads.items() if channel is None or ch is channel]
+        for p in pads:
+            try:
+                p.neutral()
+            except OSError:
+                pass
+
+    def drop(self, channel=None):
+        with self.lock:
+            keys = [k for k in self.pads if channel is None or k[0] is channel]
+            pads = [self.pads.pop(k) for k in keys]
+        for p in pads:
+            try:
+                p.close()
+            except OSError:
+                pass
+
+    def close(self):
+        self.running = False
+        self.drop()
+
+    def _rumble_loop(self):
+        while self.running:
+            with self.lock:
+                pads = list(self.pads.items())
+            if not pads:
+                time.sleep(0.2)
+                continue
+            fds = {p.ui.fd: (k, p) for k, p in pads}
+            try:
+                ready, _w, _x = select.select(list(fds), [], [], 0.2)
+            except (OSError, ValueError):
+                time.sleep(0.05)
+                continue
+            for fd in ready:
+                (channel, slot), pad = fds[fd]
+                try:
+                    events = pad.rumble_events()
+                except OSError:
+                    continue
+                for strong, weak, ms in events:
+                    self.send(channel, "R", {"p": slot, "lo": strong, "hi": weak, "ms": ms})
+
+
 class Session:
     """What everyone watching this computer shares: one screen capture (and
     sound), the virtual keyboard and mice, and the idle-timer hold. Each
@@ -860,6 +1067,7 @@ class Session:
         self.lock = threading.Lock()
         self.viewers = {}                   # Channel -> {"name", "need_key"}
         self.capture = self.cast = self.injector = None
+        self.pads = None
         self.cursor = self.audio = False
         self.locked = False
         self.ended = False
@@ -874,7 +1082,8 @@ class Session:
             return [v["name"] for ch, v in self.viewers.items() if not ch.closed]
 
     def info(self):
-        return {"name": self.host.name, "input": self.injector is not None, "cursor": self.cursor,
+        return {"name": self.host.name, "input": self.injector is not None,
+                "gamepads": self.injector is not None, "cursor": self.cursor,
                 "audio": self.audio, "encoder": self.capture.encoder if self.capture else None,
                 "locked": self.locked, "viewers": self.names()}
 
@@ -892,6 +1101,8 @@ class Session:
             self.injector = Injector(self.output)
         except Exception as e:              # no /dev/uinput access: the picture only
             log(f"keyboard and mouse unavailable: {e}")
+        if self.injector is not None:
+            self.pads = Gamepads(lambda ch, kind, payload: ch.send(kind, payload))
         self.audio = self.capture.start_audio()
         threading.Thread(target=self.supervise, daemon=True).start()
 
@@ -899,6 +1110,9 @@ class Session:
         self.ended = True
         self.host.close_capture(self.capture, self.cast)
         self.capture = self.cast = None
+        if self.pads:
+            self.pads.close()
+            self.pads = None
         if self.injector:
             self.injector.close()
             self.injector = None
@@ -930,6 +1144,8 @@ class Session:
                 self.injector.release_all()     # nothing stays held down
             except OSError:
                 pass
+        if self.pads:
+            self.pads.drop(channel)             # their controllers are unplugged
         if v and left:
             self.broadcast("S", {"viewers": self.names(), "left": v["name"]})
         return left
@@ -943,6 +1159,8 @@ class Session:
                 self.injector.release_all()
             except OSError:
                 pass
+        if self.pads:
+            self.pads.drop()
         for ch in channels:
             ch.send("E", {"error": reason})
             threading.Timer(1.0, ch.close, args=("disconnected by this computer",)).start()
@@ -986,6 +1204,15 @@ class Session:
                     self.injector.handle(ev)
             except (ValueError, TypeError, IndexError, OSError) as e:
                 log(f"input: {e}")
+        elif kind == "G" and self.pads is not None:
+            try:
+                msg = json.loads(payload)
+                if msg.get("idle"):
+                    self.pads.neutral(channel)
+                else:
+                    self.pads.handle(channel, msg)
+            except (ValueError, TypeError, AttributeError, OSError) as e:
+                log(f"controller: {e}")
         elif kind == "F":
             with self.lock:
                 if channel in self.viewers:
@@ -1765,6 +1992,124 @@ class PointerLock:
 GDK_BUTTONS = {1: 0x110, 2: 0x112, 3: 0x111, 8: 0x113, 9: 0x114}
 
 
+class Pads:
+    """The game controllers plugged into this computer, read through SDL's
+    game controller API, which maps almost any controller to one Xbox
+    layout. Runs in its own thread (SDL is only used from there); sends each
+    controller's state when it changes, while active (the stream window in
+    front), and plays the rumble the other computer sends back."""
+
+    ADDED, REMOVED = 0x653, 0x654               # SDL_CONTROLLERDEVICEADDED / REMOVED
+    BUTTONS, AXES = 15, 6
+
+    def __init__(self, send, on_change=None):
+        self.send = send                        # send(dict): one "G" message
+        self.on_change = on_change              # on_change(text): a controller came or went
+        self.active = True
+        self.running = True
+        self.rumbles = queue.Queue()
+        self.thread = threading.Thread(target=self.run, daemon=True)
+        self.thread.start()
+
+    def set_active(self, on):
+        if on != self.active:
+            self.active = on
+            if not on:
+                self.send({"idle": 1})          # let go of everything over there
+
+    def rumble(self, slot, low, high, ms):
+        self.rumbles.put((slot, low, high, ms))
+
+    def stop(self):
+        self.running = False
+
+    def run(self):
+        import ctypes
+        try:
+            sdl = ctypes.CDLL("libSDL2-2.0.so.0")
+        except OSError as e:
+            log(f"game controllers: no SDL ({e})")
+            return
+        sdl.SDL_SetHint.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
+        sdl.SDL_GameControllerOpen.restype = ctypes.c_void_p
+        sdl.SDL_GameControllerClose.argtypes = [ctypes.c_void_p]
+        sdl.SDL_GameControllerGetJoystick.argtypes = [ctypes.c_void_p]
+        sdl.SDL_GameControllerGetJoystick.restype = ctypes.c_void_p
+        sdl.SDL_JoystickInstanceID.argtypes = [ctypes.c_void_p]
+        sdl.SDL_GameControllerName.argtypes = [ctypes.c_void_p]
+        sdl.SDL_GameControllerName.restype = ctypes.c_char_p
+        sdl.SDL_GameControllerGetButton.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        sdl.SDL_GameControllerGetButton.restype = ctypes.c_uint8
+        sdl.SDL_GameControllerGetAxis.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        sdl.SDL_GameControllerGetAxis.restype = ctypes.c_int16
+        sdl.SDL_GameControllerRumble.argtypes = [ctypes.c_void_p, ctypes.c_uint16, ctypes.c_uint16,
+                                                 ctypes.c_uint32]
+        sdl.SDL_GetError.restype = ctypes.c_char_p
+        # The stream window has the focus, not SDL (it has no window): read anyway
+        sdl.SDL_SetHint(b"SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", b"1")
+        sdl.SDL_SetHint(b"SDL_NO_SIGNAL_HANDLERS", b"1")
+        if sdl.SDL_Init(0x2000 | 0x4000) != 0:   # GAMECONTROLLER | EVENTS
+            log(f"game controllers: {sdl.SDL_GetError().decode(errors='replace')}")
+            return
+        pads = {}                               # instance id -> [handle, slot, last state, name]
+        event = (ctypes.c_uint8 * 64)()
+        try:
+            while self.running:
+                while sdl.SDL_PollEvent(ctypes.byref(event)):
+                    kind = int.from_bytes(bytes(event[0:4]), "little")
+                    which = int.from_bytes(bytes(event[8:12]), "little", signed=True)
+                    if kind == self.ADDED:
+                        handle = sdl.SDL_GameControllerOpen(which)
+                        if not handle:
+                            continue
+                        iid = sdl.SDL_JoystickInstanceID(sdl.SDL_GameControllerGetJoystick(handle))
+                        used = {p[1] for p in pads.values()}
+                        slot = next((i for i in range(4) if i not in used), None)
+                        if iid in pads or slot is None:
+                            sdl.SDL_GameControllerClose(handle)
+                            continue
+                        name = (sdl.SDL_GameControllerName(handle) or b"Controller").decode(errors="replace")
+                        pads[iid] = [handle, slot, None, name]
+                        if self.on_change:
+                            self.on_change(f"Controller {slot + 1} connected: {name}")
+                    elif kind == self.REMOVED and which in pads:
+                        handle, slot, _last, name = pads.pop(which)
+                        sdl.SDL_GameControllerClose(handle)
+                        self.send({"p": slot, "gone": 1})
+                        if self.on_change:
+                            self.on_change(f"Controller {slot + 1} unplugged")
+                while True:
+                    try:
+                        slot, low, high, ms = self.rumbles.get_nowait()
+                    except queue.Empty:
+                        break
+                    for handle, s, _last, _name in pads.values():
+                        if s == slot:
+                            sdl.SDL_GameControllerRumble(handle, low, high, ms)
+                if self.active:
+                    for pad in pads.values():
+                        handle, slot, last, name = pad
+                        buttons = 0
+                        for b in range(self.BUTTONS):
+                            if sdl.SDL_GameControllerGetButton(handle, b):
+                                buttons |= 1 << b
+                        state = [buttons] + [sdl.SDL_GameControllerGetAxis(handle, a) for a in range(self.AXES)]
+                        if state != last:
+                            pad[2] = state
+                            msg = {"p": slot, "s": state}
+                            if last is None:
+                                msg["name"] = name
+                            self.send(msg)
+                else:
+                    for pad in pads.values():
+                        pad[2] = None           # send everything again when active
+                time.sleep(0.004)
+        finally:
+            for handle, _slot, _last, _name in pads.values():
+                sdl.SDL_GameControllerClose(handle)
+            sdl.SDL_Quit()
+
+
 def connect(address, ask_pin, ask_busy=None):
     """Connect and pair if needed (blocking; call from a thread). Returns
     (TLS socket, host info). ask_pin(host name, note) -> PIN or None.
@@ -1915,6 +2260,7 @@ def client_ui(address=None):
             self.rel_pending = False
             self.stopping = False
             self.ended = False
+            self.pads = None                    # game controllers (Pads), once connected
             self.overlay = Gtk.Overlay()
             self.add(self.overlay)
             self.area = Gtk.EventBox(can_focus=True)
@@ -1947,10 +2293,16 @@ def client_ui(address=None):
             self.area.connect("realize", self.on_realize)
             self.connect("key-press-event", self.on_key, True)
             self.connect("key-release-event", self.on_key, False)
-            self.connect("focus-out-event", lambda *_a: (self.release_mouse(), self.release_all()))
+            self.connect("focus-out-event", lambda *_a: (self.release_mouse(), self.release_all(),
+                                                         self.pads and self.pads.set_active(False)))
+            self.connect("focus-in-event", lambda *_a: self.pads and self.pads.set_active(True))
             self.connect("delete-event", lambda *_a: self.stop() or False)
             self.channel = Channel(sock, self.on_message, self.on_closed)
             threading.Thread(target=self.channel.run, daemon=True).start()
+            # Game controllers, if that computer takes them
+            if info.get("gamepads"):
+                self.pads = Pads(lambda msg: self.channel.send("G", msg),
+                                 lambda text: GLib.idle_add(lambda: self.show_hint(text, 3) or False))
             self.locked = False
             self.show_all()
             self.area.grab_focus()
@@ -2060,6 +2412,10 @@ def client_ui(address=None):
             elif kind == "u":
                 msg = json.loads(payload)
                 GLib.idle_add(self.unlock_answer, bool(msg.get("ok")), str(msg.get("message", "")))
+            elif kind == "R" and self.pads is not None:
+                msg = json.loads(payload)
+                self.pads.rumble(int(msg.get("p", 0)), int(msg.get("lo", 0)) & 0xFFFF,
+                                 int(msg.get("hi", 0)) & 0xFFFF, max(0, int(msg.get("ms", 0))))
             elif kind == "E":
                 self.channel.close(json.loads(payload).get("error", ""))
 
@@ -2071,6 +2427,8 @@ def client_ui(address=None):
             GLib.idle_add(self.closed, reason)
 
         def closed(self, reason):
+            if self.pads is not None:
+                self.pads.stop()
             for p in (self.video, self.audio):
                 if p is not None:
                     p.set_state(Gst.State.NULL)
