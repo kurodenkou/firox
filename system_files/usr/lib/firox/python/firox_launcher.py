@@ -87,7 +87,8 @@ def exe_icon(path):
         st = os.stat(path)
     except OSError:
         return None
-    key = hashlib.sha1(f"{path}:{st.st_size}:{st.st_mtime_ns}".encode()).hexdigest()[:12]
+    # A cache key for this version of the program (not a security check)
+    key = hashlib.sha256(f"{path}:{st.st_size}:{st.st_mtime_ns}".encode()).hexdigest()[:16]
     dest = os.path.join(ICONS, f"{re.sub(r'[^A-Za-z0-9]+', '-', default_name(path)).strip('-').lower()}-{key}.png")
     if os.path.exists(dest):
         return dest
