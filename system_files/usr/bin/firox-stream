@@ -9,6 +9,9 @@ firox-stream: play another Firox computer's games and desktop from this one.
     firox-stream on|off           let other computers stream this one, or not
     firox-stream kick             disconnect everyone streaming this one now
     firox-stream unpair           forget every computer paired with this one
+    firox-stream forget NAME|ADDRESS
+                                  forget a computer this one has streamed
+                                  (the next connection asks for its PIN)
     firox-stream status           print whether it's on and what's paired
 
 The computer being streamed (the host) captures its main display through the
@@ -2110,6 +2113,18 @@ class Pads:
             sdl.SDL_Quit()
 
 
+class IdentityChanged(ConnectionError):
+    """A paired computer answered with a different certificate."""
+
+    def __init__(self, name, expected, actual):
+        self.name, self.expected, self.actual = name, expected, actual
+        super().__init__(
+            f"{name}'s identity has changed since this computer paired with it, so nothing was sent to it. "
+            "If it was reinstalled or its Firox Stream settings were reset, forget it (in Run: "
+            f"firox-stream forget {name}) and pair again with the PIN it shows. Otherwise something on "
+            f"the network may be pretending to be it: don't pair.\n\nPaired: {expected[:16]}…\nNow: {actual[:16]}…")
+
+
 def connect(address, ask_pin, ask_busy=None):
     """Connect and pair if needed (blocking; call from a thread). Returns
     (TLS socket, host info). ask_pin(host name, note) -> PIN or None.
@@ -2118,12 +2133,18 @@ def connect(address, ask_pin, ask_busy=None):
     raw = socket.create_connection((host, port), timeout=10)
     keepalive(raw)
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE         # checked below, against the paired certificate
+    ctx.verify_mode = ssl.CERT_NONE         # self-signed: pinned by fingerprint below
     sock = ctx.wrap_socket(raw)
     try:
         fingerprint = hashlib.sha256(sock.getpeercert(binary_form=True)).hexdigest()
         hosts = load_hosts()
+        # A computer paired at this address must still have the same certificate;
+        # otherwise nothing is sent to it (it could be something pretending to be it)
+        for fp, h in hosts.items():
+            if fp != fingerprint and h.get("address") and split_address(h["address"]) == (host, port):
+                raise IdentityChanged(h.get("name") or address, fp, fingerprint)
         known = hosts.get(fingerprint, {})
         name = computer_name()
         sock.sendall(frame("H", {"v": 1, "name": name, "token": known.get("token", "")}))
@@ -2933,6 +2954,18 @@ def main(argv):
         save_conf(conf)
         print("Forgot every paired computer.")
         return 0
+    if cmd == "forget" and len(argv) > 2:
+        target = " ".join(argv[2:]).strip()
+        hosts = load_hosts()
+        gone = {fp: h for fp, h in hosts.items()
+                if target in (h.get("name"), h.get("address"))
+                or (h.get("address") and split_address(h["address"]) == split_address(target))}
+        for fp in gone:
+            del hosts[fp]
+        save_hosts(hosts)
+        print("Forgot " + ", ".join(h.get("name") or h.get("address") for h in gone.values()) if gone
+              else f"No computer called {target} has been streamed from here.")
+        return 0 if gone else 1
     if cmd == "status":
         conf = load_conf()
         print(f"streaming this computer: {'on' if conf.get('enabled') else 'off'}"

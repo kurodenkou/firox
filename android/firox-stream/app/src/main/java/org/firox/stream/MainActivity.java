@@ -356,7 +356,7 @@ public class MainActivity extends Activity {
         Context app = getApplicationContext();
         new Thread(() -> {
             try {
-                Protocol.Session s = Protocol.connect(app, e.address, e.port, new Protocol.Questions() {
+                Protocol.Session s = Protocol.connect(app, e.address, e.port, e.fingerprint, new Protocol.Questions() {
                     public String pin(String hostName, String note) {
                         return askPin(progress, hostName, note);
                     }
@@ -369,6 +369,14 @@ public class MainActivity extends Activity {
                     progress.dismiss();
                     session = s;
                     startActivity(new Intent(this, StreamActivity.class));
+                });
+            } catch (Protocol.IdentityChangedException changed) {
+                ui.post(() -> {
+                    progress.dismiss();
+                    connecting = false;
+                    if (!isFinishing()) {
+                        identityChanged(e, changed);
+                    }
                 });
             } catch (Protocol.CancelledException c) {
                 ui.post(() -> {
@@ -390,6 +398,36 @@ public class MainActivity extends Activity {
                 });
             }
         }, "connect").start();
+    }
+
+    /** A paired computer showed a different certificate: say so, and let the user decide. */
+    private void identityChanged(Entry e, Protocol.IdentityChangedException changed) {
+        new AlertDialog.Builder(this)
+                .setTitle(e.name + " isn't the computer you paired with")
+                .setMessage("Its identity has changed since this device paired with it, so nothing was sent "
+                        + "to it.\n\nIf it was reinstalled, or its Firox Stream settings were reset, forget it "
+                        + "here and pair again with the PIN it shows. Otherwise something on this network may "
+                        + "be pretending to be it: don't pair.\n\nPaired: " + shortPrint(changed.expected)
+                        + "\nNow: " + shortPrint(changed.actual))
+                .setPositiveButton("Close", null)
+                .setNegativeButton("Forget It", (d, w) -> {
+                    if (changed.expected != null) {
+                        Protocol.forget(this, changed.expected);
+                    }
+                    refresh();
+                })
+                .show();
+    }
+
+    private static String shortPrint(String fp) {
+        if (fp == null || fp.length() < 16) {
+            return String.valueOf(fp);
+        }
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < 16; i += 4) {
+            sb.append(i > 0 ? " " : "").append(fp, i, i + 4);
+        }
+        return sb.append("\u2026").toString();
     }
 
     static String explain(Exception e) {
