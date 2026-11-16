@@ -9,6 +9,8 @@ a network folder, every hour, and get files back from any backup.
     firox-backup watch        at login: back up every hour while the
                               destination is there, and when it's plugged in
     firox-backup status       print the state
+    firox-backup windows on|off
+                              back up Windows programs (their C: drive) or not
 
 How it's stored: in "Firox Backups/<computer>-<user>" on the destination.
   * Drives that support hard links (ext4, btrfs, xfs, NTFS...): one folder per
@@ -23,6 +25,12 @@ How it's stored: in "Firox Backups/<computer>-<user>" on the destination.
 Backups are plain folders: you can also browse and copy from them with the
 file manager, on any computer.
 
+Windows programs: the shared C: drive that Firox runs them in
+(~/.local/share/firox/windows) and a classic ~/.wine are backed up unless
+"Back up Windows programs" is off (WINDOWS=0). Either way, Proton-GE and the
+Steam Linux Runtime (downloaded again by themselves) and the C: drive's Temp
+folders are left out.
+
 Settings: ~/.config/firox/backup.conf. State: ~/.local/state/firox/backup.json.
 """
 
@@ -34,6 +42,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
 import time
 
 CONFIG = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "firox")
@@ -50,13 +59,20 @@ DEFAULT_EXCLUDES = [
     ".cache", ".local/share/Trash", ".var/app/*/cache", ".local/share/containers",
     ".local/share/waydroid", ".local/share/flatpak", "Downloads/*.part", ".thumbnails",
     "*.tmp", ".mozilla/firefox/*/cache2", ".local/state/firox/backup.*",
+    # Windows programs' tools, downloaded again by themselves (firox-windows)
+    ".local/share/Steam/compatibilitytools.d", ".local/share/umu",
+    ".local/share/firox/windows/drive_c/users/*/AppData/Local/Temp",
+    ".local/share/firox/windows/drive_c/windows/temp",
+    ".wine/drive_c/users/*/AppData/Local/Temp", ".wine/drive_c/windows/temp",
 ]
+# The C: drives of Windows programs: Firox's shared one, and a classic ~/.wine
+WINDOWS_PREFIXES = [".local/share/firox/windows", ".wine"]
 
 
 # ------------------------------------------------------------------ state --
 
 def load_conf():
-    conf = {"ENABLED": "1", "DEST": "", "DEST_URI": "", "EXCLUDES": ""}
+    conf = {"ENABLED": "1", "DEST": "", "DEST_URI": "", "EXCLUDES": "", "WINDOWS": "1"}
     try:
         with open(CONF) as fh:
             for line in fh:
@@ -99,7 +115,30 @@ def save_state(**changes):
 
 def excludes(conf):
     extra = [e for e in conf.get("EXCLUDES", "").split(":") if e]
+    if conf.get("WINDOWS", "1") == "0":
+        extra += WINDOWS_PREFIXES
     return DEFAULT_EXCLUDES + extra
+
+
+def windows_size():
+    """Bytes the Windows programs' C: drives take (what the option adds), or
+    None if there are none. Without the parts that are always left out."""
+    total, found = 0, False
+    skip = ("compatibilitytools.d", "umu")
+    for rel in WINDOWS_PREFIXES:
+        top = os.path.join(HOME, rel)
+        if not os.path.isdir(top):
+            continue
+        found = True
+        for root, dirs, files in os.walk(top):
+            dirs[:] = [d for d in dirs if d.lower() != "temp" and d not in skip]
+            for f in files:
+                try:
+                    st = os.lstat(os.path.join(root, f))
+                except OSError:
+                    continue
+                total += st.st_blocks * 512
+    return total if found else None
 
 
 def machine():
@@ -420,9 +459,23 @@ def ui(page=None):
             excl.connect("clicked", lambda _b: self.edit_excludes())
             opts.pack_end(excl, False, False, 0)
             box.pack_start(opts, False, False, 0)
+            self.windows = Gtk.CheckButton(label="Back up Windows programs (their C: drive)")
+            self.windows.set_tooltip_text(
+                "Windows programs you installed, their settings and saved games, in the C: drive they "
+                "share (~/.local/share/firox/windows, and ~/.wine if you have one). Proton-GE and the "
+                "Steam Linux Runtime are never backed up: they download again by themselves.")
+            self.windows.set_active(load_conf().get("WINDOWS", "1") != "0")
+            self.windows.connect("toggled", self.on_windows)
+            box.pack_start(self.windows, False, False, 0)
+
+            def measure():
+                size = windows_size()
+                GLib.idle_add(self.show_windows_size, size)
+            threading.Thread(target=measure, daemon=True).start()
             note = Gtk.Label(xalign=0, wrap=True, max_width_chars=64)
             note.get_style_context().add_class("dim-label")
-            note.set_text("Caches, the Recycle Bin and app containers are left out. Your backups are ordinary "
+            note.set_text("Caches, the Recycle Bin, app containers and Proton downloads are left out. Your "
+                          "backups are ordinary "
                           "folders on the drive (\"Firox Backups\"), so you can open them on any computer.")
             box.pack_start(note, False, False, 0)
             self.refresh()
@@ -465,6 +518,18 @@ def ui(page=None):
             self.b_now.set_sensitive(bool(dest) and not running)
             self.b_restore.set_sensitive(avail)
             return True
+
+        def show_windows_size(self, size):
+            if size is None:
+                self.windows.set_label("Back up Windows programs (their C: drive; none installed yet)")
+            else:
+                self.windows.set_label(f"Back up Windows programs (their C: drive, {human(size)})")
+            return False
+
+        def on_windows(self, b):
+            conf = load_conf()
+            conf["WINDOWS"] = "1" if b.get_active() else "0"
+            save_conf(conf)
 
         def on_auto(self, b):
             if getattr(self, "_sync_auto", False):
@@ -832,9 +897,16 @@ def main(argv):
     if cmd == "watch":
         watch()
         return 0
+    if cmd == "windows" and len(argv) > 2 and argv[2] in ("on", "off"):
+        conf = load_conf()
+        conf["WINDOWS"] = "1" if argv[2] == "on" else "0"
+        save_conf(conf)
+        print(f"Windows programs (their C: drive): {'backed up' if argv[2] == 'on' else 'left out'}.")
+        return 0
     if cmd == "status":
         conf, state = load_conf(), load_state()
-        print(f"destination: {conf.get('DEST') or 'none'}  automatic: {'on' if conf.get('ENABLED') != '0' else 'off'}")
+        print(f"destination: {conf.get('DEST') or 'none'}  automatic: {'on' if conf.get('ENABLED') != '0' else 'off'}"
+              f"  windows programs: {'on' if conf.get('WINDOWS', '1') != '0' else 'off'}")
         print(f"last backup: {time.ctime(state['last_success']) if state.get('last_success') else 'never'}")
         if state.get("message"):
             print(state["message"])
