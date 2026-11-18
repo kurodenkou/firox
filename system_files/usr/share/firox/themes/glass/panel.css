@@ -139,3 +139,17 @@ button.quick-launch:hover {
 /* Night Light's moon (firox-nightlight): lit while the screen is warmer */
 #nightlight.off { color: #8e8e93; }
 #nightlight.on { color: #c26a00; }
+
+/* ---- a soft shadow under every icon, so white icons don't wash out
+   against the frosted glass over a bright wallpaper ---- */
+#custom-start image, button.quick-launch image, #taskbar button image,
+#notification-area image, #tray image {
+    -gtk-icon-shadow: 0 1px 3px rgba(0, 0, 0, 0.55), 0 0 1px rgba(0, 0, 0, 0.50);
+}
+/* the indicator glyphs (eye, volume, battery, bell, moon, shield, network) */
+#notification-area button label {
+    text-shadow: 0 1px 3px rgba(0, 0, 0, 0.45), 0 0 1px rgba(0, 0, 0, 0.40);
+}
+#custom-notifications.unread label {
+    text-shadow: 0 0 4px rgba(255, 196, 0, 0.55), 0 1px 2px rgba(0, 0, 0, 0.35);
+}

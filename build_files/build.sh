@@ -123,6 +123,7 @@ PACKAGES=(
     gstreamer1-plugins-ugly      # x264enc, when the graphics card can't encode
     gstreamer1-plugins-good-gtk  # gtksink/gtkglsink: the picture in a GTK window
     pipewire-gstreamer           # pipewiresrc: the shared screen
+    libnice-gstreamer1           # Firox Stream to web browsers: WebRTC (webrtcbin) needs ICE
     python3-evdev                # the host's virtual keyboard and mouse (uinput)
     avahi-tools                  # finding computers on the network
     clamav                       # Virus Scan (firox-virusscan): clamscan

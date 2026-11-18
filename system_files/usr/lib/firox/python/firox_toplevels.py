@@ -107,6 +107,10 @@ class Window:
         return 0 in self.states
 
     @property
+    def fullscreen(self):
+        return 3 in self.states
+
+    @property
     def label(self):
         return self.title or NAME_FOR(self.app_id)
 

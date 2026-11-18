@@ -1,0 +1,73 @@
+/* Firox Stream in a web browser */
+:root {
+    --bg: #eef1f7; --panel: rgba(255, 255, 255, 0.92); --text: #1c1c1e; --dim: #6e6e73;
+    --border: rgba(0, 0, 0, 0.10); --accent: #0a64d6; --danger: #c41e1e;
+    font-family: "Noto Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+    :root { --bg: #15171c; --panel: rgba(36, 38, 44, 0.94); --text: #f2f2f7; --dim: #a1a1a8;
+            --border: rgba(255, 255, 255, 0.12); --accent: #4c9bff; }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; }
+body {
+    color: var(--text);
+    background: var(--bg) linear-gradient(135deg, rgba(10, 100, 214, 0.18), rgba(190, 70, 160, 0.16)) fixed;
+}
+.panel {
+    max-width: 30rem; margin: 8vh auto; padding: 24px; border-radius: 18px;
+    background: var(--panel); border: 1px solid var(--border);
+    box-shadow: 0 10px 30px rgba(10, 20, 50, 0.18);
+}
+@media (max-width: 34rem) { .panel { margin: 16px; } }
+h1 { font-size: 1.4rem; margin: 0 0 8px; display: flex; align-items: center; gap: 10px; }
+h1 img { width: 32px; height: 32px; }
+.lead { margin-top: 0; }
+.small { color: var(--dim); font-size: 0.85rem; margin-bottom: 0; }
+label { display: block; font-weight: 600; margin: 16px 0 6px; }
+input {
+    width: 100%; font: inherit; padding: 10px 12px; border-radius: 10px;
+    border: 1px solid var(--border); background: transparent; color: var(--text);
+}
+#pin { font-size: 1.8rem; letter-spacing: 0.4em; text-align: center; font-family: ui-monospace, monospace; }
+button {
+    font: inherit; padding: 9px 16px; margin: 12px 6px 0 0; border-radius: 10px; cursor: pointer;
+    border: 1px solid var(--border); background: transparent; color: var(--text);
+}
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+button.danger { color: #fff; background: var(--danger); border-color: var(--danger); }
+button:disabled { opacity: 0.5; cursor: default; }
+#message { min-height: 1.4em; margin: 14px 0 0; }
+#message.error { color: var(--danger); font-weight: 600; }
+
+#stage { position: fixed; inset: 0; background: #000; }
+#video {
+    width: 100%; height: 100%; object-fit: contain; background: #000; display: block;
+    touch-action: none; outline: none; cursor: default;
+}
+#bar {
+    position: absolute; top: 0; left: 50%; transform: translateX(-50%);
+    display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 4px;
+    max-width: calc(100% - 16px); padding: 4px 8px 8px; border-radius: 0 0 14px 14px;
+    background: rgba(20, 22, 28, 0.82); color: #fff; transition: transform 0.25s, opacity 0.25s;
+    font-size: 0.9rem;
+}
+#bar.hidden { transform: translate(-50%, -100%); opacity: 0; }
+#bar button { margin: 4px 0 0; padding: 5px 10px; color: #fff; border-color: rgba(255, 255, 255, 0.25); }
+#bar button.on { background: var(--accent); border-color: var(--accent); }
+#title { font-weight: 600; padding: 4px 8px 0; }
+#typing {
+    position: absolute; left: 0; bottom: 0; width: 1px; height: 1px; opacity: 0;
+    border: 0; padding: 0; resize: none;
+}
+#toast {
+    position: absolute; bottom: 24px; left: 50%; transform: translateX(-50%);
+    max-width: calc(100% - 32px); padding: 10px 16px; border-radius: 12px;
+    background: rgba(20, 22, 28, 0.88); color: #fff; opacity: 0; transition: opacity 0.3s;
+    pointer-events: none; text-align: center;
+}
+#toast.show { opacity: 1; }
+#tap {
+    position: absolute; inset: auto 0 40% 0; margin: auto; width: max-content; padding: 14px 22px;
+    border-radius: 14px; background: rgba(20, 22, 28, 0.88); color: #fff; font-weight: 600; cursor: pointer;
+}

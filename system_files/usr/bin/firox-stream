@@ -7,6 +7,9 @@ firox-stream: play another Firox computer's games and desktop from this one.
     firox-stream daemon           at login, when streaming is on: let paired
                                   computers stream this one
     firox-stream on|off           let other computers stream this one, or not
+    firox-stream web on|off       let web browsers stream it too (phones,
+                                  tablets, any computer): open the address
+                                  it prints, https://THIS-COMPUTER:48301/
     firox-stream kick             disconnect everyone streaming this one now
     firox-stream unpair           forget every computer paired with this one
     firox-stream forget NAME|ADDRESS
@@ -44,11 +47,18 @@ Connecting wakes the other computer's screen (monitors back on, screen saver
 off), and its screen saver, lock, monitor-off and sleep timers wait while
 it's being streamed.
 
+A web browser streams it from the page this computer serves on port 48301
+(HTTPS, with this computer's own certificate: the browser warns about it
+the first time). It pairs with the same PIN, gets the picture and sound over
+WebRTC (UDP ports 48302-48399), and sends its keyboard, mouse, touches and
+game controllers back. Local network only.
+
 Settings: ~/.config/firox/stream.json (host: on/off, bitrate, sound, paired
 computers) and ~/.config/firox/stream-hosts.json (the computers this one has
 streamed). Host log: ~/.local/state/firox/stream.log
 """
 
+import base64
 import collections
 import errno
 import hashlib
@@ -78,6 +88,11 @@ LOG = os.path.join(STATE_DIR, "stream.log")
 # Read by /usr/libexec/firox/screencast-chooser: which monitor to share
 CHOOSER_HINT = os.path.join(STATE_DIR, "screencast-output")
 PORT = 48300
+# Web browsers (`firox-stream web on`): the page and its WebSocket on
+# WEB_PORT (HTTPS), the picture and sound over WebRTC (UDP, ICE_PORTS)
+WEB_PORT = 48301
+ICE_PORTS = (48302, 48399)
+WEB_DIR = os.environ.get("FIROX_STREAM_WEB") or "/usr/share/firox/stream-web"
 SERVICE = "_firox-stream._tcp"
 MAX_MESSAGE = 32 << 20
 BACKLOG_LIMIT = 6 << 20         # bytes queued for a slow network before frames are skipped
@@ -111,7 +126,8 @@ def _save(path, data):
 
 def load_conf():
     return _load(CONF, {"enabled": False, "port": PORT, "bitrate": 20000, "fps": 60,
-                        "audio": True, "encoder": "auto", "clients": {}})
+                        "audio": True, "encoder": "auto", "clients": {},
+                        "web": False, "web_port": WEB_PORT})
 
 
 def save_conf(conf):
@@ -247,6 +263,15 @@ class Channel:
     def backlog(self):
         return self.queued
 
+    def discard(self):
+        """Never run (the stream couldn't start): let go of what it holds."""
+        self.closed = True
+        for fd in (self.wake_r, self.wake_w):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
     def _wake(self):
         try:
             os.write(self.wake_w, b"x")
@@ -358,6 +383,441 @@ class Channel:
             with self.lock:
                 self.queued -= n
             self.cur = self.cur[n:]
+
+
+# ---------------------------------------------------------- web browsers --
+#
+# A browser opens https://THIS-COMPUTER:48301/ (the page in WEB_DIR). The
+# page talks to the host over a WebSocket on the same address: the same
+# messages as the apps' connection, as JSON ({"k": kind, "d": payload}),
+# so pairing (the PIN), joining or taking over, input, controllers,
+# unlocking and the status messages all work the same way. Only the picture
+# and sound go another way: WebRTC, which browsers can play. The host offers
+# them (H.264 and Opus, the same encoded stream everyone else gets), the page
+# answers, and they find each other on the network (ICE: no STUN or TURN
+# servers, so it's the local network only).
+
+WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+
+def ws_frame(op, payload):
+    """One WebSocket frame from the host (servers don't mask)."""
+    n = len(payload)
+    if n < 126:
+        head = struct.pack(">BB", 0x80 | op, n)
+    elif n < 65536:
+        head = struct.pack(">BBH", 0x80 | op, 126, n)
+    else:
+        head = struct.pack(">BBQ", 0x80 | op, 127, n)
+    return head + payload
+
+
+def ws_parse(buf):
+    """Take one whole frame off the front of buf: (fin, opcode, data), or
+    None if it isn't all there yet. A browser always masks its frames."""
+    if len(buf) < 2:
+        return None
+    b0, b1 = buf[0], buf[1]
+    n, at = b1 & 0x7F, 2
+    if n == 126:
+        if len(buf) < 4:
+            return None
+        n, at = struct.unpack(">H", bytes(buf[2:4]))[0], 4
+    elif n == 127:
+        if len(buf) < 10:
+            return None
+        n, at = struct.unpack(">Q", bytes(buf[2:10]))[0], 10
+    if not b1 & 0x80:
+        raise ValueError("an unmasked WebSocket frame")
+    if n > 1 << 20:
+        raise ValueError("message too long")
+    if len(buf) < at + 4 + n:
+        return None
+    mask = bytes(buf[at:at + 4])
+    raw = bytes(buf[at + 4:at + 4 + n])
+    del buf[:at + 4 + n]
+    key = (mask * (n // 4 + 1))[:n]
+    data = (int.from_bytes(raw, "big") ^ int.from_bytes(key, "big")).to_bytes(n, "big")
+    return bool(b0 & 0x80), b0 & 0x0F, data
+
+
+def ws_accept(key):
+    # SHA-1 is what the WebSocket protocol uses here (RFC 6455): it only shows
+    # the server understood the request, it protects nothing
+    digest = hashlib.sha1((key + WS_GUID).encode(), usedforsecurity=False).digest()
+    return base64.b64encode(digest).decode()
+
+
+class WebHandshake:
+    """The WebSocket during pairing and joining, which Host.handshake and
+    choose_mode read and write like an app's connection (blocking, one
+    thread): messages are turned into the apps' frames and back."""
+
+    def __init__(self, sock, rest, fingerprint):
+        self.sock = sock
+        self.raw = bytearray(rest)          # WebSocket bytes not handled yet
+        self.frames = bytearray()           # incoming messages as the apps' frames
+        self.fingerprint = fingerprint
+        self.parts = []
+
+    # (the host writes)
+    def sendall(self, data):
+        while data:
+            kind, n = chr(data[0]), struct.unpack(">I", data[1:5])[0]
+            payload, data = data[5:5 + n], data[5 + n:]
+            try:
+                obj = json.loads(payload or b"{}")
+            except ValueError:
+                obj = {}
+            if kind == "N" and isinstance(obj, dict):
+                # The page works out the PIN's proof as the apps do, over the
+                # certificate the host has (it can't see it itself)
+                obj["fingerprint"] = self.fingerprint
+            self.sock.sendall(ws_frame(1, json.dumps({"k": kind, "d": obj}).encode()))
+
+    # (the host reads)
+    def recv(self, n):
+        while not self.frames:
+            self._next()
+        out = bytes(self.frames[:n])
+        del self.frames[:n]
+        return out
+
+    def _next(self):
+        while True:
+            got = ws_parse(self.raw)
+            if got is None:
+                chunk = self.sock.recv(65536)
+                if not chunk:
+                    raise EOFError("connection closed")
+                self.raw += chunk
+                continue
+            fin, op, data = got
+            if op == 8:
+                raise EOFError("the page closed")
+            if op == 9:
+                self.sock.sendall(ws_frame(10, data))
+                continue
+            if op not in (0, 1, 2):
+                continue
+            self.parts.append(data)
+            if not fin:
+                continue
+            text, self.parts = b"".join(self.parts), []
+            try:
+                msg = json.loads(text)
+                kind = str(msg["k"])
+            except (ValueError, KeyError, TypeError):
+                raise ValueError("bad message") from None
+            if len(kind) != 1:
+                continue                    # (signalling comes later)
+            self.frames += frame(kind, msg.get("d") if msg.get("d") is not None else {})
+            return
+
+    def settimeout(self, t):
+        self.sock.settimeout(t)
+
+    def shutdown(self, how):
+        self.sock.shutdown(how)
+
+    def fileno(self):
+        return self.sock.fileno()
+
+    def close(self):
+        try:
+            self.sock.sendall(ws_frame(8, b""))
+        except OSError:
+            pass
+        self.sock.close()
+
+
+class WebViewer(Channel):
+    """A web browser watching. To Session it's a Channel like an app's:
+    send() takes the same messages. The picture and sound go into a WebRTC
+    sender (webrtcbin); everything else is JSON on the page's WebSocket,
+    which this runs like Channel runs an app's connection (one thread)."""
+
+    VIDEO_PT, AUDIO_PT = 96, 97
+    INPUT = set("IGFWUQ")                   # what a page may send once it's watching
+
+    def __init__(self, sock, rest=b""):
+        super().__init__(sock, None, self._closed)
+        import gi
+        gi.require_version("Gst", "1.0")
+        gi.require_version("GstWebRTC", "1.0")
+        gi.require_version("GstSdp", "1.0")
+        gi.require_version("GstVideo", "1.0")
+        from gi.repository import Gst, GstSdp, GstVideo, GstWebRTC
+        Gst.init(None)
+        self.Gst, self.GstSdp, self.GstWebRTC, self.GstVideo = Gst, GstSdp, GstWebRTC, GstVideo
+        self.inbuf += rest
+        self.parts = []
+        self.connected = False
+        self.offered = False
+        self.caps_set = set()
+        self.pipeline = None
+        try:
+            self._build()
+        except (RuntimeError, AttributeError) as e:
+            raise RuntimeError(f"web browsers can't be streamed here: {e}") from None
+
+    def _build(self):
+        Gst, GstWebRTC = self.Gst, self.GstWebRTC
+        if Gst.ElementFactory.find("webrtcbin") is None or Gst.ElementFactory.find("nicesrc") is None:
+            raise RuntimeError("GStreamer's WebRTC support (webrtcbin, libnice) is missing")
+        p = self.pipeline = Gst.Pipeline.new("web")
+        rtc = self.webrtc = make_element("webrtcbin", {"bundle-policy": "max-bundle", "latency": 0}, "webrtc")
+        ice = rtc.get_property("ice-agent")
+        if ice is not None:
+            keep_ref(ice)
+            for prop, port in (("min-rtp-port", ICE_PORTS[0]), ("max-rtp-port", ICE_PORTS[1])):
+                if ice.find_property(prop) is not None:
+                    ice.set_property(prop, port)      # the ports the firewall lets in
+            del ice
+        p.add(rtc)
+        # (before the transceivers: adding them can ask for the offer straight away)
+        rtc.connect("on-negotiation-needed", self._on_negotiation_needed)
+        rtc.connect("on-ice-candidate", self._on_ice_candidate)
+        rtc.connect("notify::connection-state", self._on_connection_state)
+        sendonly = GstWebRTC.WebRTCRTPTransceiverDirection.SENDONLY
+        self.src = {}
+        for kind, rtp, pt, pay in (
+                # (no profile-level-id: it's whatever the encoder makes, and
+                # browsers decode any profile they're sent)
+                ("video", "application/x-rtp,media=video,encoding-name=H264,clock-rate=90000,"
+                          "packetization-mode=(string)1", self.VIDEO_PT,
+                 ("rtph264pay", {"config-interval": -1, "aggregate-mode": "zero-latency", "mtu": 1200})),
+                ("audio", "application/x-rtp,media=audio,encoding-name=OPUS,clock-rate=48000,"
+                          "encoding-params=(string)2", self.AUDIO_PT,
+                 ("rtpopuspay", {"mtu": 1200}))):
+            rtp_caps = Gst.Caps.from_string(f"{rtp},payload={pt}")
+            src = make_element("appsrc", {"is-live": True, "format": "time", "do-timestamp": True,
+                                          "max-bytes": 8 << 20, "block": False}, kind)
+            payloader = make_element(pay[0], dict(pay[1], pt=pt))
+            capsf = make_element("capsfilter", {})
+            capsf.set_property("caps", rtp_caps)
+            queue_ = make_element("queue", {"max-size-time": 0, "max-size-bytes": 0, "max-size-buffers": 200})
+            for el in (src, payloader, capsf, queue_):
+                p.add(el)
+            src.link(payloader)
+            payloader.link(capsf)
+            capsf.link(queue_)
+            # Its own sender, offered with these codecs: the offer needn't
+            # wait for the first frames (they only flow once it's connected)
+            pad = rtc.request_pad_simple("sink_%u")
+            queue_.get_static_pad("src").link(pad)
+            sender = pad.get_property("transceiver")
+            sender.set_property("direction", sendonly)
+            sender.set_property("codec-preferences", rtp_caps)
+            self.src[kind] = src
+        # The browser asks for a key frame (a new decoder, or a lost packet)
+        self.src["video"].get_static_pad("src").add_probe(Gst.PadProbeType.EVENT_UPSTREAM, self._on_upstream)
+        p.get_bus().set_sync_handler(self._on_bus)
+        p.set_state(Gst.State.PLAYING)
+
+    # -- WebRTC
+    def _on_negotiation_needed(self, rtc):
+        with self.lock:
+            if self.offered:
+                return                      # (once: the codecs don't change)
+            self.offered = True
+        promise = self.Gst.Promise.new_with_change_func(self._on_offer, rtc)
+        rtc.emit("create-offer", None, promise)
+
+    def _on_offer(self, promise, rtc):
+        if promise.wait() != self.Gst.PromiseResult.REPLIED:
+            self.close("the stream couldn't be offered to the browser")
+            return
+        # (the reply has to outlive the offer taken from it, or the offer
+        # points at freed memory)
+        reply = promise.get_reply()
+        offer = reply.get_value("offer")
+        text = offer.sdp.as_text()
+        rtc.emit("set-local-description", offer, self.Gst.Promise.new())
+        self._json("offer", {"sdp": text})
+        del offer, reply
+
+    def _on_ice_candidate(self, _rtc, mline, candidate):
+        self._json("ice", {"m": int(mline), "c": candidate})
+
+    def _on_connection_state(self, rtc, _pspec):
+        state = rtc.get_property("connection-state")
+        states = self.GstWebRTC.WebRTCPeerConnectionState
+        if state == states.CONNECTED and not self.connected:
+            self.connected = True
+            log("browser connected (WebRTC)")
+            if self.on_message:
+                self.on_message("F", b"")           # a key frame to start from
+        elif state in (states.FAILED, states.CLOSED):
+            self.close("the browser couldn't be reached (WebRTC)" if not self.connected
+                       else "the browser's connection was lost")
+
+    def _on_upstream(self, _pad, info):
+        event = info.get_event()
+        if event is not None and self.GstVideo.video_event_is_force_key_unit(event) and self.on_message:
+            self.on_message("F", b"")
+        return self.Gst.PadProbeReturn.OK
+
+    def _on_bus(self, _bus, msg):
+        if msg.type == self.Gst.MessageType.ERROR:
+            err, debug = msg.parse_error()
+            log(f"web stream error from {msg.src.get_name()}: {err.message} ({debug})")
+            self.close(f"the web stream stopped: {err.message}")
+        return self.Gst.BusSyncReply.DROP
+
+    def _signal(self, kind, msg):
+        """Signalling from the page: its answer, and where it can be reached."""
+        GstSdp, GstWebRTC = self.GstSdp, self.GstWebRTC
+        if kind == "answer":
+            ok, sdp = GstSdp.SDPMessage.new_from_text(str(msg.get("sdp", "")))
+            if ok != GstSdp.SDPResult.OK:
+                raise ValueError("bad answer")
+            answer = GstWebRTC.WebRTCSessionDescription.new(GstWebRTC.WebRTCSDPType.ANSWER, sdp)
+            self.webrtc.emit("set-remote-description", answer, self.Gst.Promise.new())
+        elif kind == "ice":
+            candidate = str(msg.get("c") or "")
+            if candidate:
+                self.webrtc.emit("add-ice-candidate", int(msg.get("m") or 0), candidate)
+
+    # -- what Session sends
+    def send(self, kind, payload=b""):
+        if kind in ("V", "A"):
+            src = self.src["video" if kind == "V" else "audio"]
+            if not self.connected or self.closed or src.get_name() not in self.caps_set:
+                return True
+            src.emit("push-buffer", self.Gst.Buffer.new_wrapped(bytes(payload)))
+            return True
+        if kind == "K":
+            info = payload if isinstance(payload, dict) else json.loads(payload)
+            src = self.src.get(info.get("kind"))
+            if src is not None:
+                src.set_property("caps", self.Gst.Caps.from_string(info["caps"]))
+                self.caps_set.add(src.get_name())
+            return True
+        if isinstance(payload, (bytes, bytearray)):
+            try:
+                payload = json.loads(payload or b"{}")
+            except ValueError:
+                payload = {}
+        return self._json(kind, payload)
+
+    def _json(self, kind, obj):
+        data = ws_frame(1, json.dumps({"k": kind, "d": obj}).encode())
+        with self.lock:
+            if self.closed:
+                return False
+            self.out.append(data)
+            self.queued += len(data)
+        self._wake()
+        return True
+
+    def backlog(self):
+        try:
+            return int(self.src["video"].get_property("current-level-bytes"))
+        except (KeyError, TypeError):
+            return 0
+
+    # -- what the page sends (Channel's loop calls this)
+    def _read(self):
+        while True:
+            try:
+                data = self.sock.recv(262144)
+            except (ssl.SSLWantReadError, ssl.SSLWantWriteError, BlockingIOError):
+                break
+            if not data:
+                raise EOFError
+            self.inbuf += data
+        while True:
+            got = ws_parse(self.inbuf)
+            if got is None:
+                return
+            fin, op, data = got
+            if op == 8:
+                raise EOFError
+            if op == 9:
+                with self.lock:
+                    self.out.append(ws_frame(10, data))
+                continue
+            if op not in (0, 1, 2):
+                continue
+            self.parts.append(data)
+            if not fin:
+                continue
+            text, self.parts = b"".join(self.parts), []
+            try:
+                msg = json.loads(text)
+                kind, body = str(msg["k"]), msg.get("d")
+            except (ValueError, KeyError, TypeError):
+                raise ValueError("bad message") from None
+            if kind in ("answer", "ice"):
+                self._signal(kind, body if isinstance(body, dict) else {})
+            elif kind in self.INPUT and self.on_message:
+                self.on_message(kind, json.dumps(body if body is not None else {}).encode())
+
+    def discard(self):
+        super().discard()
+        self._closed("")
+
+    def _closed(self, _reason):
+        if self.pipeline is not None:
+            self.pipeline.set_state(self.Gst.State.NULL)
+            self.pipeline = None
+
+
+def keep_ref(obj):
+    """webrtcbin's "ice-agent" hands over its own reference when Python
+    reads it (GStreamer 1.28), so the agent would go when Python lets go of
+    it. Give it back one: only when Python holds the only one, so it isn't
+    leaked once that's fixed."""
+    if getattr(obj, "__grefcount__", 2) != 1:
+        return
+    import ctypes
+    get = ctypes.pythonapi.PyCapsule_GetPointer
+    get.restype, get.argtypes = ctypes.c_void_p, [ctypes.py_object, ctypes.c_char_p]
+    gobject = ctypes.CDLL("libgobject-2.0.so.0")
+    gobject.g_object_ref.restype, gobject.g_object_ref.argtypes = ctypes.c_void_p, [ctypes.c_void_p]
+    gobject.g_object_ref(get(obj.__gpointer__, None))
+
+
+def read_http_request(sock, limit=16384):
+    """(method, path, headers, the bytes after them) of one HTTP request."""
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        chunk = sock.recv(4096)
+        if not chunk:
+            raise EOFError("connection closed")
+        buf += chunk
+        if len(buf) > limit:
+            raise ValueError("request too long")
+    head, _, rest = buf.partition(b"\r\n\r\n")
+    lines = head.decode("latin-1").split("\r\n")
+    parts = lines[0].split(" ")
+    if len(parts) != 3:
+        raise ValueError("bad request")
+    headers = {}
+    for line in lines[1:]:
+        k, _, v = line.partition(":")
+        headers[k.strip().lower()] = v.strip()
+    return parts[0], parts[1].split("?")[0], headers, rest
+
+
+WEB_FILES = {
+    "/": ("index.html", "text/html; charset=utf-8"),
+    "/index.html": ("index.html", "text/html; charset=utf-8"),
+    "/app.js": ("app.js", "text/javascript; charset=utf-8"),
+    "/style.css": ("style.css", "text/css; charset=utf-8"),
+    "/icon.svg": ("/usr/share/firox/icons/start-orb.svg", "image/svg+xml"),
+}
+
+
+def http_reply(sock, status, body=b"", ctype="text/plain; charset=utf-8", extra=""):
+    head = (f"HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {len(body)}\r\n"
+            "Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\n"
+            "X-Frame-Options: DENY\r\n"
+            "Content-Security-Policy: default-src 'self'; img-src 'self' data:; media-src 'self' blob:; "
+            "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'\r\n"
+            f"{extra}Connection: close\r\n\r\n")
+    sock.sendall(head.encode() + body)
 
 
 # ------------------------------------------------------------------- host --
@@ -729,16 +1189,19 @@ class Capture:
         pipeline = Gst.Pipeline.new("video")
         if self.source:
             fd, node = self.source
+            # Only ever the screen the portal shared. If PipeWire can't find
+            # that stream (or it goes away, a monitor unplugged), it would
+            # otherwise link the default video source: the webcam.
+            screen_only = {"fd": os.dup(fd), "path": str(node), "do-timestamp": True, "keepalive-time": 1000,
+                           "stream-properties": "props,node.dont-fallback=(string)true,node.dont-reconnect=(string)true"}
             if Capture._gpu_buffers:
                 # The portal only hands out GPU buffers (DMA-BUFs; NVIDIA does
                 # this): OpenGL imports them and copies the picture out
-                src = [make_element("pipewiresrc", {"fd": os.dup(fd), "path": str(node), "do-timestamp": True,
-                                                    "keepalive-time": 1000}),
+                src = [make_element("pipewiresrc", screen_only),
                        make_element("glupload", {}), make_element("glcolorconvert", {}),
                        make_element("gldownload", {}), make_element("capsfilter", {"caps": "video/x-raw"})]
             else:
-                src = [make_element("pipewiresrc", {"fd": os.dup(fd), "path": str(node), "do-timestamp": True,
-                                                    "keepalive-time": 1000, "always-copy": True}),
+                src = [make_element("pipewiresrc", dict(screen_only, **{"always-copy": True})),
                        # Ordinary memory. Otherwise pipewiresrc offers the portal
                        # only the GPU buffer layouts the encoder takes (VA-API's,
                        # behind vapostproc). The encoder uploads the frames itself.
@@ -765,7 +1228,12 @@ class Capture:
             err, debug = msg.parse_error()
             log(f"{which} error from {msg.src.get_name()}: {err.message} ({debug})")
             if which == "video":
-                self.failed = self.failed or err.message
+                message = err.message
+                if "target not found" in message:
+                    # node.dont-fallback: the shared screen's stream wasn't
+                    # there, and nothing else (a webcam) is taken instead
+                    message = "the shared screen's picture wasn't available"
+                self.failed = self.failed or message
                 self.first.set()
                 self.broken.set()
             else:
@@ -1302,6 +1770,17 @@ class Host:
         self.name = computer_name()
         threading.Thread(target=self.accept_loop, daemon=True).start()
         threading.Thread(target=self.serve_control, daemon=True).start()
+        self.web_server = None
+        if self.conf.get("web"):
+            web_port = int(os.environ.get("FIROX_STREAM_WEB_PORT") or self.conf.get("web_port") or WEB_PORT)
+            try:
+                self.web_server = socket.create_server(("", web_port), family=socket.AF_INET6,
+                                                       dualstack_ipv6=True) \
+                    if socket.has_dualstack_ipv6() else socket.create_server(("0.0.0.0", web_port))
+                threading.Thread(target=self.web_loop, daemon=True).start()
+                log(f"web browsers: https://{socket.gethostname()}.local:{web_port}/")
+            except OSError as e:
+                log(f"web browsers: couldn't listen on port {web_port}: {e}")
         self.publish()
         GLib.timeout_add_seconds(30, self.watchdog)
         log(f"listening on port {self.port}")
@@ -1351,6 +1830,82 @@ class Host:
             sock.close()
             return
         self.stream(sock, client, address, mode)
+
+    def web_loop(self):
+        while True:
+            try:
+                raw, addr = self.web_server.accept()
+            except OSError:
+                time.sleep(1)
+                continue
+            threading.Thread(target=self.serve_web, args=(raw, addr[0]), daemon=True).start()
+
+    def serve_web(self, raw, address):
+        """A web browser: the page (GET /), or the page's WebSocket (/ws),
+        which pairs and joins like an app and then watches over WebRTC."""
+        if address.startswith("::ffff:"):
+            address = address[7:]
+        try:
+            raw.settimeout(15)
+            keepalive(raw)
+            sock = self.tls.wrap_socket(raw, server_side=True)
+        except (OSError, ssl.SSLError) as e:
+            # (a browser that hasn't accepted the certificate yet hangs up here)
+            log(f"{address}: web TLS failed: {e}")
+            raw.close()
+            return
+        try:
+            method, path, headers, rest = read_http_request(sock)
+            if not load_conf().get("web"):
+                http_reply(sock, "403 Forbidden", b"Web browsers can't stream this computer.\n")
+                sock.close()
+                return
+            if path == "/ws" and headers.get("upgrade", "").lower() == "websocket":
+                # Only the page this computer serves may open it (not another
+                # web site the browser has open)
+                origin, host = headers.get("origin", ""), headers.get("host", "")
+                if not host or origin != f"https://{host}":
+                    http_reply(sock, "403 Forbidden", b"Wrong origin.\n")
+                    sock.close()
+                    return
+                key = headers.get("sec-websocket-key", "")
+                sock.sendall(("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                              f"Sec-WebSocket-Accept: {ws_accept(key)}\r\n\r\n").encode())
+                self.serve_page_socket(sock, rest, address)
+                return
+            entry = WEB_FILES.get(path) if method in ("GET", "HEAD") else None
+            if entry is None:
+                http_reply(sock, "404 Not Found", b"Not found.\n")
+            else:
+                name, ctype = entry
+                with open(name if name.startswith("/") else os.path.join(WEB_DIR, name), "rb") as fh:
+                    body = fh.read()
+                http_reply(sock, "200 OK", b"" if method == "HEAD" else body, ctype)
+        except (OSError, ValueError, EOFError) as e:
+            log(f"{address}: web: {e}")
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+    def serve_page_socket(self, sock, rest, address):
+        ws = WebHandshake(sock, rest, self.fingerprint)
+        try:
+            client = self.handshake(ws, address)
+            mode = self.choose_mode(ws, client) if client else None
+        except (OSError, ValueError, EOFError) as e:
+            log(f"{address}: {e}")
+            client = mode = None
+        if client is None or mode is None:
+            ws.close()
+            return
+        try:
+            viewer = WebViewer(sock, bytes(ws.raw))
+        except RuntimeError as e:
+            log(f"{address}: {e}")
+            self._refuse(ws, f"This computer can't stream to web browsers: {e}")
+            return
+        self.stream(ws, f"{client} (web browser)", address, mode, channel=viewer)
 
     def choose_mode(self, sock, client):
         """Someone is streaming already: ask whether to watch with them or
@@ -1482,9 +2037,9 @@ class Host:
         if cast:
             cast.close()
 
-    def stream(self, sock, client, address, mode="join"):
+    def stream(self, sock, client, address, mode="join", channel=None):
         conf = load_conf()
-        channel = Channel(sock, None)
+        channel = channel or Channel(sock, None)
         with self.session_lock:
             session = self.session
             if mode == "takeover" and session is not None and not session.ended:
@@ -1497,12 +2052,14 @@ class Host:
                 except Exception as e:
                     log(f"couldn't start: {e}")
                     session.stop()
+                    channel.discard()
                     self._refuse(sock, f"That computer couldn't share its screen: {e}")
                     return
                 self.session = session
             try:
                 sock.sendall(frame("O", session.info()))
             except OSError:
+                channel.discard()
                 if not session.viewers:
                     session.stop()
                     self.session = None
@@ -1730,22 +2287,31 @@ def run_daemon():
 # everything in). Asking firewalld anything needs the password, so it's one
 # script, asked for once.
 FIREWALL_SCRIPT = r"""
-port="$1"
 zones=$(firewall-cmd --get-active-zones 2>/dev/null | grep -v '^[[:space:]]' | cut -d' ' -f1)
 [ -n "$zones" ] || zones=$(firewall-cmd --get-default-zone)
 for z in $zones; do
     [ "$(firewall-cmd --permanent --zone="$z" --get-target 2>/dev/null)" = ACCEPT ] && continue
-    if ! firewall-cmd --permanent --zone="$z" --query-port="$port/tcp" >/dev/null 2>&1; then
-        firewall-cmd --permanent --zone="$z" --add-port="$port/tcp" >/dev/null || exit 3
-    fi
-    if ! firewall-cmd --zone="$z" --query-port="$port/tcp" >/dev/null 2>&1; then
-        firewall-cmd --zone="$z" --add-port="$port/tcp" >/dev/null || exit 3
-    fi
+    for spec in "$@"; do        # PORT/tcp, or FIRST-LAST/udp
+        if ! firewall-cmd --permanent --zone="$z" --query-port="$spec" >/dev/null 2>&1; then
+            firewall-cmd --permanent --zone="$z" --add-port="$spec" >/dev/null || exit 3
+        fi
+        if ! firewall-cmd --zone="$z" --query-port="$spec" >/dev/null 2>&1; then
+            firewall-cmd --zone="$z" --add-port="$spec" >/dev/null || exit 3
+        fi
+    done
 done
 """
 
 
-def open_firewall(port):
+def firewall_ports(conf):
+    """What other computers (and browsers) need to reach."""
+    ports = [f"{int(conf.get('port') or PORT)}/tcp"]
+    if conf.get("web"):
+        ports += [f"{int(conf.get('web_port') or WEB_PORT)}/tcp", f"{ICE_PORTS[0]}-{ICE_PORTS[1]}/udp"]
+    return ports
+
+
+def open_firewall(ports):
     """Let other computers reach the port: one password prompt (when
     streaming is turned on). An image update doesn't bring the port to a
     zone whose settings were changed on this computer (by an old Sunshine
@@ -1758,7 +2324,7 @@ def open_firewall(port):
     if not running:
         return True
     try:
-        return subprocess.run(["pkexec", "sh", "-c", FIREWALL_SCRIPT, "firox-stream", str(int(port))],
+        return subprocess.run(["pkexec", "sh", "-c", FIREWALL_SCRIPT, "firox-stream", *ports],
                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=300).returncode == 0
     except (OSError, subprocess.SubprocessError):
         return False
@@ -1772,9 +2338,9 @@ def set_enabled(on):
     conf["enabled"] = bool(on)
     save_conf(conf)
     reachable = True
-    if on and not open_firewall(int(conf.get("port") or PORT)):
+    if on and not open_firewall(firewall_ports(conf)):
         reachable = False
-        print(f"The firewall still blocks port {conf.get('port') or PORT}/tcp: other computers can't connect.",
+        print(f"The firewall still blocks {', '.join(firewall_ports(conf))}: other computers can't connect.",
               file=sys.stderr)
     subprocess.run(["pkill", "-u", str(os.getuid()), "-f", "firox-stream daemon"],
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -1783,6 +2349,30 @@ def set_enabled(on):
         subprocess.Popen([sys.argv[0], "daemon"], start_new_session=True,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return reachable
+
+
+def set_web(on):
+    """Let web browsers stream this computer too (streaming has to be on).
+    Returns whether they can reach it."""
+    conf = load_conf()
+    conf["web"] = bool(on)
+    save_conf(conf)
+    if conf.get("enabled"):
+        return set_enabled(True)            # the firewall, and the daemon again
+    return True
+
+
+def web_addresses(conf=None):
+    """Where a browser on the network finds this computer."""
+    conf = conf or load_conf()
+    port = int(conf.get("web_port") or WEB_PORT)
+    out = [f"https://{socket.gethostname().split('.')[0]}.local:{port}/"]
+    try:
+        ips = subprocess.run(["hostname", "-I"], capture_output=True, text=True, timeout=5).stdout.split()
+    except (OSError, subprocess.SubprocessError):
+        ips = []
+    out += [f"https://{ip}:{port}/" for ip in ips if ip.count(".") == 3][:2]
+    return out
 
 
 def daemon_running():
@@ -2744,6 +3334,11 @@ def client_ui(address=None):
             self.allow.set_sensitive(not policy_forbids())
             self.allow.connect("toggled", self.on_allow)
             box.add(self.allow)
+            self.web = Gtk.CheckButton(label="Let web browsers stream it too (phones, tablets, any computer)")
+            self.web.set_active(bool(load_conf().get("web")))
+            self.web.set_margin_start(24)
+            self.web.connect("toggled", self.on_web)
+            box.add(self.web)
             self.allow_note = Gtk.Label(xalign=0, wrap=True, max_width_chars=50)
             self.allow_note.get_style_context().add_class("dim-label")
             box.add(self.allow_note)
@@ -2782,13 +3377,19 @@ def client_ui(address=None):
         def update_note(self):
             conf = load_conf()
             n = len(conf.get("clients", {}))
+            self.web.set_sensitive(bool(conf.get("enabled")) and not policy_forbids())
             if policy_forbids():
                 self.allow_note.set_text("Your organization's policy doesn't allow other computers to stream "
                                          "this one.")
             elif conf.get("enabled"):
+                web = ""
+                if conf.get("web"):
+                    web = ("\n\nIn a web browser, open " + " or ".join(web_addresses(conf)) +
+                           ". The browser warns about this computer's certificate the first time: "
+                           "it's this computer's own, so allow it.")
                 self.allow_note.set_text(
                     "Computers you've paired can stream this one whenever you're logged in. "
-                    f"Paired: {n}. A new one needs the PIN this computer shows.")
+                    f"Paired: {n}. A new one needs the PIN this computer shows." + web)
             else:
                 self.allow_note.set_text("Nobody can stream this computer.")
 
@@ -2796,8 +3397,17 @@ def client_ui(address=None):
             reachable = set_enabled(button.get_active())
             self.update_note()
             if not reachable:
-                self.status.set_text(f"The firewall still blocks Firox Stream's port (TCP {PORT}), so other "
+                self.status.set_text(f"The firewall still blocks Firox Stream's ports "
+                                     f"({', '.join(firewall_ports(load_conf()))}), so other "
                                      "computers can't connect. Untick and tick the box to try again.")
+
+        def on_web(self, button):
+            reachable = set_web(button.get_active())
+            self.update_note()
+            if not reachable:
+                self.status.set_text("The firewall still blocks the ports web browsers need (TCP "
+                                     f"{WEB_PORT}, UDP {ICE_PORTS[0]}–{ICE_PORTS[1]}). Untick and tick the "
+                                     "box to try again.")
 
         def on_unpair(self, _b):
             conf = load_conf()
@@ -2939,6 +3549,21 @@ def main(argv):
         set_enabled(cmd == "on")
         print(f"Streaming this computer is {cmd}.")
         return 0
+    if cmd == "web" and len(argv) > 2 and argv[2] in ("on", "off"):
+        if argv[2] == "on" and policy_forbids():
+            print("Your organization's policy doesn't allow streaming this computer.", file=sys.stderr)
+            return 1
+        set_web(argv[2] == "on")
+        if argv[2] == "off":
+            print("Web browsers can't stream this computer.")
+        elif not load_conf().get("enabled"):
+            print("Web browsers will be able to stream this computer once streaming is on "
+                  "(firox-stream on).")
+        else:
+            print("Web browsers can stream this computer. Open one of these in a browser on the network:")
+            for a in web_addresses():
+                print(f"  {a}")
+        return 0
     if cmd == "kick":
         answer = control("kick")
         if answer is None:
@@ -2970,6 +3595,8 @@ def main(argv):
         conf = load_conf()
         print(f"streaming this computer: {'on' if conf.get('enabled') else 'off'}"
               f"{' (running)' if daemon_running() else ''}; port {conf.get('port', PORT)}")
+        if conf.get("web"):
+            print(f"web browsers: on, {' or '.join(web_addresses(conf))}")
         for name in (control() or {}).get("viewers") or []:
             print(f"streaming it now: {name}")
         for c in conf.get("clients", {}).values():

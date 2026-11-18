@@ -322,7 +322,7 @@
     <div class="feature-text">
         <h3>Screen savers</h3>
         <p><b>Settings → Screen Saver:</b> Fish Tank, Aquarium (text), Matrix, Bonsai, Bouncing firox, Starfield or Blank, full screen on every monitor, with Preview.</p>
-<p>They're off by default. <a href="guide.html#screen-savers">Add your own</a>.</p>
+<p>They're off by default. While a window is full screen (a game, a YouTube video in Firefox, Firox Stream), the screen saver waits, and it starts counting again once nothing is. <a href="guide.html#screen-savers">Add your own</a>.</p>
         <p class="tech">firox-screensaver (asciiquarium, cmatrix, cbonsai and more)</p>
     </div>
     <figure>
@@ -542,9 +542,10 @@
     <li><b>Keyboard and mouse:</b> what you type and click goes to the other computer.</li>
     <li><b>Game controllers:</b> plug a controller into this computer (Xbox, PlayStation, Switch Pro, 8BitDo and most others) and it works on the other one as an Xbox controller, rumble included. Up to four at a time.</li>
     <li><b>Pairing:</b> the first time, type the 4-digit PIN the other computer shows. After that it just connects.</li>
+    <li><b>In a web browser too:</b> tick <i>Let web browsers stream it too</i> and open its address (<code>https://NAME.local:48301/</code>) on a phone, tablet or any computer. There's no app to install, and keyboard, mouse, touch and controllers all work.</li>
     <li><b>Turned off until you want it:</b> nobody can stream a computer until you tick <i>Let other computers stream this one</i> on it.</li>
 </ul>
-        <p class="tech">firox-stream: GStreamer (portal screen capture, VA-API/NVENC/x264 H.264, Opus) over TLS on port 48300, uinput for input and virtual Xbox 360 controllers (SDL reads them here)</p>
+        <p class="tech">firox-stream: GStreamer (portal screen capture, VA-API/NVENC/x264 H.264, Opus) over TLS on port 48300 (to browsers: WebRTC via webrtcbin, signalled over a WebSocket on 48301), uinput for input and virtual Xbox 360 controllers (SDL reads them here)</p>
     </div>
     <figure>
     <img src="screenshots/stream.png" alt="The Firox Stream window" loading="lazy">

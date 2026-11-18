@@ -79,13 +79,16 @@ install-app-store:
 # sound to another Firox computer, which sends its keyboard and mouse back.
 # The Start menu's Firox Stream does the same; this is for a terminal.
 # Let other computers stream this one: ujust stream on|off|status|kick|unpair
+# Web browsers too (phones, tablets, any computer): ujust stream web-on|web-off
 [group('Firox Linux')]
 stream ACTION="status":
     #!/usr/bin/bash
     set -euo pipefail
     case "{{ ACTION }}" in
         on|off|status|kick|unpair) firox-stream "{{ ACTION }}" ;;
-        *) echo "Usage: ujust stream on|off|status|kick|unpair"; exit 2 ;;
+        web-on) firox-stream web on ;;
+        web-off) firox-stream web off ;;
+        *) echo "Usage: ujust stream on|off|status|kick|unpair|web-on|web-off"; exit 2 ;;
     esac
 
 # Firox Explorer is now Firox's file manager. This tidies up after the
