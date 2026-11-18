@@ -11,6 +11,9 @@
 #   firox-power awake [on|off|toggle]
 #                                   keep the screen on: pause the timers
 #                                   below until turned off or you log off
+#   firox-power fullscreen [on|off] a window is full screen (a game, a video,
+#                                   Firox Stream): pause the screen saver
+#                                   until it isn't (the taskbar does this)
 #
 # Keys (minutes, 0 = never):
 #   MONITOR_AC  MONITOR_BATTERY     turn the screen off when idle
@@ -26,8 +29,9 @@
 #   BATTERY_ACTION_KIND             0 nothing, 1 sleep, 2 hibernate, 3 shut down
 # Settings live in ~/.config/firox/power.conf (defaults: /etc/firox/power.conf).
 # Settings a policy sets (/var/lib/firox/policy/power.conf) win over both.
-# Apps that play video or are full screen keep the screen on (idle inhibit),
-# and so does another computer streaming this one (Firox Stream).
+# Apps that play video keep the screen on (idle inhibit), and so does another
+# computer streaming this one (Firox Stream). While a window is full screen
+# the screen saver waits; the other timers carry on.
 set -u
 
 SYS_CONF=/etc/firox/power.conf
@@ -38,6 +42,8 @@ PS="${FIROX_POWER_SUPPLY:-/sys/class/power_supply}"
 AWAKE="${XDG_RUNTIME_DIR:-/tmp}/firox-stay-awake"
 # Firox Stream holds the timers while another computer streams this one
 STREAM_AWAKE="${XDG_RUNTIME_DIR:-/tmp}/firox-stream-awake"
+# The taskbar (firox-panel) holds the screen saver while a window is full screen
+FULLSCREEN="${XDG_RUNTIME_DIR:-/tmp}/firox-fullscreen"
 
 get() {
     local v=""
@@ -157,7 +163,8 @@ start() {
     if [ -e "$AWAKE" ] || [ -e "$STREAM_AWAKE" ]; then return 0; fi
     local args=(-w) m src
     m="$(get SCREENSAVER_WAIT)"
-    if [ "$m" -gt 0 ] && [ "$(firox-screensaver current)" != none ]; then
+    # A full-screen window (a game, a video, Firox Stream): no screen saver
+    if [ "$m" -gt 0 ] && [ ! -e "$FULLSCREEN" ] && [ "$(firox-screensaver current)" != none ]; then
         args+=(timeout $((m * 60)) 'firox-screensaver start' resume 'firox-screensaver stop')
     fi
     m="$(get LOCK)"
@@ -211,6 +218,15 @@ case "${1:-show}" in
             *)      echo "usage: firox-power awake [on|off|toggle]" >&2; exit 2 ;;
         esac
         ;;
+    fullscreen)
+        case "${2:-status}" in
+            on)     [ -e "$FULLSCREEN" ] || { touch "$FULLSCREEN"; start; } ;;
+            off)    [ -e "$FULLSCREEN" ] && { rm -f "$FULLSCREEN"; start; } ;;
+            status) [ -e "$FULLSCREEN" ] && echo on || echo off ;;
+            *)      echo "usage: firox-power fullscreen [on|off]" >&2; exit 2 ;;
+        esac
+        exit 0
+        ;;
     battery)
         has_battery || { echo "no battery"; exit 1; }
         battery_level
@@ -231,7 +247,7 @@ case "${1:-show}" in
         esac
         ;;
     *)
-        sed -n '2,30s/^# \{0,1\}//p' "$0" >&2
+        sed -n '2,33s/^# \{0,1\}//p' "$0" >&2
         exit 2
         ;;
 esac

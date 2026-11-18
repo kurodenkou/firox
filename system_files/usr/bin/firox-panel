@@ -72,6 +72,7 @@ CONFIG = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~
 STATE = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "firox")
 SETTINGS = os.path.join(CONFIG, "panel.conf")
 AWAKE = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp", "firox-stay-awake")
+FULLSCREEN = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp", "firox-fullscreen")   # read by firox-power
 HEIGHT = 30
 ICON = 16
 
@@ -1187,15 +1188,20 @@ class Awake(Indicator):
 
     def __init__(self):
         super().__init__("idle_inhibitor")
+        self.fullscreen = None          # the full-screen window's name, if one is
         self.update()
 
-    def update(self):
+    def update(self, fullscreen=False):
+        if fullscreen is not False:
+            self.fullscreen = fullscreen
+        fullscreen = self.fullscreen
         on = os.path.exists(AWAKE)
-        self.set(FA_EYE if on else FA_EYE_SLASH,
-                 "Keeping the screen on: the screen saver, screen off and sleep timers are paused\n"
-                 "Click to turn this off" if on else
-                 "Click to keep the screen on (pause the screen saver and sleep timers)",
-                 ["activated" if on else "deactivated"])
+        tip = ("Keeping the screen on: the screen saver, screen off and sleep timers are paused\n"
+               "Click to turn this off" if on else
+               "Click to keep the screen on (pause the screen saver and sleep timers)")
+        if fullscreen and not on:
+            tip = f"The screen saver is paused while {fullscreen} is full screen\n" + tip
+        self.set(FA_EYE if on else FA_EYE_SLASH, tip, ["activated" if on else "deactivated"])
 
     def left(self):
         subprocess.run(["firox-power", "awake", "toggle"], stdout=subprocess.DEVNULL,
@@ -1962,6 +1968,13 @@ class Panel:
         if not GtkLayerShell.is_supported():
             cant_run("the compositor doesn't support layer-shell")
         firox_toplevels.NAME_FOR = lambda app_id: APPS.lookup(app_id)[0]
+        self.awake = Awake()
+        # Nothing is full screen yet (a file left by an earlier session goes)
+        self.fullscreen = False
+        self.fullscreen_check = 0
+        if os.path.exists(FULLSCREEN):
+            subprocess.Popen(["firox-power", "fullscreen", "off"], stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
         try:
             self.toplevels = Toplevels(self.refresh)
         except firox_toplevels.Unavailable as err:
@@ -1971,7 +1984,7 @@ class Panel:
         self.battery = Battery()
         self.security = Security()
         self.nightlight = NightLight()
-        self.indicators = [Awake(), self.nightlight, Network(), Bluetooth(), Volume(), self.battery,
+        self.indicators = [self.awake, self.nightlight, Network(), Bluetooth(), Volume(), self.battery,
                            self.security, Updates(), Bell(), self.clock]
 
         self.glass = None
@@ -2103,6 +2116,31 @@ class Panel:
         bars = list(self.bars.values())
         for bar in bars:
             bar.taskbar.refresh([w for w in windows if bar.matches(w, bars)], self.grouping)
+        self.watch_fullscreen(windows)
+
+    def watch_fullscreen(self, windows):
+        """Pause the screen saver while a window is full screen (a game, a video,
+        Firox Stream), and let it run again once none is. Checked again after a
+        moment, so a window that's only passing through full screen (or going
+        from one full screen to another) doesn't restart the idle timers."""
+        full = [w for w in windows if w.fullscreen and not w.minimized]
+        self.awake.update(full[0].label if full else None)
+        want = bool(full)
+        if want == self.fullscreen or self.fullscreen_check:
+            return
+
+        def check():
+            self.fullscreen_check = 0
+            now = any(w.fullscreen and not w.minimized for w in self.toplevels.ordered())
+            if now != self.fullscreen:
+                self.fullscreen = now
+                try:
+                    subprocess.Popen(["firox-power", "fullscreen", "on" if now else "off"],
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                except OSError:
+                    pass
+            return False
+        self.fullscreen_check = GLib.timeout_add(1500, check)
 
     def set_grouping(self, on):
         self.grouping = on
