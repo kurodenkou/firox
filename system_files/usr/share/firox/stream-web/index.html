@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<title>Firox Stream</title>
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main id="start" class="panel">
+    <h1><img src="icon.svg" alt=""> Firox Stream</h1>
+    <p class="lead">Watch and use <b id="host">this computer</b> from this browser: its screen and sound, with your keyboard, mouse, touch screen and game controllers.</p>
+
+    <form id="connect-form">
+        <label for="name">Name this device</label>
+        <input id="name" maxlength="60" autocomplete="off" required>
+        <button id="connect" type="submit" class="primary">Connect</button>
+    </form>
+
+    <form id="pin-form" hidden>
+        <p><b>Type the PIN that <span class="host-name">the computer</span> is showing.</b> It's on that computer's screen now. Pairing is only needed once in this browser.</p>
+        <input id="pin" inputmode="numeric" pattern="[0-9]{4}" maxlength="4" autocomplete="one-time-code" required>
+        <button type="submit" class="primary">Pair</button>
+        <button type="button" id="pin-cancel">Cancel</button>
+    </form>
+
+    <div id="busy" hidden>
+        <p><b id="busy-text">Someone is already streaming this computer.</b></p>
+        <button type="button" id="join" class="primary">Watch with them</button>
+        <button type="button" id="takeover">Take over</button>
+        <button type="button" id="busy-cancel">Cancel</button>
+    </div>
+
+    <p id="message" role="status"></p>
+    <p class="small">Connecting shares nothing from this device: it only receives the other computer's picture and sound. On the local network only.</p>
+</main>
+
+<div id="stage" hidden>
+    <video id="video" playsinline autoplay></video>
+    <div id="bar">
+        <span id="title">Firox Stream</span>
+        <button type="button" id="b-full" title="Full screen">Full screen</button>
+        <button type="button" id="b-mouse" title="Keep the mouse in the picture, for games (Esc lets go)">Capture mouse</button>
+        <button type="button" id="b-keys" title="Show this device's on-screen keyboard">Keyboard</button>
+        <button type="button" id="b-wake" title="Turn the other computer's screen back on">Wake screen</button>
+        <button type="button" id="b-unlock" title="Unlock it with its password" hidden>Unlock</button>
+        <button type="button" id="b-stop" class="danger" title="Stop streaming">Disconnect</button>
+    </div>
+    <textarea id="typing" autocapitalize="off" autocomplete="off" autocorrect="off" spellcheck="false" aria-label="Type on the other computer"></textarea>
+    <div id="toast" role="status"></div>
+    <div id="tap" hidden>Tap to start the sound</div>
+</div>
+<script src="app.js"></script>
+</body>
+</html>
