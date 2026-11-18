@@ -729,16 +729,19 @@ class Capture:
         pipeline = Gst.Pipeline.new("video")
         if self.source:
             fd, node = self.source
+            # Only ever the screen the portal shared. If PipeWire can't find
+            # that stream (or it goes away, a monitor unplugged), it would
+            # otherwise link the default video source: the webcam.
+            screen_only = {"fd": os.dup(fd), "path": str(node), "do-timestamp": True, "keepalive-time": 1000,
+                           "stream-properties": "props,node.dont-fallback=(string)true,node.dont-reconnect=(string)true"}
             if Capture._gpu_buffers:
                 # The portal only hands out GPU buffers (DMA-BUFs; NVIDIA does
                 # this): OpenGL imports them and copies the picture out
-                src = [make_element("pipewiresrc", {"fd": os.dup(fd), "path": str(node), "do-timestamp": True,
-                                                    "keepalive-time": 1000}),
+                src = [make_element("pipewiresrc", screen_only),
                        make_element("glupload", {}), make_element("glcolorconvert", {}),
                        make_element("gldownload", {}), make_element("capsfilter", {"caps": "video/x-raw"})]
             else:
-                src = [make_element("pipewiresrc", {"fd": os.dup(fd), "path": str(node), "do-timestamp": True,
-                                                    "keepalive-time": 1000, "always-copy": True}),
+                src = [make_element("pipewiresrc", dict(screen_only, **{"always-copy": True})),
                        # Ordinary memory. Otherwise pipewiresrc offers the portal
                        # only the GPU buffer layouts the encoder takes (VA-API's,
                        # behind vapostproc). The encoder uploads the frames itself.
@@ -765,7 +768,12 @@ class Capture:
             err, debug = msg.parse_error()
             log(f"{which} error from {msg.src.get_name()}: {err.message} ({debug})")
             if which == "video":
-                self.failed = self.failed or err.message
+                message = err.message
+                if "target not found" in message:
+                    # node.dont-fallback: the shared screen's stream wasn't
+                    # there, and nothing else (a webcam) is taken instead
+                    message = "the shared screen's picture wasn't available"
+                self.failed = self.failed or message
                 self.first.set()
                 self.broken.set()
             else:
