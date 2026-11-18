@@ -69,7 +69,7 @@
             <li>Asks for each feature, in plain words: "a realistic fish tank screensaver", "Active Directory support in firox-policy".</li>
             <li>Installs the builds on their own computers and reports what doesn't work. For example, the Steam mouse problem was found and confirmed fixed on real hardware.</li>
             <li>Overrules the AI when it's wrong. For example, they had a change to the Proton Wayland setting reverted.</li>
-            <li>Passes on findings from security scanners. Claude then fixed them, such as certificate checking in the Android app, a file path check, and replacing SHA-1.</li>
+            <li>Scans the code with <a href="https://snyk.io/">Snyk</a> and passes its findings on. Claude then fixed them, such as certificate checking in the Android app, a file path check, and replacing SHA-1.</li>
             <li>Reviews and merges, or declines, every pull request.</li>
         </ul>
     </div>
@@ -99,7 +99,7 @@
 
 <h2 id="limits">What this means for you</h2>
 <ul>
-    <li><b>AI makes mistakes, including security mistakes.</b> Several have already been found and fixed. Assume there are more. Firox hasn't had an independent security audit.</li>
+    <li><b>AI makes mistakes, including security mistakes.</b> The maintainer scans the code with <a href="https://snyk.io/">Snyk</a>, a static analysis tool, and the issues it has found so far have been fixed. A scanner catches many common problems but not all of them, and Firox hasn't had a security audit by a person. Assume there are more mistakes.</li>
     <li><b>Much of it has only been tested in containers.</b> Features that need particular hardware or servers may never have run on them before release. Examples are joining an Active Directory domain, NFS home folders, some game controllers and some graphics cards. The pull requests say what was and wasn't tested.</li>
     <li><b>Be careful in sensitive places.</b> Before using Firox where a security or reliability failure would be costly (a business, a school, anything holding other people's data), read the parts you rely on, or have someone do it.</li>
     <li><b>Copyright and licensing.</b> The law on who owns AI-written code is still unsettled in some places. If that matters for how you use Firox, take advice.</li>
