@@ -114,15 +114,17 @@ button.quick-launch:hover {
     font-weight: 900;
 }
 #idle_inhibitor.activated { color: #0a64d6; }
-#idle_inhibitor.deactivated { color: #6e6e73; }
+/* Icons that are off or idle are black like the rest (grey with the
+   drop shadow looked smudged); on or warning states keep their colours */
+#idle_inhibitor.deactivated { color: #1c1c1e; }
 #battery.warning { color: #b26a00; }
 #battery.critical { color: #c41e1e; }
 #network, #bluetooth { padding: 0 5px; }
-#network.disconnected, #bluetooth.off { color: #8e8e93; }
+#network.disconnected, #bluetooth.off { color: #1c1c1e; }
 #network.connecting { color: #0a64d6; }
 #clock { padding: 0 10px 0 6px; font-weight: bold; }
 
-#custom-notifications.read, #custom-notifications.dnd { color: #6e6e73; }
+#custom-notifications.read, #custom-notifications.dnd { color: #1c1c1e; }
 #custom-notifications.unread { color: #e0a400; text-shadow: 0 0 4px rgba(255, 196, 0, 0.55); }
 #custom-updates.pending { color: #0a64d6; }
 
@@ -132,12 +134,12 @@ button.quick-launch:hover {
 /* Security Center's shield (firox-security): dim when everything's fine,
    lit when something needs your attention */
 #security { padding: 0 4px; }
-#security.ok { color: #8e8e93; }
+#security.ok { color: #1c1c1e; }
 #security.warn { color: #b26a00; }
 #security.bad { color: #c41e1e; }
 
 /* Night Light's moon (firox-nightlight): lit while the screen is warmer */
-#nightlight.off { color: #8e8e93; }
+#nightlight.off { color: #1c1c1e; }
 #nightlight.on { color: #c26a00; }
 
 /* ---- a soft shadow under every icon, so white icons don't wash out
