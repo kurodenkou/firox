@@ -9,6 +9,8 @@ A desktop Linux built on [Universal Blue](https://universal-blue.org/) (Fedora A
 - **Android apps** with [Waydroid](https://waydro.id/).
 - **Updates that can't break your computer:** each update is a complete new version of the system, switched to when you restart, and System Restore takes you back if one misbehaves.
 
+**Firox is written almost entirely by AI.** Its code, website, help and artwork were written by Claude, an AI model made by Anthropic, using Claude Code. One human maintainer chooses the features, tests the builds and reviews and merges every change. See [How AI was used in this project](https://kurodenkou.github.io/firox/ai.html).
+
 Themes, icons, wallpapers and the Start menu are original work; no Microsoft assets are used. It was briefly called FirefoxOS, until it was determined that the name was already used, and was quickly renamed Firox Linux.
 
 ![Firox Linux desktop with the Start menu open](docs/screenshots/start-menu.png)
@@ -36,6 +38,7 @@ For a fresh install from an ISO, NVIDIA graphics (`ghcr.io/kurodenkou/firox-nvid
 | [Install](https://kurodenkou.github.io/firox/install.html) | Installing, NVIDIA, VMs, and your first login |
 | [Guide](https://kurodenkou.github.io/firox/guide.html) | `ujust` commands, customising, building and signing, nightly builds, known limitations |
 | [Under the hood](https://kurodenkou.github.io/firox/internals.html) | What each part of the desktop is and how it works |
+| [How AI was used](https://kurodenkou.github.io/firox/ai.html) | Who wrote Firox: an AI, directed by one person, and what that means for you |
 
 The help that comes with Firox (Start → Help and Support) is in `system_files/usr/share/firox/help/`.
 

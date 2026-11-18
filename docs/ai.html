@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How AI Was Used · Firox Linux</title>
+<meta name="description" content="Almost all of Firox Linux, its code, documentation and artwork, was written by Claude, an AI model made by Anthropic, under the direction of the project's maintainer. This page explains who did what.">
+<meta property="og:title" content="How AI Was Used · Firox Linux">
+<meta property="og:description" content="Almost all of Firox Linux was written by Claude, an AI model made by Anthropic, under the direction of the project's maintainer. This page explains who did what.">
+<link rel="icon" href="assets/firox-orb.svg" type="image/svg+xml">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<header class="site-header">
+    <div class="wrap">
+        <a class="brand" href="index.html"><img src="assets/firox-orb.svg" alt=""><span>firox</span> Linux</a>
+        <nav class="nav" aria-label="Site">
+        <a href="index.html">Home</a>
+        <a href="looks.html">Looks</a>
+        <a href="features.html">Features</a>
+        <a href="policy.html">Policy</a>
+        <a href="install.html">Install</a>
+        <a href="guide.html">Guide</a>
+        <a href="ai.html" aria-current="page">AI use</a>
+        <a href="https://github.com/kurodenkou/firox">GitHub</a>
+        </nav>
+    </div>
+</header>
+<section class="hero page-hero">
+    <div class="wrap">
+        <h1>How AI was used in this project</h1>
+        <p class="lead">Almost all of Firox Linux was written by an AI. One person, the project's maintainer, decides what gets built, tries it on real computers and accepts or rejects every change. The AI writes the code.</p>
+    </div>
+</section>
+<main>
+<div class="wrap">
+
+<div class="note"><b>In short:</b> nearly every line of code, the website, the built-in help, the themes, icons and wallpapers, and the screenshots were produced by <b>Claude</b>, an AI model made by <a href="https://www.anthropic.com/">Anthropic</a>, working through <a href="https://claude.com/claude-code">Claude Code</a>. A human chose the features, reported what was wrong and reviewed and merged each change. If that matters to you, and it reasonably might, you should know it before you install Firox.</div>
+
+<ul class="toc">
+    <li><a href="#numbers">By the numbers</a></li>
+    <li><a href="#who">Who did what</a></li>
+    <li><a href="#how">How a change is made</a></li>
+    <li><a href="#third-party">AI-made content from other projects</a></li>
+    <li><a href="#limits">What this means for you</a></li>
+    <li><a href="#check">Checking it yourself</a></li>
+</ul>
+
+<h2 id="numbers">By the numbers</h2>
+<p>As of 16 November 2026, counting the commits on the <code>main</code> branch (not counting merge commits):</p>
+<div class="table-wrap">
+<table>
+    <thead><tr><th>Author</th><th>Commits</th><th>Lines added</th></tr></thead>
+    <tbody>
+        <tr><td>Claude (AI)</td><td>133</td><td>about 55,500</td></tr>
+        <tr><td>The maintainer</td><td>1 (the first commit, a one-line README)</td><td>1</td></tr>
+        <tr><td>Dependabot (automatic dependency updates)</td><td>3</td><td>a few</td></tr>
+    </tbody>
+</table>
+</div>
+<p>The maintainer merged all 78 pull requests. In other words, the human's work shows up as decisions, bug reports and merges, not as written code.</p>
+
+<h2 id="who">Who did what</h2>
+<div class="grid two">
+    <div class="card">
+        <h3>The maintainer (a person)</h3>
+        <ul>
+            <li>Started the project and decides what Firox should be.</li>
+            <li>Asks for each feature, in plain words: "a realistic fish tank screensaver", "Active Directory support in firox-policy".</li>
+            <li>Installs the builds on their own computers and reports what doesn't work. For example, the Steam mouse problem was found and confirmed fixed on real hardware.</li>
+            <li>Overrules the AI when it's wrong. For example, they had a change to the Proton Wayland setting reverted.</li>
+            <li>Scans the code with <a href="https://snyk.io/">Snyk</a> and passes its findings on. Claude then fixed them, such as certificate checking in the Android app, a file path check, and replacing SHA-1.</li>
+            <li>Reviews and merges, or declines, every pull request.</li>
+        </ul>
+    </div>
+    <div class="card">
+        <h3>Claude (an AI model)</h3>
+        <ul>
+            <li>Writes the code: the desktop programs (Python and GTK), the shell scripts, the image build, the Android app for Firox Stream.</li>
+            <li>Draws the artwork as code: the themes, the SVG icons, the user pictures and the wallpapers. No image-generating AI was used for these.</li>
+            <li>Writes this website, the README and the help that comes with Firox, including this page.</li>
+            <li>Tests its own changes in throwaway Linux containers and takes the screenshots there.</li>
+            <li>Writes the commit messages and pull requests.</li>
+        </ul>
+    </div>
+</div>
+
+<h2 id="how">How a change is made</h2>
+<ol>
+    <li>The maintainer describes what they want, or what's broken, in a Claude Code session.</li>
+    <li>Claude reads the existing code, writes the change and tests it in a container. It uses stand-ins for anything a container doesn't have, such as hardware, a game controller, an Active Directory server or an NFS server.</li>
+    <li>Claude commits the change under the author name <b>Claude</b>, with a link to the session it came from, and opens or updates a pull request.</li>
+    <li>The maintainer reads it, tries it, asks for fixes, and merges it or not.</li>
+</ol>
+
+<h2 id="third-party">AI-made content from other projects</h2>
+<p>The six saltwater fish in the <b>Fish Tank</b> screensaver (clownfish, blue tang, yellow tang, blue damselfish, royal gramma and pufferfish) come from <a href="https://github.com/timsaucer/reef_glass_roku_screensaver">Reef Glass</a> by Tim Saucer, under CC0. That project made them with AI too: each fish's picture was generated with Z-Image-Turbo and turned into a 3D model with TripoSR. The freshwater fish in the same screensaver are drawn by Firox's own code.</p>
+<p>Firox also includes, as is, a great deal of software written by people: Fedora, Universal Blue, Firefox, labwc, Waydroid and the rest. This page is only about the parts made for Firox.</p>
+
+<h2 id="limits">What this means for you</h2>
+<ul>
+    <li><b>AI makes mistakes, including security mistakes.</b> The maintainer scans the code with <a href="https://snyk.io/">Snyk</a>, a static analysis tool, and the issues it has found so far have been fixed. A scanner catches many common problems but not all of them, and Firox hasn't had a security audit by a person. Assume there are more mistakes.</li>
+    <li><b>Much of it has only been tested in containers.</b> Features that need particular hardware or servers may never have run on them before release. Examples are joining an Active Directory domain, NFS home folders, some game controllers and some graphics cards. The pull requests say what was and wasn't tested.</li>
+    <li><b>Be careful in sensitive places.</b> Before using Firox where a security or reliability failure would be costly (a business, a school, anything holding other people's data), read the parts you rely on, or have someone do it.</li>
+    <li><b>Copyright and licensing.</b> The law on who owns AI-written code is still unsettled in some places. If that matters for how you use Firox, take advice.</li>
+    <li><b>Problems are welcome.</b> If something is wrong, <a href="https://github.com/kurodenkou/firox/issues">report it</a>. It will most likely be fixed the same way: the maintainer asks Claude to fix it, then checks the result.</li>
+</ul>
+
+<h2 id="check">Checking it yourself</h2>
+<p>None of this is hidden in the project's history:</p>
+<ul>
+    <li>Commits written by the AI have the author <b>Claude</b>, and end with a <code>Co-Authored-By: Claude</code> line and a <code>Claude-Session:</code> link.</li>
+    <li>Pull requests written by the AI end with "Generated with Claude Code".</li>
+    <li>To count them yourself, in a copy of the repository:</li>
+</ul>
+<div class="code"><pre><code>git log --no-merges --format='%an' | sort | uniq -c</code></pre></div>
+
+</div>
+</main>
+<footer class="site-footer">
+    <div class="wrap">
+        <span>Firox Linux, built on <a href="https://universal-blue.org/">Universal Blue</a> (Fedora Atomic). Themes, icons, wallpapers and the Start menu are original work; no Microsoft assets are used. Firox is written almost entirely by AI: <a href="ai.html">how AI was used</a>.</span>
+        <span><a href="https://github.com/kurodenkou/firox">Source on GitHub</a> · <a href="https://github.com/kurodenkou/firox/issues">Report a problem</a></span>
+    </div>
+</footer>
+<script src="assets/site.js"></script>
+</body>
+</html>
