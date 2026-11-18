@@ -153,3 +153,10 @@ separator.menusep {
 }
 .bigbutton:hover { background-color: rgba(255, 255, 255, 0.85); border-radius: 16px; box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12); }
 .bigbutton label { color: #1c1c1e; }
+
+/* a soft shadow under every icon, so white icons don't wash out against
+   the white glass */
+#menu image, #allpage image, #dialog image {
+    -gtk-icon-shadow: 0 1px 3px rgba(0, 0, 0, 0.45), 0 0 1px rgba(0, 0, 0, 0.40);
+}
+#search image { -gtk-icon-shadow: none; }
