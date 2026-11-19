@@ -553,6 +553,7 @@ class WebViewer(Channel):
         self.inbuf += rest
         self.parts = []
         self.connected = False
+        self.audio_pts = None
         self.offered = False
         self.caps_set = set()
         self.pipeline = None
@@ -588,10 +589,14 @@ class WebViewer(Channel):
                           "packetization-mode=(string)1", self.VIDEO_PT,
                  ("rtph264pay", {"config-interval": -1, "aggregate-mode": "zero-latency", "mtu": 1200})),
                 ("audio", "application/x-rtp,media=audio,encoding-name=OPUS,clock-rate=48000,"
-                          "encoding-params=(string)2", self.AUDIO_PT,
+                          "encoding-params=(string)2,stereo=(string)1,sprop-stereo=(string)1", self.AUDIO_PT,
                  ("rtpopuspay", {"mtu": 1200}))):
             rtp_caps = Gst.Caps.from_string(f"{rtp},payload={pt}")
-            src = make_element("appsrc", {"is-live": True, "format": "time", "do-timestamp": True,
+            # The picture is stamped as it arrives. The sound is stamped by
+            # its length instead (send()): stamped on arrival, packets that
+            # come in bursts look like jitter to the browser, which then
+            # fills the gaps with made-up sound (crackling)
+            src = make_element("appsrc", {"is-live": True, "format": "time", "do-timestamp": kind == "video",
                                           "max-bytes": 8 << 20, "block": False}, kind)
             payloader = make_element(pay[0], dict(pay[1], pt=pt))
             capsf = make_element("capsfilter", {})
@@ -606,6 +611,9 @@ class WebViewer(Channel):
             # wait for the first frames (they only flow once it's connected)
             pad = rtc.request_pad_simple("sink_%u")
             queue_.get_static_pad("src").link(pad)
+            # Separate streams for the browser, so it doesn't hold the sound
+            # back to keep it in step with the picture (it was 70 ms behind)
+            pad.set_property("msid", f"firox-{kind}")
             sender = pad.get_property("transceiver")
             sender.set_property("direction", sendonly)
             sender.set_property("codec-preferences", rtp_caps)
@@ -685,7 +693,10 @@ class WebViewer(Channel):
             src = self.src["video" if kind == "V" else "audio"]
             if not self.connected or self.closed or src.get_name() not in self.caps_set:
                 return True
-            src.emit("push-buffer", self.Gst.Buffer.new_wrapped(bytes(payload)))
+            buf = self.Gst.Buffer.new_wrapped(bytes(payload))
+            if kind == "A":
+                self._stamp_audio(buf, payload)
+            src.emit("push-buffer", buf)
             return True
         if kind == "K":
             info = payload if isinstance(payload, dict) else json.loads(payload)
@@ -700,6 +711,20 @@ class WebViewer(Channel):
             except ValueError:
                 payload = {}
         return self._json(kind, payload)
+
+    def _stamp_audio(self, buf, packet):
+        """Each Opus packet starts where the last one ended, so the browser
+        gets evenly spaced sound. If that drifts more than a quarter of a
+        second from the clock (the capture was restarted, or paused), start
+        again from now."""
+        Gst = self.Gst
+        clock = self.pipeline.get_clock() if self.pipeline else None
+        now = clock.get_time() - self.pipeline.get_base_time() if clock else 0
+        if self.audio_pts is None or abs(self.audio_pts - now) > Gst.SECOND // 4:
+            self.audio_pts = now
+        length = opus_duration(packet) or 10 * Gst.MSECOND
+        buf.pts, buf.duration = self.audio_pts, length
+        self.audio_pts += length
 
     def _json(self, kind, obj):
         data = ws_frame(1, json.dumps({"k": kind, "d": obj}).encode())
@@ -762,6 +787,27 @@ class WebViewer(Channel):
         if self.pipeline is not None:
             self.pipeline.set_state(self.Gst.State.NULL)
             self.pipeline = None
+
+
+def opus_duration(packet):
+    """How long an Opus packet plays, in nanoseconds (RFC 6716 3.1), or 0."""
+    if not packet:
+        return 0
+    toc = packet[0]
+    config, code = toc >> 3, toc & 3
+    if config < 12:                                 # SILK: 10, 20, 40, 60 ms
+        frame = (10_000_000, 20_000_000, 40_000_000, 60_000_000)[config % 4]
+    elif config < 16:                               # hybrid: 10, 20 ms
+        frame = (10_000_000, 20_000_000)[config % 2]
+    else:                                           # CELT: 2.5, 5, 10, 20 ms
+        frame = (2_500_000, 5_000_000, 10_000_000, 20_000_000)[config % 4]
+    if code == 0:
+        frames = 1
+    elif code in (1, 2):
+        frames = 2
+    else:
+        frames = packet[1] & 0x3F if len(packet) > 1 else 0
+    return frame * frames
 
 
 def keep_ref(obj):
