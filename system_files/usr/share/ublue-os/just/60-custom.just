@@ -298,3 +298,109 @@ remove-nvidia:
     [[ "${ans,,}" == y* ]] || exit 0
     sudo bootc switch "${target}" || exit 1
     echo "Restart to finish:  systemctl reboot"
+
+# Darling (darlinghq.org) runs macOS programs on Linux. It's experimental:
+# command-line programs work best, and most apps with windows don't run yet.
+# It goes in its own container (Distrobox, Ubuntu 24.04, which Darling's
+# packages are built for), so it can't affect the rest of Firox, and adds a
+# "macOS Terminal" to the Start menu. Your macOS files are in ~/.darling.
+#   ujust darling install   download Darling and set it up (about 900 MB)
+#   ujust darling           open a macOS shell (the same as the Start menu)
+#   ujust darling update    reinstall Darling (after a Firox update moves it on)
+#   ujust darling remove    take it out again (~/.darling is kept)
+#   ujust darling status    whether it's installed
+[group('Firox Linux')]
+darling ACTION="shell":
+    #!/usr/bin/bash
+    set -euo pipefail
+    BOX=darling
+    IMAGE=docker.io/library/ubuntu:24.04
+    # Darling's release: its prebuilt packages and their SHA-256 (from the
+    # release page; the download is refused if it doesn't match)
+    VERSION=v0.1.20260608
+    ZIP=debs_20260608.zip
+    SHA256=27469ef3932da2e91dd7fb34b70e3628a3e54b7af9fb5480051f44af35eca1fd
+    URL="https://github.com/darlinghq/darling/releases/download/${VERSION}/${ZIP}"
+    APPS="${HOME}/.local/share/applications"
+    ENTRY="${APPS}/firox-darling.desktop"
+
+    have_box() { podman container exists "${BOX}" 2>/dev/null; }
+
+    install_debs() {
+        local dir
+        dir="$(mktemp -d "${HOME}/.cache/firox-darling.XXXXXX")"    # (the container sees your home)
+        trap 'rm -rf "${dir}"' RETURN
+        echo "Downloading Darling ${VERSION#v} (about 115 MB)..."
+        curl -fL --progress-bar -o "${dir}/${ZIP}" "${URL}"
+        echo "${SHA256}  ${dir}/${ZIP}" | sha256sum -c --quiet - \
+            || { echo "The download doesn't match Darling's published checksum: not installing it."; exit 1; }
+        python3 -I -c 'import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])' \
+            "${dir}/${ZIP}" "${dir}/debs"
+        echo "Installing Darling in its container..."
+        distrobox enter "${BOX}" -- sudo env DEBIAN_FRONTEND=noninteractive \
+            sh -c 'apt-get update -qq && apt-get install -y -qq "$@"' sh "${dir}"/debs/*/*.deb
+    }
+
+    case "{{ ACTION }}" in
+        install)
+            command -v distrobox >/dev/null || { echo "Distrobox is missing, and Darling is set up with it."; exit 1; }
+            if have_box; then
+                echo "Darling is already installed. To reinstall it: ujust darling update"
+                exit 0
+            fi
+            echo "Darling runs macOS programs. It's experimental: command-line programs work best,"
+            echo "and most apps with windows don't run yet. It needs about 900 MB."
+            read -rp "Install it? [y/N] " answer
+            [[ "${answer}" =~ ^[Yy] ]] || exit 0
+            mkdir -p "${HOME}/.cache"
+            distrobox create --yes --name "${BOX}" --image "${IMAGE}"
+            install_debs
+            mkdir -p "${APPS}"
+            {
+                echo "[Desktop Entry]"
+                echo "Type=Application"
+                echo "Name=macOS Terminal (Darling)"
+                echo "Comment=Run macOS command-line programs (experimental)"
+                echo "Exec=firox-terminal -T \"macOS Terminal\" -x distrobox enter ${BOX} -- darling shell"
+                echo "Icon=utilities-terminal"
+                echo "Categories=System;TerminalEmulator;"
+                echo "Keywords=mac;macOS;darwin;darling;"
+            } > "${ENTRY}"
+            echo
+            echo "Darling is ready. Open Start -> macOS Terminal (Darling), or run: ujust darling"
+            echo "The first start sets up your macOS files in ~/.darling, which takes a minute."
+            ;;
+        shell)
+            have_box || { echo "Darling isn't installed. To install it: ujust darling install"; exit 1; }
+            exec distrobox enter "${BOX}" -- darling shell
+            ;;
+        update)
+            have_box || { echo "Darling isn't installed. To install it: ujust darling install"; exit 1; }
+            distrobox enter "${BOX}" -- darling shutdown >/dev/null 2>&1 || true
+            install_debs
+            echo "Darling ${VERSION#v} is installed."
+            ;;
+        remove)
+            if have_box; then
+                distrobox enter "${BOX}" -- darling shutdown >/dev/null 2>&1 || true
+                distrobox rm --force "${BOX}"
+            fi
+            rm -f "${ENTRY}"
+            echo "Darling is removed. Your macOS files are still in ~/.darling."
+            if [ -d "${HOME}/.darling" ]; then
+                echo "To delete them too (some belong to the container's users, hence podman unshare):"
+                echo "    podman unshare rm -rf ~/.darling"
+            fi
+            ;;
+        status)
+            if have_box; then
+                echo "Darling: installed (container \"${BOX}\", release ${VERSION#v}); macOS files: ~/.darling"
+            else
+                echo "Darling: not installed (ujust darling install)"
+            fi
+            ;;
+        *)
+            echo "Usage: ujust darling [install|shell|update|remove|status]"
+            exit 2
+            ;;
+    esac
