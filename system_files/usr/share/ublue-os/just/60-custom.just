@@ -301,9 +301,11 @@ remove-nvidia:
 
 # Darling (darlinghq.org) runs macOS programs on Linux. It's experimental:
 # command-line programs work best, and most apps with windows don't run yet.
-# It goes in its own container (Distrobox, Ubuntu 24.04, which Darling's
+# It goes in a container of its own (podman, Ubuntu 24.04, which Darling's
 # packages are built for), so it can't affect the rest of Firox, and adds a
 # "macOS Terminal" to the Start menu. Your macOS files are in ~/.darling.
+# (Not Distrobox: on image-based systems it mounts /sysroot with options
+# that newer podman refuses.)
 #   ujust darling install   download Darling and set it up (about 900 MB)
 #   ujust darling           open a macOS shell (the same as the Start menu)
 #   ujust darling update    reinstall Darling (after a Firox update moves it on)
@@ -314,6 +316,7 @@ darling ACTION="shell":
     #!/usr/bin/bash
     set -euo pipefail
     BOX=darling
+    LABEL=org.firox.darling
     IMAGE=docker.io/library/ubuntu:24.04
     # Darling's release: its prebuilt packages and their SHA-256 (from the
     # release page; the download is refused if it doesn't match)
@@ -324,7 +327,12 @@ darling ACTION="shell":
     APPS="${HOME}/.local/share/applications"
     ENTRY="${APPS}/firox-darling.desktop"
 
-    have_box() { podman container exists "${BOX}" 2>/dev/null; }
+    exists() { podman container exists "${BOX}" 2>/dev/null; }
+    ours() { [ "$(podman container inspect -f "{{{{ index .Config.Labels \"${LABEL}\" }}" "${BOX}" 2>/dev/null)" = 1 ]; }
+    need_box() { ours || { echo "Darling isn't installed. To install it: ujust darling install"; exit 1; }; }
+    # The container stops when you log off or restart; it starts again as needed
+    up() { podman start "${BOX}" >/dev/null; }
+    as_root() { up; podman exec --user root "${BOX}" "$@"; }
 
     install_debs() {
         local dir
@@ -336,15 +344,19 @@ darling ACTION="shell":
             || { echo "The download doesn't match Darling's published checksum: not installing it."; exit 1; }
         python3 -I -c 'import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])' \
             "${dir}/${ZIP}" "${dir}/debs"
-        echo "Installing Darling in its container..."
-        distrobox enter "${BOX}" -- sudo env DEBIAN_FRONTEND=noninteractive \
-            sh -c 'apt-get update -qq && apt-get install -y -qq "$@"' sh "${dir}"/debs/*/*.deb
+        echo "Installing Darling in its container (a few minutes)..."
+        as_root env DEBIAN_FRONTEND=noninteractive \
+            sh -c 'apt-get update -qq && apt-get install -y -qq "$@" >/dev/null' sh "${dir}"/debs/*/*.deb
     }
 
     case "{{ ACTION }}" in
         install)
-            command -v distrobox >/dev/null || { echo "Distrobox is missing, and Darling is set up with it."; exit 1; }
-            if have_box; then
+            command -v podman >/dev/null || { echo "podman is missing, and Darling is set up with it."; exit 1; }
+            if [ "$(uname -m)" != x86_64 ]; then
+                echo "Darling needs a 64-bit Intel or AMD processor (this one is $(uname -m))."
+                exit 1
+            fi
+            if ours; then
                 echo "Darling is already installed. To reinstall it: ujust darling update"
                 exit 0
             fi
@@ -352,8 +364,23 @@ darling ACTION="shell":
             echo "and most apps with windows don't run yet. It needs about 900 MB."
             read -rp "Install it? [y/N] " answer
             [[ "${answer}" =~ ^[Yy] ]] || exit 0
+            if exists; then
+                # Not one this made (an earlier attempt with Distrobox, say)
+                read -rp "There's already a container called \"${BOX}\". Replace it? [y/N] " answer
+                [[ "${answer}" =~ ^[Yy] ]] || exit 0
+                podman rm --force "${BOX}" >/dev/null
+            fi
             mkdir -p "${HOME}/.cache"
-            distrobox create --yes --name "${BOX}" --image "${IMAGE}"
+            echo "Getting Ubuntu 24.04 for the container..."
+            # You, with your home folder, inside: Darling builds its macOS
+            # files in ~/.darling with its own namespaces and overlay mount,
+            # which needs --privileged (still only your rights: rootless).
+            # SELinux labels are left alone rather than relabelling your home.
+            podman create --name "${BOX}" --hostname "${BOX}" --label "${LABEL}=1" \
+                --userns keep-id --privileged --security-opt label=disable \
+                --volume "${HOME}:${HOME}" --env "HOME=${HOME}" --workdir "${HOME}" \
+                --volume /tmp/.X11-unix:/tmp/.X11-unix --env "DISPLAY=${DISPLAY:-:0}" \
+                "${IMAGE}" sleep infinity >/dev/null
             install_debs
             mkdir -p "${APPS}"
             {
@@ -361,7 +388,7 @@ darling ACTION="shell":
                 echo "Type=Application"
                 echo "Name=macOS Terminal (Darling)"
                 echo "Comment=Run macOS command-line programs (experimental)"
-                echo "Exec=firox-terminal -T \"macOS Terminal\" -x distrobox enter ${BOX} -- darling shell"
+                echo "Exec=firox-terminal -T \"macOS Terminal\" -x ujust darling"
                 echo "Icon=utilities-terminal"
                 echo "Categories=System;TerminalEmulator;"
                 echo "Keywords=mac;macOS;darwin;darling;"
@@ -371,19 +398,20 @@ darling ACTION="shell":
             echo "The first start sets up your macOS files in ~/.darling, which takes a minute."
             ;;
         shell)
-            have_box || { echo "Darling isn't installed. To install it: ujust darling install"; exit 1; }
-            exec distrobox enter "${BOX}" -- darling shell
+            need_box
+            up
+            exec podman exec -it --user "$(id -u)" --workdir "${HOME}" "${BOX}" darling shell
             ;;
         update)
-            have_box || { echo "Darling isn't installed. To install it: ujust darling install"; exit 1; }
-            distrobox enter "${BOX}" -- darling shutdown >/dev/null 2>&1 || true
+            need_box
+            podman exec --user "$(id -u)" "${BOX}" darling shutdown >/dev/null 2>&1 || true
             install_debs
             echo "Darling ${VERSION#v} is installed."
             ;;
         remove)
-            if have_box; then
-                distrobox enter "${BOX}" -- darling shutdown >/dev/null 2>&1 || true
-                distrobox rm --force "${BOX}"
+            if ours; then
+                podman exec --user "$(id -u)" "${BOX}" darling shutdown >/dev/null 2>&1 || true
+                podman rm --force "${BOX}" >/dev/null
             fi
             rm -f "${ENTRY}"
             echo "Darling is removed. Your macOS files are still in ~/.darling."
@@ -393,7 +421,7 @@ darling ACTION="shell":
             fi
             ;;
         status)
-            if have_box; then
+            if ours; then
                 echo "Darling: installed (container \"${BOX}\", release ${VERSION#v}); macOS files: ~/.darling"
             else
                 echo "Darling: not installed (ujust darling install)"
