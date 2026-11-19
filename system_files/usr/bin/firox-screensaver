@@ -81,12 +81,28 @@ start() {
     return 1
 }
 
+SAVERS=("--app-id=$APP_ID" "$HELPER" "^$APP_ID-gui")
+
+# Stopped only once it has gone: the monitors are turned off, or the
+# computer put to sleep, straight after this, and a screen saver still
+# drawing then can be left stuck (waiting for a frame that a switched-off
+# monitor never shows)
 stop() {
+    local p i
     makoctl mode -r screensaver >/dev/null 2>&1
-    pkill -u "$USER" -f -- "--app-id=$APP_ID" 2>/dev/null
-    pkill -u "$USER" -f -- "$HELPER" 2>/dev/null
-    pkill -u "$USER" -f -- "^$APP_ID-gui" 2>/dev/null
+    for p in "${SAVERS[@]}"; do pkill -u "$USER" -f -- "$p" 2>/dev/null; done
+    for i in $(seq 20); do
+        any_saver || return 0
+        sleep 0.1
+    done
+    for p in "${SAVERS[@]}"; do pkill -KILL -u "$USER" -f -- "$p" 2>/dev/null; done
     return 0
+}
+
+any_saver() {
+    local p
+    for p in "${SAVERS[@]}"; do pgrep -u "$USER" -f -- "$p" >/dev/null && return 0; done
+    return 1
 }
 
 case "${1:-show}" in
