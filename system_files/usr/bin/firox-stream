@@ -12,6 +12,9 @@ firox-stream: play another Firox computer's games and desktop from this one.
                                   without a PIN (keys from
                                   ~/.config/firox/stream-keys and
                                   ~/.ssh/authorized_keys), or not
+    firox-stream ssh-keys check   on the computer you connect from: the SSH
+                                  keys it would use, why any can't be, and
+                                  the public keys to give the other one
     firox-stream web on|off       let web browsers stream it too (phones,
                                   tablets, any computer): open the address
                                   it prints, https://THIS-COMPUTER:48301/
@@ -252,51 +255,120 @@ def ssh_verify(key, signature, message):
     return r.returncode == 0
 
 
-def ssh_signatures(message, limit=6):
-    """This computer's SSH keys' signatures over message: [{"key", "sig"}].
-    Keys in ssh-agent first, then key files that need no passphrase (nothing
-    here asks for one: a GUI connection has nobody at a terminal)."""
-    if not shutil.which("ssh-keygen"):
-        return []
+PRIVATE_KEY_HEADS = (b"-----BEGIN OPENSSH PRIVATE KEY-----", b"-----BEGIN RSA PRIVATE KEY-----",
+                     b"-----BEGIN EC PRIVATE KEY-----", b"-----BEGIN PRIVATE KEY-----")
+NOT_KEYS = ("known_hosts", "known_hosts.old", "config", "authorized_keys", "authorized_keys2", "environment")
+
+
+def ssh_client_keys(tmp):
+    """This computer's SSH keys that could sign: keys in ssh-agent first,
+    then every private key file in ~/.ssh, whatever it's called and with or
+    without its .pub. [{"key", "where", "signer" (the -f argument, or None),
+    "problem" (why it can't be used, or "")}]. tmp: a folder for the agent's
+    public keys."""
     env = dict(os.environ, SSH_ASKPASS_REQUIRE="never")
-    candidates = []                         # (public key line, -f argument)
+    found, seen = [], set()
+
+    def add(key, where, signer, problem=""):
+        if key in seen:
+            return
+        seen.add(key)
+        found.append({"key": key, "where": where, "signer": signer, "problem": problem})
+
+    try:
+        agent = subprocess.run(["ssh-add", "-L"], capture_output=True, text=True, timeout=5, env=env).stdout
+    except (OSError, subprocess.SubprocessError):
+        agent = ""
+    for i, line in enumerate(agent.splitlines()):
+        key = ssh_key_of(line)
+        if key:
+            pub = os.path.join(tmp, f"agent{i}.pub")
+            with open(pub, "w") as fh:
+                fh.write(line + "\n")
+            add(key, "ssh-agent", pub)              # a public key: ssh-keygen signs through the agent
+    ssh_dir = os.path.join(HOME, ".ssh")
+    try:
+        names = sorted(os.listdir(ssh_dir))
+    except OSError:
+        names = []
+    for name in names:
+        path = os.path.join(ssh_dir, name)
+        if name.endswith(".pub") or name in NOT_KEYS or not os.path.isfile(path):
+            continue
+        try:
+            st = os.stat(path)
+            if st.st_size > 65536:
+                continue
+            with open(path, "rb") as fh:
+                head = fh.read(64)
+        except OSError:
+            continue
+        if not head.startswith(PRIVATE_KEY_HEADS):
+            continue
+        where = "~/.ssh/" + name
+        # Its public half: the .pub beside it, or worked out from the key
+        # (which needs no passphrase; -P "" means nothing is asked)
+        key = None
+        try:
+            with open(path + ".pub") as fh:
+                key = ssh_key_of(fh.readline())
+        except OSError:
+            pass
+        problem = ""
+        if st.st_mode & 0o077:
+            problem = (f"others can read it, so OpenSSH won't use it (fix: chmod 600 {where})")
+        derived = None
+        if not problem:
+            try:
+                r = subprocess.run(["ssh-keygen", "-y", "-P", "", "-f", path], capture_output=True, text=True,
+                                   timeout=10, env=env, start_new_session=True)
+                derived = ssh_key_of(r.stdout) if r.returncode == 0 else None
+                if r.returncode != 0:
+                    problem = ("it has a passphrase: load it into the SSH agent first (ssh-add " + where + ")"
+                               if "passphrase" in (r.stderr or "").lower() else
+                               "OpenSSH can't read it: " + (r.stderr or "").strip()[:120])
+            except (OSError, subprocess.SubprocessError):
+                problem = "OpenSSH couldn't be run"
+        key = key or derived
+        if key is None:
+            # Nothing to identify it by (no .pub, and it can't be opened)
+            add(f"(unknown) {where}", where, None, problem or "its public key can't be worked out")
+        elif key in seen:
+            continue                                # (in the agent too: that copy signs)
+        else:
+            add(key, where, path if not problem else None, problem)
+    return found
+
+
+def ssh_signatures(message, limit=6):
+    """This computer's SSH keys' signatures over message, and why any key
+    couldn't sign: ([{"key", "sig"}], [problem text]). Nothing here asks
+    for a passphrase: a GUI connection has nobody at a terminal."""
+    if not shutil.which("ssh-keygen"):
+        return [], ["OpenSSH (ssh-keygen) isn't installed on this computer"]
+    env = dict(os.environ, SSH_ASKPASS_REQUIRE="never")
     tmp = tempfile.mkdtemp()
     try:
-        try:
-            agent = subprocess.run(["ssh-add", "-L"], capture_output=True, text=True, timeout=5, env=env).stdout
-        except (OSError, subprocess.SubprocessError):
-            agent = ""
-        for i, line in enumerate(agent.splitlines()):
-            if ssh_key_of(line):
-                pub = os.path.join(tmp, f"agent{i}.pub")
-                with open(pub, "w") as fh:
-                    fh.write(line + "\n")
-                candidates.append((line, pub))      # a public key: ssh-keygen signs through the agent
-        ssh_dir = os.path.join(HOME, ".ssh")
-        for base in ("id_ed25519", "id_ecdsa", "id_rsa", "id_ed25519_sk", "id_ecdsa_sk"):
-            priv, pub = os.path.join(ssh_dir, base), os.path.join(ssh_dir, base + ".pub")
-            try:
-                with open(pub) as fh:
-                    line = fh.readline().strip()
-            except OSError:
+        out, problems = [], []
+        for k in ssh_client_keys(tmp):
+            if k["problem"] or not k["signer"]:
+                problems.append(f"{k['where']}: {k['problem']}")
                 continue
-            if os.path.exists(priv) and ssh_key_of(line):
-                candidates.append((line, priv))
-        out, seen = [], set()
-        for line, keyfile in candidates:
-            key = ssh_key_of(line)
-            if key in seen or len(out) >= limit:
+            if len(out) >= limit:
                 continue
-            seen.add(key)
             try:
-                r = subprocess.run(["ssh-keygen", "-Y", "sign", "-q", "-f", keyfile, "-n", SSH_NAMESPACE],
+                r = subprocess.run(["ssh-keygen", "-Y", "sign", "-q", "-f", k["signer"], "-n", SSH_NAMESPACE],
                                    input=message, capture_output=True, timeout=20, env=env,
                                    start_new_session=True)      # (no terminal to ask a passphrase on)
             except (OSError, subprocess.SubprocessError):
+                problems.append(f"{k['where']}: signing didn't finish")
                 continue
             if r.returncode == 0 and b"BEGIN SSH SIGNATURE" in r.stdout:
-                out.append({"key": key, "sig": r.stdout.decode()})
-        return out
+                out.append({"key": k["key"], "sig": r.stdout.decode()})
+            else:
+                problems.append(f"{k['where']}: " + (r.stderr.decode(errors="replace").strip()[:120]
+                                                     or "it couldn't sign"))
+        return out, problems
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -2977,8 +3049,17 @@ def connect(address, ask_pin, ask_busy=None):
             elif kind == "C":
                 # It takes our SSH keys instead of a PIN: sign its challenge
                 nonce = str(msg.get("nonce", ""))[:64]
-                sigs = ssh_signatures(ssh_message(fingerprint, name, nonce)) if nonce else []
+                sigs, problems = ssh_signatures(ssh_message(fingerprint, name, nonce)) if nonce else ([], [])
                 sock.sendall(frame("S", {"sigs": sigs}))
+                # If the PIN comes next, say why the keys didn't do
+                if sigs:
+                    note = ("It didn't accept your SSH key (" +
+                            ", ".join(ssh_key_label(x["key"]) for x in sigs[:3]) +
+                            "). On it, add the public key to ~/.config/firox/stream-keys.")
+                else:
+                    note = ("No SSH key of yours could be used" +
+                            (": " + "; ".join(problems[:2]) if problems else
+                             ": none found in ~/.ssh or the SSH agent") + ".")
             elif kind == "B":
                 sock.settimeout(None)
                 mode = ask_busy(msg.get("viewers") or []) if ask_busy else "join"
@@ -3792,6 +3873,31 @@ def main(argv):
         set_enabled(cmd == "on")
         print(f"Streaming this computer is {cmd}.")
         return 0
+    if cmd == "ssh-keys" and len(argv) > 2 and argv[2] == "check":
+        # The connecting side: which keys it would offer, and why not
+        tmp = tempfile.mkdtemp()
+        try:
+            keys = ssh_client_keys(tmp) if shutil.which("ssh-keygen") else []
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        if not shutil.which("ssh-keygen"):
+            print("OpenSSH (ssh-keygen) isn't installed, so no SSH key can be used.")
+            return 1
+        if not keys:
+            print("No SSH keys found (in ~/.ssh or the SSH agent).")
+            return 1
+        usable = [k for k in keys if not k["problem"]]
+        for k in keys:
+            label = ssh_key_label(k["key"]) if not k["key"].startswith("(") else ""
+            print(f"{k['where']}: {k['key'].split()[0]} {label}".rstrip() +
+                  (f"\n    can't be used: {k['problem']}" if k["problem"] else "\n    ready"))
+        if usable:
+            print("\nOn the computer you stream, these public keys must be in ~/.config/firox/stream-keys")
+            print("(or ~/.ssh/authorized_keys), with \"Let computers with my SSH keys connect without a")
+            print("PIN\" ticked (firox-stream ssh-keys on); firox-stream ssh-keys list there shows them:\n")
+            for k in usable:
+                print(f"{k['key']} {computer_name()}")
+        return 0 if usable else 1
     if cmd == "ssh-keys" and len(argv) > 2 and argv[2] in ("on", "off", "list"):
         conf = load_conf()
         if argv[2] != "list":
