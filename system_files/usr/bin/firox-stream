@@ -7,6 +7,11 @@ firox-stream: play another Firox computer's games and desktop from this one.
     firox-stream daemon           at login, when streaming is on: let paired
                                   computers stream this one
     firox-stream on|off           let other computers stream this one, or not
+    firox-stream ssh-keys on|off|list
+                                  let computers with your SSH keys connect
+                                  without a PIN (keys from
+                                  ~/.config/firox/stream-keys and
+                                  ~/.ssh/authorized_keys), or not
     firox-stream web on|off       let web browsers stream it too (phones,
                                   tablets, any computer): open the address
                                   it prints, https://THIS-COMPUTER:48301/
@@ -47,6 +52,16 @@ Connecting wakes the other computer's screen (monitors back on, screen saver
 off), and its screen saver, lock, monitor-off and sleep timers wait while
 it's being streamed.
 
+With "ssh-keys on", a computer that holds one of your SSH keys (in its
+ssh-agent, or a key file without a passphrase) connects without a PIN: this
+computer sends a random challenge, the other signs it with the key
+(ssh-keygen -Y sign, over this computer's certificate too, so it can't be
+passed on), and this one checks the signature (ssh-keygen -Y verify). The
+keys accepted are those in ~/.config/firox/stream-keys, and those in
+~/.ssh/authorized_keys that carry no options (a key limited to one command
+or one address there isn't taken as permission to stream). Removing a key,
+or turning the option off, stops the computers that connected with it.
+
 A web browser streams it from the page this computer serves on port 48301
 (HTTPS, with this computer's own certificate: the browser warns about it
 the first time). It pairs with the same PIN, gets the picture and sound over
@@ -65,14 +80,18 @@ import hashlib
 import hmac
 import json
 import os
+import pwd
 import queue
 import random
+import re
 import secrets
 import select
+import shutil
 import socket
 import ssl
 import struct
 import subprocess
+import tempfile
 import sys
 import threading
 import time
@@ -127,7 +146,7 @@ def _save(path, data):
 def load_conf():
     return _load(CONF, {"enabled": False, "port": PORT, "bitrate": 20000, "fps": 60,
                         "audio": True, "encoder": "auto", "clients": {},
-                        "web": False, "web_port": WEB_PORT})
+                        "web": False, "web_port": WEB_PORT, "ssh_keys": False})
 
 
 def save_conf(conf):
@@ -164,6 +183,122 @@ def proof(pin, fingerprint, name):
 
 def token_key(token):
     return hashlib.sha256(token.encode()).hexdigest()
+
+
+# ---------------------------------------------------------------- SSH keys --
+
+SSH_NAMESPACE = "firox-stream"
+SSH_TYPES = ("ssh-ed25519", "ssh-rsa", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521",
+             "sk-ssh-ed25519@openssh.com", "sk-ecdsa-sha2-nistp256@openssh.com")
+HOME = pwd.getpwuid(os.getuid()).pw_dir
+SSH_KEY_FILES = (os.path.join(HOME, ".config", "firox", "stream-keys"),     # Firox Stream's own
+                 os.path.join(HOME, ".ssh", "authorized_keys"))              # (lines without options)
+
+
+def ssh_key_of(line):
+    """"TYPE BASE64" from a public key line, or None. With options in front
+    (command=, from=, restrict...) it's None: that key was given limited use."""
+    parts = line.strip().split()
+    if len(parts) >= 2 and parts[0] in SSH_TYPES and re.fullmatch(r"[A-Za-z0-9+/]+={0,3}", parts[1]):
+        return f"{parts[0]} {parts[1]}"
+    return None
+
+
+def accepted_ssh_keys():
+    """The SSH public keys that may connect without a PIN."""
+    keys = []
+    for path in SSH_KEY_FILES:
+        try:
+            with open(path) as fh:
+                for line in fh:
+                    key = ssh_key_of(line)
+                    if key and key not in keys:
+                        keys.append(key)
+        except OSError:
+            pass
+    return keys
+
+
+def ssh_key_label(key):
+    """A key as ssh-keygen -l shows it (SHA256:...)."""
+    try:
+        blob = base64.b64decode(key.split()[1])
+        return "SHA256:" + base64.b64encode(hashlib.sha256(blob).digest()).decode().rstrip("=")
+    except (ValueError, IndexError):
+        return key[:24]
+
+
+def ssh_message(fingerprint, name, nonce):
+    """What a computer signs: this host's certificate, its own name and the
+    challenge, so a signature only works once, here, for that name."""
+    return f"firox-stream ssh-auth|{fingerprint}|{name}|{nonce}".encode()
+
+
+def ssh_verify(key, signature, message):
+    """True if signature (ssh-keygen -Y sign, armored) is key's over message."""
+    if not shutil.which("ssh-keygen") or not isinstance(signature, str) or len(signature) > 16384:
+        return False
+    with tempfile.TemporaryDirectory() as tmp:
+        signers, sig = os.path.join(tmp, "allowed"), os.path.join(tmp, "sig")
+        with open(signers, "w") as fh:
+            fh.write(f"firox {key}\n")
+        with open(sig, "w") as fh:
+            fh.write(signature)
+        try:
+            r = subprocess.run(["ssh-keygen", "-Y", "verify", "-f", signers, "-I", "firox", "-n", SSH_NAMESPACE,
+                                "-s", sig], input=message, capture_output=True, timeout=15)
+        except (OSError, subprocess.SubprocessError):
+            return False
+    return r.returncode == 0
+
+
+def ssh_signatures(message, limit=6):
+    """This computer's SSH keys' signatures over message: [{"key", "sig"}].
+    Keys in ssh-agent first, then key files that need no passphrase (nothing
+    here asks for one: a GUI connection has nobody at a terminal)."""
+    if not shutil.which("ssh-keygen"):
+        return []
+    env = dict(os.environ, SSH_ASKPASS_REQUIRE="never")
+    candidates = []                         # (public key line, -f argument)
+    tmp = tempfile.mkdtemp()
+    try:
+        try:
+            agent = subprocess.run(["ssh-add", "-L"], capture_output=True, text=True, timeout=5, env=env).stdout
+        except (OSError, subprocess.SubprocessError):
+            agent = ""
+        for i, line in enumerate(agent.splitlines()):
+            if ssh_key_of(line):
+                pub = os.path.join(tmp, f"agent{i}.pub")
+                with open(pub, "w") as fh:
+                    fh.write(line + "\n")
+                candidates.append((line, pub))      # a public key: ssh-keygen signs through the agent
+        ssh_dir = os.path.join(HOME, ".ssh")
+        for base in ("id_ed25519", "id_ecdsa", "id_rsa", "id_ed25519_sk", "id_ecdsa_sk"):
+            priv, pub = os.path.join(ssh_dir, base), os.path.join(ssh_dir, base + ".pub")
+            try:
+                with open(pub) as fh:
+                    line = fh.readline().strip()
+            except OSError:
+                continue
+            if os.path.exists(priv) and ssh_key_of(line):
+                candidates.append((line, priv))
+        out, seen = [], set()
+        for line, keyfile in candidates:
+            key = ssh_key_of(line)
+            if key in seen or len(out) >= limit:
+                continue
+            seen.add(key)
+            try:
+                r = subprocess.run(["ssh-keygen", "-Y", "sign", "-q", "-f", keyfile, "-n", SSH_NAMESPACE],
+                                   input=message, capture_output=True, timeout=20, env=env,
+                                   start_new_session=True)      # (no terminal to ask a passphrase on)
+            except (OSError, subprocess.SubprocessError):
+                continue
+            if r.returncode == 0 and b"BEGIN SSH SIGNATURE" in r.stdout:
+                out.append({"key": key, "sig": r.stdout.decode()})
+        return out
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def split_address(text):
@@ -1986,8 +2121,16 @@ class Host:
             return None
         token = str(hello.get("token") or "")
         known = self.conf.get("clients", {}).get(token_key(token)) if token else None
+        if known and known.get("ssh_key") and not (self.conf.get("ssh_keys")
+                                                    and known["ssh_key"] in accepted_ssh_keys()):
+            known = None                    # paired by a key that's no longer accepted
         if known:
             return name                     # its name now (it may have been renamed)
+        # An SSH key of yours instead of a PIN
+        if hello.get("ssh") and self.conf.get("ssh_keys"):
+            key = self.ssh_challenge(sock, name)
+            if key:
+                return self.issue_token(sock, name, address, ssh_key=key)
         # Pairing: a PIN on this screen, which the other computer's user types
         pin = f"{random.SystemRandom().randrange(10000):04d}"
         cancelled = threading.Event()
@@ -2013,13 +2156,40 @@ class Host:
         if sock.fileno() < 0:
             return None
         sock.settimeout(15)
+        return self.issue_token(sock, name, address)
+
+    def issue_token(self, sock, name, address, ssh_key=None):
         token = secrets.token_hex(32)
         self.conf = load_conf()
-        self.conf.setdefault("clients", {})[token_key(token)] = {"name": name, "paired": time.time()}
+        record = {"name": name, "paired": time.time()}
+        if ssh_key:
+            record["ssh_key"] = ssh_key     # (it stops working if the key is taken away)
+        self.conf.setdefault("clients", {})[token_key(token)] = record
         save_conf(self.conf)
-        log(f"paired with {name} ({address})")
+        log(f"paired with {name} ({address})" + (f" by its SSH key {ssh_key_label(ssh_key)}" if ssh_key else ""))
         sock.sendall(frame("T", {"token": token}))
         return name
+
+    def ssh_challenge(self, sock, name):
+        """Ask the other computer to sign a challenge with its SSH keys: the
+        accepted key that did, or None (then it's the PIN)."""
+        accepted = accepted_ssh_keys()
+        if not accepted:
+            return None
+        nonce = secrets.token_hex(16)
+        sock.sendall(frame("C", {"nonce": nonce, "namespace": SSH_NAMESPACE}))
+        sock.settimeout(60)
+        kind, msg = recv_json(sock)
+        sock.settimeout(15)
+        if kind != "S" or not isinstance(msg, dict) or not isinstance(msg.get("sigs"), list):
+            return None
+        message = ssh_message(self.fingerprint, name, nonce)
+        for item in msg["sigs"][:8]:
+            key = ssh_key_of(str(item.get("key", ""))) if isinstance(item, dict) else None
+            if key in accepted and ssh_verify(key, item.get("sig"), message):
+                return key
+        log(f"{name}: no accepted SSH key signed the challenge; asking for the PIN")
+        return None
 
     def open_capture(self, conf, channel, output):
         """Share the screen and start encoding it: (capture, portal session,
@@ -2783,7 +2953,8 @@ def connect(address, ask_pin, ask_busy=None):
                 raise IdentityChanged(h.get("name") or address, fp, fingerprint)
         known = hosts.get(fingerprint, {})
         name = computer_name()
-        sock.sendall(frame("H", {"v": 1, "name": name, "token": known.get("token", "")}))
+        sock.sendall(frame("H", {"v": 1, "name": name, "token": known.get("token", ""),
+                                 "ssh": bool(shutil.which("ssh-keygen"))}))
         # Starting the capture can take a while (GStreamer's first plugin
         # scan after an update, the portal's retries)
         sock.settimeout(90)
@@ -2803,6 +2974,11 @@ def connect(address, ask_pin, ask_busy=None):
                     raise ConnectionError("")
                 known["name"] = host_name
                 sock.sendall(frame("P", {"proof": proof(pin.strip(), fingerprint, name)}))
+            elif kind == "C":
+                # It takes our SSH keys instead of a PIN: sign its challenge
+                nonce = str(msg.get("nonce", ""))[:64]
+                sigs = ssh_signatures(ssh_message(fingerprint, name, nonce)) if nonce else []
+                sock.sendall(frame("S", {"sigs": sigs}))
             elif kind == "B":
                 sock.settimeout(None)
                 mode = ask_busy(msg.get("viewers") or []) if ask_busy else "join"
@@ -3385,6 +3561,14 @@ def client_ui(address=None):
             self.web.set_margin_start(24)
             self.web.connect("toggled", self.on_web)
             box.add(self.web)
+            self.sshkeys = Gtk.CheckButton(label="Let computers with my SSH keys connect without a PIN")
+            self.sshkeys.set_active(bool(load_conf().get("ssh_keys")))
+            self.sshkeys.set_margin_start(24)
+            self.sshkeys.set_tooltip_text("Keys in ~/.config/firox/stream-keys, and in ~/.ssh/authorized_keys "
+                                          "(those without options). The other computer proves it holds one; "
+                                          "removing the key stops it.")
+            self.sshkeys.connect("toggled", self.on_sshkeys)
+            box.add(self.sshkeys)
             self.allow_note = Gtk.Label(xalign=0, wrap=True, max_width_chars=50)
             self.allow_note.get_style_context().add_class("dim-label")
             box.add(self.allow_note)
@@ -3424,6 +3608,7 @@ def client_ui(address=None):
             conf = load_conf()
             n = len(conf.get("clients", {}))
             self.web.set_sensitive(bool(conf.get("enabled")) and not policy_forbids())
+            self.sshkeys.set_sensitive(bool(conf.get("enabled")) and not policy_forbids())
             if policy_forbids():
                 self.allow_note.set_text("Your organization's policy doesn't allow other computers to stream "
                                          "this one.")
@@ -3433,9 +3618,15 @@ def client_ui(address=None):
                     web = ("\n\nIn a web browser, open " + " or ".join(web_addresses(conf)) +
                            ". The browser warns about this computer's certificate the first time: "
                            "it's this computer's own, so allow it.")
+                keys = ""
+                if conf.get("ssh_keys"):
+                    count = len(accepted_ssh_keys())
+                    keys = (f"\n\nSSH keys accepted instead of a PIN: {count}." if count else
+                            "\n\nNo SSH keys to accept yet: add public keys to ~/.config/firox/stream-keys "
+                            "(or ~/.ssh/authorized_keys).")
                 self.allow_note.set_text(
                     "Computers you've paired can stream this one whenever you're logged in. "
-                    f"Paired: {n}. A new one needs the PIN this computer shows." + web)
+                    f"Paired: {n}. A new one needs the PIN this computer shows." + keys + web)
             else:
                 self.allow_note.set_text("Nobody can stream this computer.")
 
@@ -3454,6 +3645,12 @@ def client_ui(address=None):
                 self.status.set_text("The firewall still blocks the ports web browsers need (TCP "
                                      f"{WEB_PORT}, UDP {ICE_PORTS[0]}–{ICE_PORTS[1]}). Untick and tick the "
                                      "box to try again.")
+
+        def on_sshkeys(self, button):
+            conf = load_conf()
+            conf["ssh_keys"] = button.get_active()
+            save_conf(conf)
+            self.update_note()
 
         def on_unpair(self, _b):
             conf = load_conf()
@@ -3594,6 +3791,19 @@ def main(argv):
             return 1
         set_enabled(cmd == "on")
         print(f"Streaming this computer is {cmd}.")
+        return 0
+    if cmd == "ssh-keys" and len(argv) > 2 and argv[2] in ("on", "off", "list"):
+        conf = load_conf()
+        if argv[2] != "list":
+            conf["ssh_keys"] = argv[2] == "on"
+            save_conf(conf)                 # (the daemon reads it at every connection)
+        keys = accepted_ssh_keys()
+        print(f"SSH keys instead of a PIN: {'on' if conf.get('ssh_keys') else 'off'}")
+        if not keys:
+            print("No keys yet: put public keys (one per line) in ~/.config/firox/stream-keys,")
+            print("or in ~/.ssh/authorized_keys.")
+        for key in keys:
+            print(f"  {key.split()[0]} {ssh_key_label(key)}")
         return 0
     if cmd == "web" and len(argv) > 2 and argv[2] in ("on", "off"):
         if argv[2] == "on" and policy_forbids():
