@@ -90,10 +90,23 @@ def main():
     ap.add_argument("out_dir", type=Path)
     ap.add_argument("--faces", type=int, default=6000)
     args = ap.parse_args()
-    args.out_dir.mkdir(parents=True, exist_ok=True)
+    # The folders are yours to choose (this runs by hand, as you); the files
+    # read and written in them are only the fish named in FISH
+    mesh_dir = args.mesh_dir.resolve()
+    if not mesh_dir.is_dir():
+        ap.error(f"{args.mesh_dir} isn't a folder")
+    out_dir = args.out_dir.resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    def child(folder, file_name):
+        path = (folder / file_name).resolve()
+        if path.parent != folder:
+            raise SystemExit(f"{file_name} would be outside {folder}")
+        return path
+
     for name in FISH:
-        n, t = convert(args.mesh_dir / f"{name}.ply", args.mesh_dir / f"{name}_full.png",
-                       args.out_dir / f"{name}.mesh", args.out_dir / f"{name}.png", args.faces)
+        n, t = convert(child(mesh_dir, f"{name}.ply"), child(mesh_dir, f"{name}_full.png"),
+                       child(out_dir, f"{name}.mesh"), child(out_dir, f"{name}.png"), args.faces)
         print(f"{name}: {n} vertices, {t} triangles")
     return 0
 

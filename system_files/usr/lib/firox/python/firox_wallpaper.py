@@ -26,8 +26,9 @@ gi.require_version("Gdk", "3.0")
 gi.require_version("GdkPixbuf", "2.0")
 from gi.repository import Gdk, GdkPixbuf, GLib  # noqa: E402
 
-CFG = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
-USER_CONF = os.path.join(CFG, "pcmanfm-qt", "firox", "settings.conf")
+import firox_paths  # noqa: E402
+
+USER_CONF = os.path.join(firox_paths.CONFIG, "pcmanfm-qt", "firox", "settings.conf")
 SYS_CONF = "/etc/xdg/pcmanfm-qt/firox/settings.conf"
 MANAGED_CONF = "/var/lib/firox/policy/desktop.conf"     # set by a policy
 MODES = [("zoom", "Fill"), ("fit", "Fit"), ("stretch", "Stretch"), ("center", "Center"), ("tile", "Tile")]

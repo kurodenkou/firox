@@ -25,6 +25,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import threading
 import time
@@ -35,6 +36,8 @@ import gi
 gi.require_version("Gio", "2.0")
 from gi.repository import Gio, GLib  # noqa: E402
 
+import firox_paths  # noqa: E402
+
 try:
     gi.require_version("Secret", "1")
     from gi.repository import Secret  # noqa: E402
@@ -43,18 +46,41 @@ except (ValueError, ImportError):
 
 
 
-def xdg_dir(var, default):
-    """An XDG base folder from the environment. The spec says relative
-    paths are to be ignored, so only an absolute one counts."""
-    value = os.environ.get(var, "")
-    return os.path.normpath(value) if os.path.isabs(value) else default
-
-
-CONFIG = os.path.join(xdg_dir("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "firox")
+# Where things go, from the account itself (the user database and the
+# user ID), not from environment variables: whatever started this program
+# can't point connections, logs or mounts somewhere else. These are the
+# standard places (~/.config, ~/.local/state, /run/user/UID).
+UID = firox_paths.UID
+CONFIG = os.path.join(firox_paths.CONFIG, "firox")
 STORE = os.path.join(CONFIG, "connections.json")
-LOGDIR = os.path.join(xdg_dir("XDG_STATE_HOME", os.path.expanduser("~/.local/state")), "firox", "mounts")
-RUNTIME = xdg_dir("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+LOGDIR = os.path.join(firox_paths.STATE, "firox", "mounts")
+RUNTIME = firox_paths.RUNTIME
 MOUNTS = os.path.join(RUNTIME, "firox-mounts")
+
+
+def _private_ok(say):
+    try:
+        private_mounts()
+        return True
+    except OSError as err:
+        say(f"    skipped: {err}")
+        return False
+
+
+def private_mounts():
+    """MOUNTS, made if need be, once it's sure to be private: the runtime
+    folder (made by systemd-logind at login) and MOUNTS itself must be this
+    user's own and closed to everyone else. OSError if not."""
+    def check(path, mode_ok):
+        st = os.lstat(path)                 # (a symlink isn't followed: it fails)
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != UID or not mode_ok(st.st_mode):
+            raise OSError(f"{path} isn't a private folder of yours")
+
+    check(RUNTIME, lambda mode: not mode & 0o077)
+    os.makedirs(MOUNTS, mode=0o700, exist_ok=True)
+    check(MOUNTS, lambda mode: True)        # ours, a real folder: then close it
+    os.chmod(MOUNTS, 0o700)
+    return MOUNTS
 
 
 def inside(folder, name):
@@ -287,10 +313,13 @@ def mount_rclone(conn, secret, done):
     if shutil.which("rclone") is None:
         done("rclone isn't installed (it comes with Firox Explorer's image update).")
         return
+    try:
+        private_mounts()
+    except OSError as err:
+        done(f"There's nowhere private to mount it: {err}.")
+        return
     point = mountpoint(conn)
-    os.makedirs(MOUNTS, mode=0o700, exist_ok=True)
-    os.chmod(MOUNTS, 0o700)
-    os.makedirs(point, exist_ok=True)
+    os.makedirs(point, mode=0o700, exist_ok=True)
     unit = rclone_unit(conn)
     log = log_path(conn)
     try:
@@ -601,10 +630,11 @@ def diagnose(conn, out=print, ask_secret=None):
             say("    skipped: rclone isn't installed (update Firox Linux to get it)")
         elif is_mounted(conn):
             say(f"    already mounted at {mountpoint(conn)}: skipped")
+        elif not _private_ok(say):
+            pass
         else:
-            os.makedirs(MOUNTS, mode=0o700, exist_ok=True)
-            point = os.path.join(MOUNTS, ".test-" + conn["id"])
-            os.makedirs(point, exist_ok=True)
+            point = inside(MOUNTS, ".test-" + (re.sub(r"[^a-zA-Z0-9_-]", "-", conn["id"]) or "connection"))
+            os.makedirs(point, mode=0o700, exist_ok=True)
             mlog = log_path(conn, "-test-mount")
             try:
                 os.remove(mlog)

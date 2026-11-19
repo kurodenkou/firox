@@ -14,8 +14,9 @@ import json
 import os
 import subprocess
 
-CFG = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
-CONF = os.path.join(CFG, "firox", "main-display")
+import firox_paths  # noqa: E402
+
+CONF = os.path.join(firox_paths.CONFIG, "firox", "main-display")
 
 
 def outputs():

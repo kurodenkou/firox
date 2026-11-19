@@ -25,7 +25,7 @@ import gi  # noqa: E402
 
 gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
-from gi.repository import Gdk, GLib, GLibUnix, Gtk  # noqa: E402
+from gi.repository import Gdk, GLib, Gtk  # noqa: E402
 import firox_saver_input  # noqa: E402
 
 try:
@@ -185,9 +185,13 @@ def main(argv):
     if args and args[0] in ("-h", "--help"):
         print(__doc__.strip())
         return 0
-    Saver(windowed="--window" in args)
+    # Stopping it ends it there and then, as the system does by default.
+    # Handled in the main loop it could wait for ever: when the monitors are
+    # turned off just as it's asked to stop, drawing waits for a frame they
+    # never show, and the request is never seen
     for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
-        GLibUnix.signal_add(GLib.PRIORITY_HIGH, sig, Saver.quit)
+        signal.signal(sig, signal.SIG_DFL)
+    Saver(windowed="--window" in args)
     Gtk.main()
     return 0
 
