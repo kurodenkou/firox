@@ -26,6 +26,7 @@ import ctypes
 import math
 import os
 import random
+import re
 import struct
 from array import array
 
@@ -42,7 +43,7 @@ FOVY = 40.0
 BACK = -14.0           # back of the tank
 FLOOR_K = 0.11         # gravel rises towards the back: y = -FLOOR_K * z
 Z_NEAR, Z_FAR = 0.5, 80.0
-DATA_DIR = os.environ.get("FIROX_FISHTANK_DATA", "/usr/share/firox/fishtank")
+DATA_DIR = "/usr/share/firox/fishtank"      # (set firox_fishtank.DATA_DIR to try other files)
 TAU = math.tau
 
 
@@ -762,6 +763,8 @@ SPECIES = [
 
 
 def _mesh_files(sp):
+    if not re.fullmatch(r"[a-z0-9_]+", sp.mesh):
+        raise ValueError(f"{sp.mesh!r} isn't a fish name")
     return (os.path.join(DATA_DIR, sp.mesh + ".mesh"), os.path.join(DATA_DIR, sp.mesh + ".png"))
 
 

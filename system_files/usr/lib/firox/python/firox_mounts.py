@@ -23,7 +23,6 @@ connection step by step and writes ID-test.log, with any secret blanked.
 
 import json
 import os
-import pwd
 import re
 import shutil
 import stat
@@ -37,6 +36,8 @@ import gi
 gi.require_version("Gio", "2.0")
 from gi.repository import Gio, GLib  # noqa: E402
 
+import firox_paths  # noqa: E402
+
 try:
     gi.require_version("Secret", "1")
     from gi.repository import Secret  # noqa: E402
@@ -49,12 +50,11 @@ except (ValueError, ImportError):
 # user ID), not from environment variables: whatever started this program
 # can't point connections, logs or mounts somewhere else. These are the
 # standard places (~/.config, ~/.local/state, /run/user/UID).
-UID = os.getuid()
-HOME = pwd.getpwuid(UID).pw_dir
-CONFIG = os.path.join(HOME, ".config", "firox")
+UID = firox_paths.UID
+CONFIG = os.path.join(firox_paths.CONFIG, "firox")
 STORE = os.path.join(CONFIG, "connections.json")
-LOGDIR = os.path.join(HOME, ".local", "state", "firox", "mounts")
-RUNTIME = f"/run/user/{UID}"
+LOGDIR = os.path.join(firox_paths.STATE, "firox", "mounts")
+RUNTIME = firox_paths.RUNTIME
 MOUNTS = os.path.join(RUNTIME, "firox-mounts")
 
 

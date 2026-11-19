@@ -26,10 +26,11 @@ gi.require_version("Gtk", "3.0")
 gi.require_version("GdkPixbuf", "2.0")
 from gi.repository import GdkPixbuf, Gio, GLib, Gtk  # noqa: E402
 
+import firox_paths  # noqa: E402
+
 WINDOWS_EXT = (".exe", ".msi", ".bat", ".cmd", ".com")
-DATA = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
-ICONS = os.path.join(DATA, "icons", "firox-launchers")
-APPS = os.path.join(DATA, "applications")
+ICONS = os.path.join(firox_paths.DATA, "icons", "firox-launchers")
+APPS = os.path.join(firox_paths.DATA, "applications")
 
 
 def kind_of(path):

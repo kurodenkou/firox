@@ -22,6 +22,8 @@ try:
 except (ValueError, ImportError):
     GtkLayerShell = None
 
+import firox_paths  # noqa: E402
+
 THEMES = "/usr/share/firox/themes"
 
 
@@ -34,9 +36,8 @@ def read(path):
 
 
 def theme_css(name="popup.css"):
-    cfg = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
     theme = "classic"
-    for path in (os.path.join(cfg, "firox", "theme"), "/etc/firox/theme"):
+    for path in (os.path.join(firox_paths.CONFIG, "firox", "theme"), "/etc/firox/theme"):
         if read(path):
             theme = read(path)
             break
