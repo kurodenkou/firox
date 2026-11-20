@@ -1,0 +1,249 @@
+#!/usr/bin/python3
+"""
+firox-sysprep: System Preparation. Get this computer ready to be copied to
+others, or handed to someone new, like Windows' Sysprep.
+
+    firox-sysprep                       the window
+    firox-sysprep [--oobe] [--generalize] [--remove-users]
+                  [--shutdown | --reboot | --quit] [--yes]
+    firox-sysprep --status | --cancel
+
+  --oobe          enter first-time setup at the next start: whoever starts
+                  it makes their account and names the computer (OOBE)
+  --generalize    forget what makes this computer itself: its machine ID,
+                  SSH host keys, name, logs, saved networks, Bluetooth
+                  pairings and domain membership, so each copy is new
+  --remove-users  delete every account and its files (needs --oobe, which
+                  it turns on: otherwise nobody could log in)
+  --shutdown      then shut down (to take an image of the disk), the default
+  --reboot        then restart
+  --quit          do it at the next shutdown, whenever that is
+  --yes           don't ask again
+
+It all happens as the computer shuts down, once everyone has been logged
+out (firox-reset.service). Asks for an administrator's password. Log:
+/var/lib/firox/reset/last.log.
+"""
+
+import sys
+
+sys.path.insert(0, "/usr/lib/firox/python")
+import firox_reset as R  # noqa: E402
+
+AFTER_FLAGS = {"--shutdown": "poweroff", "--reboot": "reboot", "--quit": "none"}
+
+
+def cli(args):
+    if args == ["--status"]:
+        plan = R.pending()
+        print("Waiting for shutdown:\n  " + "\n  ".join(R.describe(plan)) if plan else
+              "Nothing is waiting (or run as root to see).")
+        return 0
+    if args == ["--cancel"]:
+        ok, msg = R.cancel()
+        print(msg)
+        return 0 if ok else 1
+    plan = {"mode": "sysprep", "after": "poweroff"}
+    yes = False
+    for a in args:
+        if a == "--oobe":
+            plan["oobe"] = True
+        elif a == "--generalize":
+            plan["generalize"] = True
+        elif a == "--remove-users":
+            plan["remove_users"] = True
+        elif a in AFTER_FLAGS:
+            plan["after"] = AFTER_FLAGS[a]
+        elif a == "--yes":
+            yes = True
+        else:
+            print(__doc__.strip(), file=sys.stderr)
+            return 2
+    try:
+        plan = R.check_plan(plan)
+    except R.ResetError as e:
+        print(f"firox-sysprep: {e}", file=sys.stderr)
+        return 2
+    print("System Preparation will:\n  " + "\n  ".join(R.describe(plan)))
+    if not yes:
+        try:
+            if input("Go ahead? [y/N] ").strip().lower() not in ("y", "yes"):
+                return 1
+        except EOFError:
+            return 1
+    ok, msg = R.schedule(plan)
+    print(msg if ok else f"Not done: {msg}")
+    return 0 if ok else 1
+
+
+def gui():
+    import gi
+    gi.require_version("Gtk", "3.0")
+    from gi.repository import GLib, Gtk
+
+    class Sysprep(Gtk.Window):
+        def __init__(self):
+            super().__init__(title="System Preparation Tool")
+            self.set_icon_name("applications-system")
+            self.set_resizable(False)
+            self.connect("destroy", Gtk.main_quit)
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+            box.set_border_width(16)
+            self.add(box)
+            head = Gtk.Box(spacing=12)
+            icon = Gtk.Image.new_from_icon_name("applications-system", Gtk.IconSize.DIALOG)
+            icon.set_valign(Gtk.Align.START)
+            head.pack_start(icon, False, False, 0)
+            intro = Gtk.Label(xalign=0, wrap=True, max_width_chars=58)
+            intro.set_markup("<b>System Preparation</b> gets this computer ready to be copied to other "
+                             "computers (an image of its disk), or to be handed to someone new.")
+            head.pack_start(intro, True, True, 0)
+            box.pack_start(head, False, False, 0)
+
+            self.banner = Gtk.InfoBar(message_type=Gtk.MessageType.WARNING)
+            self.banner.set_no_show_all(True)
+            self.banner_text = Gtk.Label(xalign=0, wrap=True, max_width_chars=60)
+            self.banner.get_content_area().add(self.banner_text)
+            self.banner.add_button("Cancel It", 1)
+            self.banner.connect("response", lambda *_: self.cancel())
+            box.pack_start(self.banner, False, False, 0)
+
+            f1 = Gtk.Frame(label=" System Cleanup Action ")
+            v1 = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+            v1.set_border_width(10)
+            f1.add(v1)
+            self.action = Gtk.ComboBoxText()
+            self.action.append("oobe", "Enter first-time setup (OOBE)")
+            self.action.append("none", "Don't enter first-time setup")
+            self.action.set_active_id("oobe")
+            self.action.connect("changed", lambda *_: self.sync())
+            v1.pack_start(self.action, False, False, 0)
+            self.generalize = Gtk.CheckButton(label="Generalize")
+            self.generalize.set_active(True)
+            self.generalize.connect("toggled", lambda *_: self.sync())
+            v1.pack_start(self.generalize, False, False, 0)
+            g = Gtk.Label(xalign=0, wrap=True, max_width_chars=60)
+            g.set_markup("<small>Forget what makes this computer itself: its machine ID, SSH host keys, name, "
+                         "logs, saved networks, Bluetooth pairings and domain membership. Each copy made "
+                         "from it becomes a computer of its own.</small>")
+            g.set_margin_start(26)
+            g.get_style_context().add_class("dim-label")
+            v1.pack_start(g, False, False, 0)
+            self.users = Gtk.CheckButton(label="Remove user accounts and their files")
+            self.users.set_active(True)
+            self.users.connect("toggled", lambda *_: self.sync())
+            v1.pack_start(self.users, False, False, 0)
+            box.pack_start(f1, False, False, 0)
+
+            f2 = Gtk.Frame(label=" Shutdown Options ")
+            v2 = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+            v2.set_border_width(10)
+            f2.add(v2)
+            self.after = Gtk.ComboBoxText()
+            self.after.append("poweroff", "Shut down")
+            self.after.append("reboot", "Restart")
+            self.after.append("none", "Wait for the next shutdown")
+            self.after.set_active_id("poweroff")
+            v2.pack_start(self.after, False, False, 0)
+            box.pack_start(f2, False, False, 0)
+
+            self.note = Gtk.Label(xalign=0, wrap=True, max_width_chars=60)
+            box.pack_start(self.note, False, False, 0)
+
+            buttons = Gtk.Box(spacing=8)
+            ok = Gtk.Button(label="OK")
+            ok.get_style_context().add_class("suggested-action")
+            ok.connect("clicked", lambda *_: self.go())
+            close = Gtk.Button(label="Cancel")
+            close.connect("clicked", lambda *_: self.destroy())
+            buttons.pack_end(ok, False, False, 0)
+            buttons.pack_end(close, False, False, 0)
+            box.pack_start(buttons, False, False, 0)
+            self.sync()
+            self.show_all()
+            self.check_pending()
+
+        def plan(self):
+            return {"mode": "sysprep", "oobe": self.action.get_active_id() == "oobe",
+                    "generalize": self.generalize.get_active(), "remove_users": self.users.get_active(),
+                    "after": self.after.get_active_id()}
+
+        def sync(self):
+            # Removing everyone needs first-time setup, or nobody could log in
+            if self.users.get_active() and self.action.get_active_id() != "oobe":
+                self.action.set_active_id("oobe")
+            notes = []
+            if self.generalize.get_active() and not self.users.get_active():
+                notes.append("The accounts stay, and with them their own files and settings: every copy "
+                             "gets them.")
+            who = R.managed_by()
+            if who:
+                notes.append(f"This computer is managed by {who}: it stays enrolled, and its policies "
+                             "apply to every copy.")
+            self.note.set_markup("<small>" + "\n".join(GLib.markup_escape_text(n) for n in notes) + "</small>"
+                                 if notes else "")
+
+        def check_pending(self):
+            plan = R.pending()
+            if plan:
+                self.banner_text.set_text("Already waiting for the next shutdown: " +
+                                          "; ".join(R.describe(plan)[:-1]).lower() + ".")
+                self.banner.show()
+                self.banner_text.show()
+            else:
+                self.banner.hide()
+
+        def cancel(self):
+            ok, msg = R.cancel()
+            self.check_pending()
+            if not ok and msg != "cancelled":
+                self.message(Gtk.MessageType.ERROR, "Couldn't cancel it", msg)
+
+        def message(self, kind, text, secondary):
+            d = Gtk.MessageDialog(transient_for=self, modal=True, message_type=kind,
+                                  buttons=Gtk.ButtonsType.OK, text=text)
+            d.format_secondary_text(secondary)
+            d.run()
+            d.destroy()
+
+        def go(self):
+            try:
+                plan = R.check_plan(self.plan())
+            except R.ResetError as e:
+                self.message(Gtk.MessageType.WARNING, "There's nothing to do", str(e).capitalize() + ".")
+                return
+            d = Gtk.MessageDialog(transient_for=self, modal=True, message_type=Gtk.MessageType.WARNING,
+                                  buttons=Gtk.ButtonsType.NONE,
+                                  text="Prepare this computer?")
+            d.format_secondary_text("\n".join("• " + line for line in R.describe(plan)) +
+                                    "\n\nThis can't be undone once the computer shuts down.")
+            d.add_button("Cancel", Gtk.ResponseType.CANCEL)
+            b = d.add_button("Prepare", Gtk.ResponseType.OK)
+            b.get_style_context().add_class("destructive-action")
+            answer = d.run()
+            d.destroy()
+            if answer != Gtk.ResponseType.OK:
+                return
+            ok, msg = R.schedule(plan)
+            if ok:
+                if plan["after"] == "none":
+                    self.message(Gtk.MessageType.INFO, "Ready", "It happens the next time this computer "
+                                 "shuts down or restarts. To change your mind, open System Preparation "
+                                 "again and click Cancel It.")
+                    self.check_pending()
+                else:
+                    self.destroy()
+            elif msg != "cancelled":
+                self.message(Gtk.MessageType.ERROR, "Not done", msg)
+
+    Sysprep()
+    Gtk.main()
+    return 0
+
+
+def main(argv):
+    return cli(argv[1:]) if len(argv) > 1 else gui()
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

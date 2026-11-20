@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Powerwash
+Comment=Reset this computer to how it was when it was new
+Exec=firox-powerwash
+Icon=edit-clear-all
+Categories=System;Settings;
+Keywords=factory reset;reset;wipe;erase;give away;start over;
+StartupNotify=false

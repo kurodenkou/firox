@@ -1,0 +1,79 @@
+#!/usr/bin/python3
+"""
+The root side of System Preparation and Powerwash (see firox_reset).
+
+    reset schedule     read a plan (JSON) on stdin and carry it out at shutdown;
+                       shuts down or restarts now if the plan says so
+    reset cancel       forget the waiting plan
+    reset status       the waiting plan, as JSON (or null)
+    reset final        carry out the plan (firox-reset.service runs this
+                       when it's stopped, at shutdown)
+
+Run through pkexec, which asks for an administrator's password.
+"""
+
+import json
+import os
+import subprocess
+import sys
+
+sys.path.insert(0, "/usr/lib/firox/python")
+import firox_reset as R  # noqa: E402
+
+
+def main(argv):
+    cmd = argv[1] if len(argv) > 1 else ""
+    if os.geteuid() != 0:
+        print("This needs to run as root (through pkexec).", file=sys.stderr)
+        return 1
+    if cmd == "schedule":
+        try:
+            plan = R.check_plan(json.loads(sys.stdin.read(65536) or "null"))
+        except (ValueError, R.ResetError) as e:
+            print(f"Not done: {e}", file=sys.stderr)
+            return 2
+        if plan["mode"] == "powerwash" and R.powerwash_forbidden():
+            print("Your organization's policy doesn't allow Powerwash on this computer.", file=sys.stderr)
+            return 3
+        try:
+            os.unlink(R.LAST_LOG)
+        except OSError:
+            pass
+        who = os.environ.get("PKEXEC_UID", "root")
+        R.log(f"{plan['mode']} planned by uid {who}: {json.dumps(plan)}")
+        if plan.get("reset_packages") and R.layered_packages():
+            R.log("taking out added packages (rpm-ostree reset), from the next start")
+            R.run("rpm-ostree", "reset", timeout=900)
+        R.save_plan(plan)
+        if subprocess.run(["systemctl", "start", R.UNIT]).returncode != 0:
+            R.drop_plan()
+            print("Couldn't set it up (firox-reset.service didn't start).", file=sys.stderr)
+            return 1
+        print("\n".join(R.describe(plan)))
+        if plan["after"] in ("poweroff", "reboot"):
+            subprocess.Popen(["systemctl", "--no-block", plan["after"]])
+        return 0
+    if cmd == "cancel":
+        R.drop_plan()                       # first: stopping the unit then does nothing
+        subprocess.run(["systemctl", "stop", R.UNIT])
+        print("Cancelled: nothing will be reset.")
+        return 0
+    if cmd == "status":
+        print(json.dumps(R.pending()))
+        return 0
+    if cmd == "final":
+        plan = R.pending()
+        if plan is None:
+            return 0                        # cancelled, or a plan from an earlier start
+        R.drop_plan()                       # once only, whatever happens next
+        try:
+            R.carry_out(plan)
+        except Exception as e:              # still shut down
+            R.log(f"stopped by an error: {e}")
+        return 0
+    print(__doc__.strip(), file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

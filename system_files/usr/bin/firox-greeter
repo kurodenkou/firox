@@ -1,5 +1,6 @@
 #!/usr/bin/bash
-# Login screen launcher (run by greetd as the "greetd" user).
+# Login screen launcher (run by greetd as the "greetd" user), or first-time
+# setup while that's waiting.
 # Shows firox-welcome ("To begin, click your user name", with account
 # pictures) in the cage kiosk compositor, styled with the system default look
 # from /etc/firox/theme. If it can't start, falls back to gtkgreet so you can
@@ -23,5 +24,11 @@ fi
 
 css="$THEMES/$theme/greeter.css"
 [ -f "$css" ] || css="$THEMES/classic/greeter.css"
-exec cage -d -s -m last -- sh -c \
-    'firox-welcome --theme "$1" || exec gtkgreet -s "$2"' sh "$theme" "$css"
+# First-time setup (firox-oobe) comes first while it's waiting: after System
+# Preparation or a Powerwash. It logs the new account in itself (exit 0);
+# otherwise the usual login screen follows.
+exec cage -d -s -m last -- sh -c '
+    if [ -e /var/lib/firox/oobe ] && [ -x /usr/libexec/firox/firox-oobe ]; then
+        /usr/libexec/firox/firox-oobe --theme "$1" && exit 0
+    fi
+    firox-welcome --theme "$1" || exec gtkgreet -s "$2"' sh "$theme" "$css"

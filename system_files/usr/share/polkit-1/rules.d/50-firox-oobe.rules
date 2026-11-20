@@ -1,0 +1,11 @@
+// First-time setup (firox-oobe) runs on the login screen as the greetd
+// user and makes the first account with /usr/libexec/firox/oobe-apply.
+// The login screen may run that one program without a password; it only
+// does anything while setup is waiting (/var/lib/firox/oobe).
+polkit.addRule(function(action, subject) {
+    if (action.id == "org.freedesktop.policykit.exec" &&
+        action.lookup("program") == "/usr/libexec/firox/oobe-apply" &&
+        subject.user == "greetd") {
+        return polkit.Result.YES;
+    }
+});

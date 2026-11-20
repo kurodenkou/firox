@@ -1,0 +1,215 @@
+#!/usr/bin/python3
+"""
+firox-powerwash: Powerwash. Reset this computer to how it was when it was
+new, like a Chromebook's Powerwash: for giving it away, or starting afresh.
+
+    firox-powerwash             the window
+    firox-powerwash --yes       powerwash now, without the window
+    firox-powerwash --status | --cancel
+
+Deleted: every account and everything in it (documents, pictures, settings,
+apps installed for one person), saved Wi-Fi and other networks, Bluetooth
+pairings, and packages added on top of Firox. Kept: Firox itself with its
+updates, apps installed for everyone, and, on a computer managed by a policy
+(firox-policy), its enrollment. The computer restarts into first-time setup.
+
+It happens as the computer restarts, once everyone has been logged out.
+Asks for an administrator's password. A policy can turn it off
+(system.powerwash). Log: /var/lib/firox/reset/last.log.
+"""
+
+import sys
+import threading
+
+sys.path.insert(0, "/usr/lib/firox/python")
+import firox_reset as R  # noqa: E402
+
+GOES = ["Every account on this computer, and everything in them: documents, pictures, downloads, "
+        "settings and apps installed for one person",
+        "Saved Wi-Fi and other network connections",
+        "Paired Bluetooth devices",
+        "Packages added on top of Firox"]
+STAYS = ["Firox Linux itself, with its updates",
+         "Apps installed for everyone on this computer"]
+
+
+def stays():
+    who = R.managed_by()
+    return STAYS + ([f"Its enrollment with {who}, and the policies that come with it"] if who else [])
+
+
+def cli(args):
+    if args == ["--status"]:
+        plan = R.pending()
+        print("Waiting for the restart:\n  " + "\n  ".join(R.describe(plan)) if plan else "Nothing is waiting.")
+        return 0
+    if args == ["--cancel"]:
+        ok, msg = R.cancel()
+        print(msg)
+        return 0 if ok else 1
+    if args != ["--yes"]:
+        print(__doc__.strip(), file=sys.stderr)
+        return 2
+    if R.powerwash_forbidden():
+        print("Your organization's policy doesn't allow Powerwash on this computer.", file=sys.stderr)
+        return 3
+    ok, msg = R.schedule({"mode": "powerwash", "after": "reboot"})
+    print(msg if ok else f"Not done: {msg}")
+    return 0 if ok else 1
+
+
+def gui():
+    import gi
+    gi.require_version("Gtk", "3.0")
+    from gi.repository import GLib, Gtk
+
+    class Powerwash(Gtk.Window):
+        def __init__(self):
+            super().__init__(title="Powerwash")
+            self.set_icon_name("edit-clear-all")
+            self.set_resizable(False)
+            self.connect("destroy", Gtk.main_quit)
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+            box.set_border_width(18)
+            self.add(box)
+            head = Gtk.Box(spacing=14)
+            icon = Gtk.Image.new_from_icon_name("edit-clear-all", Gtk.IconSize.DIALOG)
+            icon.set_pixel_size(56)
+            icon.set_valign(Gtk.Align.START)
+            head.pack_start(icon, False, False, 0)
+            intro = Gtk.Label(xalign=0, wrap=True, max_width_chars=56)
+            intro.set_markup("<span size='large'><b>Reset this computer to how it was when it was new</b></span>"
+                             "\n\nFor giving it to someone else, or starting afresh. It restarts into "
+                             "first-time setup, where a new account is made.")
+            head.pack_start(intro, True, True, 0)
+            box.pack_start(head, False, False, 0)
+
+            self.banner = Gtk.InfoBar(message_type=Gtk.MessageType.WARNING)
+            self.banner.set_no_show_all(True)
+            self.banner_text = Gtk.Label(xalign=0, wrap=True, max_width_chars=56)
+            self.banner.get_content_area().add(self.banner_text)
+            self.banner.add_button("Cancel It", 1)
+            self.banner.connect("response", lambda *_: self.cancel())
+            box.pack_start(self.banner, False, False, 0)
+
+            def listing(title, items, icon):
+                frame = Gtk.Frame(label=f" {title} ")
+                v = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+                v.set_border_width(10)
+                frame.add(v)
+                for text in items:
+                    row = Gtk.Box(spacing=8)
+                    img = Gtk.Image.new_from_icon_name(icon, Gtk.IconSize.MENU)
+                    img.set_valign(Gtk.Align.START)
+                    row.pack_start(img, False, False, 0)
+                    row.pack_start(Gtk.Label(label=text, xalign=0, wrap=True, max_width_chars=54), True, True, 0)
+                    v.pack_start(row, False, False, 0)
+                return frame
+            box.pack_start(listing("Deleted", GOES, "edit-delete"), False, False, 0)
+            box.pack_start(listing("Kept", stays(), "emblem-ok-symbolic"), False, False, 0)
+
+            tip = Gtk.Label(xalign=0, wrap=True, max_width_chars=60)
+            tip.set_markup("<small>Want to keep your files? Copy them first, with <b>Backup and Restore</b> "
+                           "or to a USB drive.</small>")
+            tip.get_style_context().add_class("dim-label")
+            box.pack_start(tip, False, False, 0)
+
+            self.sure = Gtk.CheckButton(label="I understand that everything listed above will be deleted")
+            self.sure.connect("toggled", lambda *_: self.sync())
+            box.pack_start(self.sure, False, False, 0)
+
+            buttons = Gtk.Box(spacing=8)
+            self.go_button = Gtk.Button(label="Powerwash and Restart")
+            self.go_button.get_style_context().add_class("destructive-action")
+            self.go_button.connect("clicked", lambda *_: self.go())
+            close = Gtk.Button(label="Close")
+            close.connect("clicked", lambda *_: self.destroy())
+            buttons.pack_end(self.go_button, False, False, 0)
+            buttons.pack_end(close, False, False, 0)
+            box.pack_start(buttons, False, False, 0)
+
+            self.forbidden = R.powerwash_forbidden()
+            if self.forbidden:
+                self.sure.set_sensitive(False)
+                self.banner_text.set_text("Your organization's policy doesn't allow Powerwash on this computer.")
+                self.banner.set_message_type(Gtk.MessageType.INFO)
+                for b in self.banner.get_action_area().get_children():
+                    b.hide()
+                self.banner.show()
+                self.banner_text.show()
+            self.sync()
+            self.show_all()
+            self.check_pending()
+
+        def sync(self):
+            self.go_button.set_sensitive(self.sure.get_active() and not self.forbidden)
+
+        def check_pending(self):
+            if self.forbidden:
+                return
+            plan = R.pending()
+            if plan and plan.get("mode") == "powerwash":
+                self.banner_text.set_text("A Powerwash is waiting for the next restart.")
+                self.banner.show()
+                self.banner_text.show()
+            else:
+                self.banner.hide()
+
+        def cancel(self):
+            ok, msg = R.cancel()
+            self.check_pending()
+            if not ok and msg != "cancelled":
+                self.message(Gtk.MessageType.ERROR, "Couldn't cancel it", msg)
+
+        def message(self, kind, text, secondary):
+            d = Gtk.MessageDialog(transient_for=self, modal=True, message_type=kind,
+                                  buttons=Gtk.ButtonsType.OK, text=text)
+            d.format_secondary_text(secondary)
+            d.run()
+            d.destroy()
+
+        def go(self):
+            d = Gtk.MessageDialog(transient_for=self, modal=True, message_type=Gtk.MessageType.WARNING,
+                                  buttons=Gtk.ButtonsType.NONE, text="Powerwash this computer now?")
+            d.format_secondary_markup("Everyone's accounts and files will be deleted and the computer will "
+                                      "restart. <b>This can't be undone.</b>\n\nSave anything you're working "
+                                      "on first: open programs are closed.")
+            d.add_button("Cancel", Gtk.ResponseType.CANCEL)
+            b = d.add_button("Powerwash", Gtk.ResponseType.OK)
+            b.get_style_context().add_class("destructive-action")
+            answer = d.run()
+            d.destroy()
+            if answer != Gtk.ResponseType.OK:
+                return
+            # (taking out added packages can take minutes: not in the window's thread)
+            self.go_button.set_sensitive(False)
+            self.sure.set_sensitive(False)
+            self.go_button.set_label("Getting ready…")
+
+            def work():
+                ok, msg = R.schedule({"mode": "powerwash", "after": "reboot"})
+                GLib.idle_add(done, ok, msg)
+
+            def done(ok, msg):
+                if ok:
+                    self.destroy()          # the computer is restarting
+                    return False
+                self.go_button.set_label("Powerwash and Restart")
+                self.sure.set_sensitive(True)
+                self.sync()
+                if msg != "cancelled":
+                    self.message(Gtk.MessageType.ERROR, "Not done", msg)
+                return False
+            threading.Thread(target=work, daemon=True).start()
+
+    Powerwash()
+    Gtk.main()
+    return 0
+
+
+def main(argv):
+    return cli(argv[1:]) if len(argv) > 1 else gui()
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

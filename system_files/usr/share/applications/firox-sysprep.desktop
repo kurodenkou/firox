@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=System Preparation
+Comment=Get this computer ready to be copied to others or handed over (Sysprep)
+Exec=firox-sysprep
+Icon=applications-system
+Categories=System;Settings;
+Keywords=sysprep;generalize;oobe;image;clone;deploy;
+StartupNotify=false
