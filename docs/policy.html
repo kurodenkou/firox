@@ -39,7 +39,7 @@
 <ul class="toc">
     <li><a href="#why">Why it's built this way</a></li>
     <li><a href="#start">Getting started</a></li>
-    <li><a href="#settings">The 32 settings</a></li>
+    <li><a href="#settings">The 33 settings</a></li>
     <li><a href="#domain">Active Directory and NFS home folders</a></li>
     <li><a href="#computers">On managed computers</a></li>
     <li><a href="#security">Security</a></li>
@@ -96,7 +96,7 @@
 <p>That's it. Computers check for a new policy when they start and every 30 minutes. To change something, edit, sign and publish again.</p>
 <div class="note"><b>Encrypted policies</b> need an enrollment file made after you turn encryption on: it carries the key computers decrypt with. Copy it only to the computers you enroll.</div>
 
-<h2 id="settings">The 32 settings</h2>
+<h2 id="settings">The 33 settings</h2>
 <p>Each setting is either <b>Not configured</b>, and left to each person, or set and locked: people can't change it in Settings, and the computer puts it back if it's changed some other way, at the next check.</p>
 <div class="table-wrap">
 <table class="internals">
@@ -112,6 +112,7 @@
         <tr><th scope="row">Remote login (SSH)<br><code>ssh.enabled</code></th><td>Let people log in to this computer over the network with SSH.</td><td>Allowed / Not allowed</td></tr>
         <tr><th scope="row">Lock the screen when idle<br><code>screen.lock_minutes</code></th><td>Lock the screen after this many minutes without use. People can't make it longer or turn it off in Settings.</td><td>1–240 minutes</td></tr>
         <tr><th scope="row">Lock when waking from sleep<br><code>screen.lock_on_wake</code></th><td>Ask for the password when the computer wakes up.</td><td>On / Off</td></tr>
+        <tr><th scope="row">Powerwash<br><code>system.powerwash</code></th><td>Whether people may Powerwash this computer (delete every account and start again with first-time setup). Not allowed hides it; the computer stays enrolled either way.</td><td>Allowed / Not allowed</td></tr>
         <tr><th scope="row">Minimum password length<br><code>password.min_length</code></th><td>New passwords must be at least this long (when people change their password).</td><td>6–64 characters</td></tr>
         <tr><th scope="row">Virus definition updates<br><code>virus.definitions</code></th><td>Keep Virus Scan's virus definitions up to date (downloaded every two hours).</td><td>On / Off</td></tr>
         <tr class="group"><th colspan="3">Power</th></tr>

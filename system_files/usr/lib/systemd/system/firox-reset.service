@@ -1,0 +1,19 @@
+# System Preparation (firox-sysprep) and Powerwash (firox-powerwash): the
+# plan in /var/lib/firox/reset/plan.json is carried out when this unit is
+# stopped, at shutdown. Ordered before user.slice and the user sessions, so
+# that by then everyone has been logged out and their files can go.
+# Started by /usr/libexec/firox/reset schedule; never enabled.
+[Unit]
+Description=Firox Linux: reset this computer at shutdown (System Preparation, Powerwash)
+DefaultDependencies=no
+After=local-fs.target systemd-journald.service dbus.service dbus.socket
+Before=user.slice systemd-user-sessions.service shutdown.target
+Conflicts=shutdown.target
+RequiresMountsFor=/var /etc
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/true
+ExecStop=/usr/libexec/firox/reset final
+TimeoutStopSec=15min

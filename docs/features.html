@@ -484,6 +484,24 @@
 
 <div class="feature">
     <div class="feature-text">
+        <h3>Powerwash and System Preparation</h3>
+        <p><b>Powerwash</b> resets the computer to how it was when it was new, for giving it away or starting afresh.</p>
+<ul>
+    <li><b>Deleted:</b> every account and its files, saved networks, Bluetooth pairings, packages added on top.</li>
+    <li><b>Kept:</b> Firox with its updates, apps installed for everyone, and a managed computer's enrollment. A policy can turn it off.</li>
+</ul>
+<p><b>System Preparation</b> is the Sysprep for people who set up many computers.</p>
+<ul>
+    <li><b>Enter first-time setup (OOBE):</b> the next person to start it makes their account and names it.</li>
+    <li><b>Generalize:</b> new machine ID, SSH host keys and name for every copy; logs, networks and domain membership forgotten.</li>
+    <li><b>Then:</b> shut down to take an image, restart, or wait for the next shutdown.</li>
+</ul>
+        <p class="tech">firox-powerwash, firox-sysprep: carried out at shutdown by firox-reset.service, after everyone has logged out; first-time setup is firox-oobe on the login screen</p>
+    </div>
+</div>
+
+<div class="feature">
+    <div class="feature-text">
         <h3>Backup and Restore</h3>
         <p>Backs up your home folder every hour to a USB drive or a network folder, and as soon as the backup drive is plugged in.</p>
 <ul>
@@ -520,7 +538,7 @@
         <h3>Policy Editor: manage your computers from one place</h3>
         <p>Set things once for every Firox computer you look after, without a server or a directory service.</p>
 <ul>
-    <li><b>32 settings in folders, like Group Policy:</b> joining Active Directory (realmd), NFS home folders, a login banner, Wi-Fi networks, DNS servers, printers, time zone and network time, updates, firewall, remote login, screen lock, password length, virus definitions, power timers, USB drives, Bluetooth, the look and wallpaper, Firefox (home page, bookmarks, private browsing, about:config, passwords, developer tools, add-ons, DNS over HTTPS), Firox Sync and Firox Stream. Each is set and locked, or left to each person.</li>
+    <li><b>33 settings in folders, like Group Policy:</b> joining Active Directory (realmd), NFS home folders, a login banner, Wi-Fi networks, DNS servers, printers, time zone and network time, updates, firewall, remote login, screen lock, password length, Powerwash, virus definitions, power timers, USB drives, Bluetooth, the look and wallpaper, Firefox (home page, bookmarks, private browsing, about:config, passwords, developer tools, add-ons, DNS over HTTPS), Firox Sync and Firox Stream. Each is set and locked, or left to each person.</li>
     <li><b>Signed:</b> computers apply only policies signed with your admin key, and never an older one, so a fake or replayed policy is refused.</li>
     <li><b>Publish anywhere:</b> a web server, a git repository or a shared folder. Computers check every 30 minutes.</li>
     <li><b>Private if you like:</b> policies can also be encrypted so only your computers can read them.</li>

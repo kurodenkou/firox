@@ -197,6 +197,9 @@ done
 cp -avf /ctx/system_files/. /
 
 chmod 0755 /usr/bin/firox-* /usr/bin/umu-run
+# System Preparation, Powerwash and first-time setup (root helpers, polkit rule)
+chmod 0755 /usr/libexec/firox/reset /usr/libexec/firox/oobe-apply /usr/libexec/firox/firox-oobe
+chmod 0644 /usr/share/polkit-1/rules.d/50-firox-oobe.rules
 
 # Our .desktop files' file types (Windows programs open with firox-windows,
 # folders with Firox Explorer): GIO only sees what mimeinfo.cache lists

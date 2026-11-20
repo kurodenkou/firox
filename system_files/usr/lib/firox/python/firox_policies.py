@@ -330,6 +330,11 @@ def apply_stream(allowed):
     return "allowed" if allowed else "not allowed (running hosts stopped)"
 
 
+def apply_powerwash(allowed):
+    # Read by firox-powerwash and /usr/libexec/firox/reset from managed.json
+    return "allowed" if allowed else "not allowed"
+
+
 def apply_wallpaper(value):
     """An https:// picture is downloaded (checked to be an image); a path
     must already be on the computer."""
@@ -1097,6 +1102,10 @@ POLICIES = [
     Policy("screen.lock_on_wake", "Security", "Lock when waking from sleep",
            "Ask for the password when the computer wakes up.", "bool", apply_lock_on_wake,
            release=release_lock_on_wake),
+    Policy("system.powerwash", "Security", "Powerwash",
+           "Whether people may Powerwash this computer (delete every account and start again with first-time "
+           "setup). Not allowed hides it; the computer stays enrolled either way.",
+           "bool", apply_powerwash, on_label="Allowed", off_label="Not allowed"),
     Policy("password.min_length", "Security", "Minimum password length",
            "New passwords must be at least this long (when people change their password).",
            "number", apply_password_length, low=6, high=64, unit="characters", release=release_password_length),

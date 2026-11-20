@@ -1,0 +1,82 @@
+#!/usr/bin/python3
+"""
+The root side of first-time setup (firox-oobe): reads the answers as JSON on
+stdin and makes them so.
+
+    {"user", "fullname", "password", "hostname", "timezone", "layout"}
+
+It only does anything while first-time setup is waiting
+(/var/lib/firox/oobe), and removes that once the account exists, so it
+can't be used to add accounts afterwards. The login screen's user (greetd)
+may run it without a password, by the polkit rule
+/usr/share/polkit-1/rules.d/50-firox-oobe.rules; nothing else may, except
+an administrator.
+"""
+
+import json
+import os
+import pwd
+import re
+import subprocess
+import sys
+
+FLAG = "/var/lib/firox/oobe"
+USER_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
+HOST_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
+LAYOUT_RE = re.compile(r"^[a-z]{2,12}$")
+RESERVED = {"root", "bin", "daemon", "adm", "lp", "sync", "shutdown", "halt", "mail", "operator", "games",
+            "ftp", "nobody", "greetd", "admin", "administrator", "guest", "user"}
+
+
+def fail(msg, code=1):
+    print(msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def run(*cmd, data=None):
+    p = subprocess.run(list(cmd), input=data, capture_output=True, text=True, timeout=120)
+    if p.returncode != 0:
+        fail(f"{cmd[0]}: {(p.stderr or p.stdout).strip()[:200]}")
+
+
+def main():
+    if os.geteuid() != 0:
+        fail("This needs to run as root (through pkexec).")
+    if not os.path.exists(FLAG):
+        fail("First-time setup isn't waiting on this computer.", 3)
+    try:
+        a = json.loads(sys.stdin.read(16384))
+        user, fullname, password = str(a["user"]), str(a["fullname"]), str(a["password"])
+        hostname, tz, layout = str(a["hostname"]), str(a["timezone"]), str(a.get("layout") or "us")
+    except (ValueError, KeyError, TypeError):
+        fail("The answers couldn't be read.", 2)
+    if not USER_RE.match(user) or user in RESERVED:
+        fail(f"{user!r} can't be a user name.", 2)
+    if not fullname.strip() or len(fullname) > 100 or any(c in fullname for c in ":,\n\r\0"):
+        fail("Your name can't contain : , or new lines.", 2)
+    if not password or len(password) > 512 or "\n" in password or "\0" in password:
+        fail("That password can't be used.", 2)
+    if not HOST_RE.match(hostname):
+        fail(f"{hostname!r} can't be a computer name.", 2)
+    zone = os.path.realpath(os.path.join("/usr/share/zoneinfo", tz))
+    if ".." in tz or not zone.startswith("/usr/share/zoneinfo/") or not os.path.isfile(zone):
+        fail(f"{tz!r} isn't a time zone.", 2)
+    if not LAYOUT_RE.match(layout):
+        fail(f"{layout!r} isn't a keyboard layout.", 2)
+    try:
+        pwd.getpwnam(user)
+        fail(f"There's already an account called {user}.", 2)
+    except KeyError:
+        pass
+    # The computer first (these can be repeated), the account last
+    run("hostnamectl", "set-hostname", hostname)
+    run("timedatectl", "set-timezone", tz)
+    run("localectl", "set-x11-keymap", layout)
+    run("useradd", "--create-home", "--comment", fullname, "--groups", "wheel", user)
+    run("chpasswd", data=f"{user}:{password}\n")
+    os.unlink(FLAG)
+    print(f"Made {user} ({fullname}), an administrator; this computer is {hostname}.")
+
+
+if __name__ == "__main__":
+    main()

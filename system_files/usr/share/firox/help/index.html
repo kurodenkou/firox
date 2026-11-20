@@ -48,6 +48,8 @@
   <a href="#stream">Firox Stream</a>
   <a href="#policy">Managing several computers</a>
   <a href="#restore">System Restore</a>
+  <a href="#powerwash">Powerwash</a>
+  <a href="#sysprep">System Preparation</a>
   <a href="#taskmgr">Task Manager</a>
   <a href="#terminal">Command Prompt</a>
   <a href="#hud">Gaming HUD</a>
@@ -210,6 +212,19 @@ Settings a policy sets are greyed out in Settings (Power Options, Screen Saver, 
 <h2 id="restore">Going back after an update (System Restore)</h2>
 <p>Each update installs a complete new version of Firox Linux and keeps the one you used before. If something stopped working after an update, open <b>Settings &rarr; System Restore</b>, pick <b>Previous version</b> and click <b>Restore this version</b>; it starts the next time you restart (<b>Undo</b> changes your mind). Your files, settings and apps aren't touched.</p>
 <p>Automatic updates would bring the newest version back the next day, so click <b>Pause automatic updates</b> there to stay on the restored one, and resume them once the problem is fixed. <b>Keep this version</b> holds on to a version you trust even after later updates; kept versions can also be chosen in the boot menu (hold <kbd>Shift</kbd> or press <kbd>Esc</kbd> while the computer starts).</p>
+
+<h2 id="powerwash">Starting afresh (Powerwash)</h2>
+<p>To give your computer to someone else, or to start again from scratch, open <b>Settings &rarr; Powerwash</b>. It deletes every account on the computer and everything in them (documents, pictures, downloads, settings and apps installed for one person), saved Wi-Fi networks, Bluetooth pairings and packages added on top of Firox. Firox itself, its updates and apps installed for everyone stay. Tick <b>I understand</b>, click <b>Powerwash and Restart</b> and type an administrator's password: the computer restarts and shows first-time setup, where a new account is made. Copy anything you want to keep first, with <a href="#backup">Backup and Restore</a> or to a USB drive. On a computer managed by a policy it stays enrolled, and the policy can turn Powerwash off. From a terminal: <code>firox-powerwash --yes</code>.</p>
+
+<h2 id="sysprep">Preparing computers for copying (System Preparation)</h2>
+<p>Like Windows' Sysprep, <b>Settings &rarr; System Preparation</b> gets a computer ready to be copied to others (an image of its disk) or handed to someone new. Set it up the way you want, with apps and settings, then choose:</p>
+<ul>
+  <li><b>Enter first-time setup (OOBE):</b> at the next start, whoever starts it chooses the time zone and keyboard, makes their account (an administrator) and names the computer, then is logged straight in.</li>
+  <li><b>Generalize:</b> forget what makes this computer itself: its machine ID, SSH host keys, name, logs, saved networks, Bluetooth pairings and domain membership, so each copy becomes a computer of its own (a policy that joins computers to a domain joins each copy under its own name).</li>
+  <li><b>Remove user accounts and their files:</b> start every copy with no accounts at all (this needs first-time setup).</li>
+  <li><b>Shutdown options:</b> shut down (then take the image), restart, or wait for the next shutdown.</li>
+</ul>
+<p>Everything happens as the computer shuts down, once everyone has been logged out, so even the account you ran it from can go. Until then, opening System Preparation again shows what's waiting, with <b>Cancel It</b>. A record of what was done is kept in <code>/var/lib/firox/reset/last.log</code>. From a terminal: <code>firox-sysprep --oobe --generalize --remove-users --shutdown</code> (<code>--status</code>, <code>--cancel</code>).</p>
 
 <h2 id="taskmgr">Task Manager</h2>
 <p>Press <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Del</kbd> (or <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Esc</kbd>). <b>Applications</b> lists your open windows: <b>End Task</b> asks a stuck one to close. <b>Processes</b> shows everything that's running and how much CPU and memory it uses; click a column to sort, and <b>End Process</b> stops one that won't close. <b>Performance</b> graphs CPU and memory use. <b>GPU</b> shows each graphics card: how busy it is, its memory, temperature, speed, power and fan, and which programs are using it (<b>GPU Monitor</b> in the Start menu opens this tab).</p>
