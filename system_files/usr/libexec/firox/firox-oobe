@@ -10,6 +10,7 @@ Shown on the login screen instead of the list of people while
     your account (name, user name, password): an administrator
     the computer's name
 
+(Ctrl+Shift+F3 starts audit mode instead, as in Windows: see firox-sysprep)
 then makes them with /usr/libexec/firox/oobe-apply (through pkexec: a polkit
 rule lets the login screen run that one program, and the program only does
 anything while setup is waiting) and logs you straight in through greetd.
@@ -216,6 +217,7 @@ class Setup(Gtk.Window):
                                                  Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 1)
         self.set_name("welcome")
         self.connect("destroy", Gtk.main_quit)
+        self.connect("key-press-event", self.on_key)
 
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         self.add(root)
@@ -488,6 +490,38 @@ class Setup(Gtk.Window):
             self.result = 3                 # the login screen asks for the password
             self.set_finish("Your computer is ready", "Log in with the account you just made.")
             GLib.timeout_add(1500, Gtk.main_quit)
+        return False
+
+    def on_key(self, _w, event):
+        """Ctrl+Shift+F3, as in Windows: audit mode instead of setup."""
+        mods = event.state & (Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK)
+        if event.keyval == Gdk.KEY_F3 and mods == (Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK):
+            self.index = self.STEPS.index("finish")
+            self.show_step()
+            self.set_finish("Audit mode", "Logging in as audit, to set this computer up…")
+            self.spinner.start()
+
+            def work():
+                try:
+                    p = subprocess.run(["pkexec", APPLY], input=json.dumps({"audit": True}), capture_output=True,
+                                       text=True, timeout=120)
+                    ok, msg = p.returncode == 0, (p.stderr or p.stdout).strip()
+                except (OSError, subprocess.SubprocessError) as e:
+                    ok, msg = False, str(e)
+                GLib.idle_add(self.audit_done, ok, msg)
+            threading.Thread(target=work, daemon=True).start()
+            return True
+        return False
+
+    def audit_done(self, ok, msg):
+        if ok:
+            self.result = 0                 # greetd restarts and logs audit in
+            GLib.timeout_add(3000, Gtk.main_quit)
+        else:
+            self.spinner.stop()
+            self.index = 0
+            self.show_step()
+            self.error.set_text("Audit mode couldn't start: " + (msg.splitlines()[-1] if msg else "unknown error"))
         return False
 
     def set_finish(self, title, sub):

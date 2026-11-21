@@ -10,6 +10,12 @@ others, or handed to someone new, like Windows' Sysprep.
 
   --oobe          enter first-time setup at the next start: whoever starts
                   it makes their account and names the computer (OOBE)
+  --audit         enter audit mode, as in Windows: every start logs straight
+                  into a temporary administrator account, audit (no
+                  password), to install and set things up; System
+                  Preparation opens there. Run it again with --oobe to
+                  finish: the audit account goes. (Ctrl+Shift+F3 on
+                  first-time setup does the same.)
   --generalize    forget what makes this computer itself: its machine ID,
                   SSH host keys, name, logs, saved networks, Bluetooth
                   pairings and domain membership, so each copy is new
@@ -48,6 +54,8 @@ def cli(args):
     for a in args:
         if a == "--oobe":
             plan["oobe"] = True
+        elif a == "--audit":
+            plan["audit"] = True
         elif a == "--generalize":
             plan["generalize"] = True
         elif a == "--remove-users":
@@ -114,6 +122,7 @@ def gui():
             f1.add(v1)
             self.action = Gtk.ComboBoxText()
             self.action.append("oobe", "Enter first-time setup (OOBE)")
+            self.action.append("audit", "Enter audit mode")
             self.action.append("none", "Don't enter first-time setup")
             self.action.set_active_id("oobe")
             self.action.connect("changed", lambda *_: self.sync())
@@ -165,14 +174,21 @@ def gui():
 
         def plan(self):
             return {"mode": "sysprep", "oobe": self.action.get_active_id() == "oobe",
+                    "audit": self.action.get_active_id() == "audit",
                     "generalize": self.generalize.get_active(), "remove_users": self.users.get_active(),
                     "after": self.after.get_active_id()}
 
         def sync(self):
-            # Removing everyone needs first-time setup, or nobody could log in
-            if self.users.get_active() and self.action.get_active_id() != "oobe":
+            # Removing everyone needs someone to log in: first-time setup or audit
+            if self.users.get_active() and self.action.get_active_id() == "none":
                 self.action.set_active_id("oobe")
             notes = []
+            if R.in_audit():
+                notes.append("This computer is in audit mode. When it's set up, choose Enter first-time "
+                             "setup (OOBE): the audit account goes as it shuts down.")
+            if self.action.get_active_id() == "audit":
+                notes.append("Audit mode logs straight into a temporary administrator account (audit, no "
+                             "password) at every start, until System Preparation is run again.")
             if self.generalize.get_active() and not self.users.get_active():
                 notes.append("The accounts stay, and with them their own files and settings: every copy "
                              "gets them.")
