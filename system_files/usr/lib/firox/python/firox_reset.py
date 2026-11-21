@@ -6,6 +6,12 @@ A plan is a few switches:
     mode           "sysprep" or "powerwash"
     oobe           next start shows first-time setup (an account, the
                    computer's name, time zone, keyboard), see firox-oobe
+    audit          audit mode, as in Windows: every start logs straight into a
+                   temporary administrator account, "audit" (no password, no
+                   password asked for admin tasks), to install and set things
+                   up; System Preparation opens there. Running it again
+                   without audit mode leaves it: the account, its rights and
+                   the automatic login go
     generalize     forget what makes this computer itself: its machine ID,
                    SSH host keys, name, logs, saved networks, domain
                    membership (sysprep, for computers about to be cloned)
@@ -41,14 +47,20 @@ STATE_DIR = "/var/lib/firox/reset"
 PLAN = os.path.join(STATE_DIR, "plan.json")
 LAST_LOG = os.path.join(STATE_DIR, "last.log")
 OOBE_FLAG = "/var/lib/firox/oobe"           # firox-greeter shows first-time setup while it exists
+AUDIT_FLAG = "/var/lib/firox/audit"         # in audit mode
+AUDIT_USER = "audit"
+GREETD_CONF = "/etc/greetd/config.toml"
+GREETD_BACKUP = os.path.join(STATE_DIR, "greetd-config.toml")
+AUDIT_POLKIT = "/etc/polkit-1/rules.d/49-firox-audit.rules"
+AUDIT_SUDO = "/etc/sudoers.d/firox-audit"
 UNIT = "firox-reset.service"
 HELPER = "/usr/libexec/firox/reset"
 MANAGED = "/var/lib/firox/policy/managed.json"
 
-SWITCHES = ("oobe", "generalize", "remove_users", "reset_network", "reset_bluetooth", "reset_packages")
+SWITCHES = ("oobe", "audit", "generalize", "remove_users", "reset_network", "reset_bluetooth", "reset_packages")
 AFTER = ("poweroff", "reboot", "none")
 
-POWERWASH = {"mode": "powerwash", "oobe": True, "generalize": False, "remove_users": True,
+POWERWASH = {"mode": "powerwash", "oobe": True, "audit": False, "generalize": False, "remove_users": True,
              "reset_network": True, "reset_bluetooth": True, "reset_packages": True, "after": "reboot"}
 
 
@@ -77,11 +89,13 @@ def check_plan(plan):
     if after not in AFTER:
         raise ResetError(f"after must be one of {', '.join(AFTER)}")
     clean["after"] = after
-    if clean["remove_users"]:
+    if clean["audit"]:
+        clean["oobe"] = False               # one or the other: audit mode comes first
+    elif clean["remove_users"]:
         clean["oobe"] = True
     if mode == "powerwash":
         clean = dict(POWERWASH, after=clean["after"] if clean["after"] != "none" else "reboot")
-    if not any(clean[k] for k in SWITCHES):
+    if not any(clean[k] for k in SWITCHES) and not in_audit():
         raise ResetError("there's nothing to do: choose first-time setup, generalize or another reset")
     return clean
 
@@ -125,9 +139,16 @@ def pending():
     return None
 
 
+def in_audit():
+    return os.path.exists(AUDIT_FLAG)
+
+
 def describe(plan):
     """What a plan will do, as short lines for people."""
     out = []
+    if in_audit() and not plan.get("audit"):
+        out.append("Leave audit mode: the audit account and its files go, and the computer no longer "
+                   "logs in by itself")
     if plan.get("remove_users"):
         out.append("Delete every account on this computer and everything in it (documents, pictures, "
                    "settings, apps installed for one person)")
@@ -144,6 +165,10 @@ def describe(plan):
     if plan.get("oobe"):
         out.append("Show first-time setup at the next start: a new account, the computer's name, "
                    "time zone and keyboard")
+    if plan.get("audit"):
+        out.append("Start in audit mode: every start logs straight into a temporary administrator "
+                   "account (audit, no password) to install and set things up; System Preparation "
+                   "opens there. Run it again with first-time setup to finish")
     out.append({"poweroff": "Then shut down", "reboot": "Then restart",
                 "none": "All this happens the next time the computer shuts down or restarts"}[plan["after"]])
     return out
@@ -338,9 +363,97 @@ def generalize():
     empty_dir("/var/cache/firox")
 
 
+def enter_audit():
+    """Audit mode: the audit account (an administrator with no password,
+    needing none for admin tasks), logged in at every start by greetd."""
+    log("entering audit mode")
+    try:
+        pwd.getpwnam(AUDIT_USER)
+    except KeyError:
+        run("useradd", "--create-home", "--comment", "Audit (System Preparation)", "--groups", "wheel",
+            AUDIT_USER)
+    run("passwd", "--delete", AUDIT_USER)
+    try:
+        e = pwd.getpwnam(AUDIT_USER)
+        # No screen lock: there's no password to unlock it with
+        conf = os.path.join(e.pw_dir, ".config", "firox")
+        os.makedirs(conf, exist_ok=True)
+        with open(os.path.join(conf, "power.conf"), "w") as fh:
+            fh.write("LOCK=0\nLOCK_ON_WAKE=0\n")
+        for d, _dirs, files in os.walk(os.path.join(e.pw_dir, ".config")):
+            os.chown(d, e.pw_uid, e.pw_gid)
+            for f in files:
+                os.chown(os.path.join(d, f), e.pw_uid, e.pw_gid)
+    except (KeyError, OSError) as err:
+        log(f"  {err}")
+    os.makedirs(os.path.dirname(AUDIT_POLKIT), exist_ok=True)
+    with open(AUDIT_POLKIT, "w") as fh:
+        fh.write("// Audit mode (System Preparation): the audit account needs no password for\n"
+                 "// admin tasks. Removed when audit mode ends.\n"
+                 "polkit.addRule(function(action, subject) {\n"
+                 f"    if (subject.user == \"{AUDIT_USER}\") {{ return polkit.Result.YES; }}\n"
+                 "});\n")
+    os.chmod(AUDIT_POLKIT, 0o644)
+    os.makedirs(os.path.dirname(AUDIT_SUDO), exist_ok=True)
+    with open(AUDIT_SUDO, "w") as fh:
+        fh.write(f"# Audit mode (System Preparation); removed when it ends\n{AUDIT_USER} ALL=(ALL) NOPASSWD: ALL\n")
+    os.chmod(AUDIT_SUDO, 0o440)
+    # greetd logs it in by itself at every start ([initial_session])
+    try:
+        with open(GREETD_CONF) as fh:
+            conf = fh.read()
+    except OSError:
+        conf = ""
+    if not os.path.exists(GREETD_BACKUP):
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(GREETD_BACKUP, "w") as fh:
+            fh.write(conf)
+    if "[initial_session]" not in conf:
+        with open(GREETD_CONF, "w") as fh:
+            fh.write(conf.rstrip("\n") + "\n\n# Audit mode (System Preparation): log in by itself. "
+                     "Removed when it ends.\n[initial_session]\ncommand = \"firox-session\"\n"
+                     f"user = \"{AUDIT_USER}\"\n")
+    remove_files([OOBE_FLAG])
+    with open(AUDIT_FLAG, "w") as fh:
+        fh.write(time.strftime("%Y-%m-%d %H:%M:%S\n"))
+    os.chmod(AUDIT_FLAG, 0o644)
+
+
+def leave_audit():
+    log("leaving audit mode")
+    try:
+        with open(GREETD_BACKUP) as fh:
+            original = fh.read()
+        with open(GREETD_CONF, "w") as fh:
+            fh.write(original)
+        remove_files([GREETD_BACKUP])
+    except OSError:
+        # No copy: take out what audit mode added
+        try:
+            with open(GREETD_CONF) as fh:
+                conf = fh.read()
+            if "[initial_session]" in conf:
+                conf = conf.split("\n# Audit mode (System Preparation)")[0].split("[initial_session]")[0]
+                with open(GREETD_CONF, "w") as fh:
+                    fh.write(conf.rstrip("\n") + "\n")
+        except OSError:
+            pass
+    remove_files([AUDIT_POLKIT, AUDIT_SUDO, AUDIT_FLAG])
+    try:
+        e = pwd.getpwnam(AUDIT_USER)
+        log(f"deleting the account {AUDIT_USER}")
+        run("userdel", "--remove", "--force", AUDIT_USER)
+        if os.path.isdir(e.pw_dir) and e.pw_dir.startswith(("/var/home/", "/home/")):
+            shutil.rmtree(e.pw_dir, ignore_errors=True)
+    except KeyError:
+        pass
+
+
 def carry_out(plan):
     """Do plan (at shutdown, as root)."""
     log(f"{plan['mode']}: starting")
+    if in_audit() and not plan.get("audit"):
+        leave_audit()
     if plan.get("remove_users"):
         remove_users()
     if plan.get("generalize"):
@@ -352,7 +465,9 @@ def carry_out(plan):
             remove_files(["/etc/hostname"])     # first-time setup names it again
     if plan.get("reset_bluetooth") and not plan.get("generalize"):
         reset_bluetooth()
-    if plan.get("oobe"):
+    if plan.get("audit"):
+        enter_audit()
+    elif plan.get("oobe"):
         os.makedirs(os.path.dirname(OOBE_FLAG), exist_ok=True)
         with open(OOBE_FLAG, "w") as fh:
             fh.write(f"{plan['mode']} {time.strftime('%Y-%m-%d %H:%M:%S')}\n")

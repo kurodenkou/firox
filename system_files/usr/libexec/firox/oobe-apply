@@ -5,6 +5,9 @@ stdin and makes them so.
 
     {"user", "fullname", "password", "hostname", "timezone", "layout"}
 
+or {"audit": true}: audit mode instead (Ctrl+Shift+F3 on first-time setup,
+as in Windows), see firox_reset.enter_audit.
+
 It only does anything while first-time setup is waiting
 (/var/lib/firox/oobe), and removes that once the account exists, so it
 can't be used to add accounts afterwards. The login screen's user (greetd)
@@ -46,6 +49,20 @@ def main():
         fail("First-time setup isn't waiting on this computer.", 3)
     try:
         a = json.loads(sys.stdin.read(16384))
+    except ValueError:
+        fail("The answers couldn't be read.", 2)
+    if isinstance(a, dict) and a.get("audit") is True:
+        # Ctrl+Shift+F3 on first-time setup, as in Windows: audit mode
+        sys.path.insert(0, "/usr/lib/firox/python")
+        import firox_reset
+        firox_reset.enter_audit()
+        try:
+            subprocess.Popen(["systemctl", "--no-block", "restart", "greetd.service"])
+        except OSError as e:
+            fail(f"Audit mode is set up, but the login screen didn't restart ({e}): restart the computer.")
+        print("Audit mode: logging in as audit.")
+        return
+    try:
         user, fullname, password = str(a["user"]), str(a["fullname"]), str(a["password"])
         hostname, tz, layout = str(a["hostname"]), str(a["timezone"]), str(a.get("layout") or "us")
     except (ValueError, KeyError, TypeError):

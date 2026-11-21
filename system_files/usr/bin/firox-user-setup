@@ -27,6 +27,13 @@ if [ ! -x "$HOME/.local/share/firefoxpwa/runtime/firefox" ] && [ ! -f "$STATE/ru
     ) &
 fi
 
+# Audit mode (System Preparation): open it, as Windows does
+if [ "$(id -un)" = audit ] && [ -e /var/lib/firox/audit ]; then
+    ( sleep 4
+      notify-send -a "System Preparation" -i applications-system "Audit mode" \
+          "Install and set things up. When you're done, choose Enter first-time setup (OOBE) in System Preparation."
+      firox-sysprep ) &
+fi
 # First login: welcome balloon
 if [ ! -f "$STATE/welcomed" ]; then
     touch "$STATE/welcomed"
