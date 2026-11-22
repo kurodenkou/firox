@@ -1801,7 +1801,8 @@ class AccountsDialog(Gtk.Dialog):
             except GLib.Error:
                 continue
             child.path = path
-            child.set_tooltip_text(os.path.splitext(os.path.basename(path))[0].title())
+            # ("rune-sly.png" is "Rune Sly")
+            child.set_tooltip_text(os.path.splitext(os.path.basename(path))[0].replace("-", " ").title())
             flow.add(child)
         flow.connect("child-activated", lambda _f, c: self._choose(c.path))
         box.pack_start(flow, False, False, 0)
