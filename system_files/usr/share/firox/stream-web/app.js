@@ -8,9 +8,9 @@
 "use strict";
 
 const $ = (id) => document.getElementById(id);
-const TOKEN = "firox-stream-token", NAME = "firox-stream-name";
+const TOKEN = "firox-stream-token", NAME = "firox-stream-name", QUALITY = "firox-stream-quality";
 
-let ws = null, pc = null, info = {}, streaming = false, pairing = false, hostName = "";
+let ws = null, pc = null, info = {}, streaming = false, pairing = false, hostName = "", qualityKnown = false;
 
 function store(key, value) {
     try {
@@ -160,6 +160,21 @@ async function handle(k, d, name) {
     case "R":
         rumble(d);
         break;
+    case "z": {                                 // the picture quality the host is sending
+        const first = !qualityKnown, mine = store(QUALITY);
+        qualityKnown = true;
+        if (first && mine && mine !== d.quality) {  // this browser's choice, from last time
+            send("Z", { quality: mine });
+            break;
+        }
+        if (d.quality) {
+            const changed = $("quality").value !== d.quality;
+            $("quality").value = d.quality;
+            if (!first && changed)
+                toast(`Picture quality: ${$("quality").selectedOptions[0].text}` + (d.by ? ` (set by ${d.by})` : ""));
+        }
+        break;
+    }
     }
 }
 
@@ -220,6 +235,7 @@ function stop() {
     streaming = false;
     if (pc) { pc.close(); pc = null; }
     ws = null;
+    qualityKnown = false;
     if (document.pointerLockElement) document.exitPointerLock();
     if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
     $("video").srcObject = null;
@@ -468,6 +484,11 @@ $("b-stop").onclick = () => {
     send("Q");
     say("Disconnected.");
     if (ws) ws.close();
+};
+$("quality").onchange = () => {
+    store(QUALITY, $("quality").value);         // remembered in this browser
+    send("Z", { quality: $("quality").value });
+    $("video").focus();
 };
 $("tap").onclick = () => { $("video").muted = false; $("video").play(); $("tap").hidden = true; };
 

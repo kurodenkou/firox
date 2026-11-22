@@ -46,6 +46,8 @@ motion).
     Ctrl+Alt+Shift+Z  release the mouse     Ctrl+Alt+Shift+M  capture on click on/off
     Ctrl+Alt+Shift+F  full screen           Ctrl+Alt+Shift+Q  stop
     Ctrl+Alt+Shift+U  unlock it (its password)  Ctrl+Alt+Shift+W  wake its screen
+    Ctrl+Alt+Shift+Up / Down  picture quality: Speed, Balanced, Quality, Best
+                      (the bitrate, changed while streaming; remembered)
 
 Game controllers plugged into this computer (Xbox, PlayStation, Switch Pro,
 8BitDo and most others, through SDL's controller database) work on the other
@@ -71,7 +73,13 @@ the first time). It pairs with the same PIN, gets the picture and sound over
 WebRTC (UDP ports 48302-48399), and sends its keyboard, mouse, touches and
 game controllers back. Local network only.
 
-Settings: ~/.config/firox/stream.json (host: on/off, bitrate, sound, paired
+Picture quality: on the computer being streamed, its setting (Speed,
+Balanced, Quality, Best) chooses the encoder's effort and the starting
+bitrate (12, 30, 50 or 80 Mbit/s); a viewer's setting, or
+Ctrl+Alt+Shift+Up/Down while streaming, changes the bitrate for everyone
+watching.
+
+Settings: ~/.config/firox/stream.json (host: on/off, picture quality, sound, paired
 computers) and ~/.config/firox/stream-hosts.json (the computers this one has
 streamed). Host log: ~/.local/state/firox/stream.log
 """
@@ -147,7 +155,8 @@ def _save(path, data):
 
 
 def load_conf():
-    return _load(CONF, {"enabled": False, "port": PORT, "bitrate": 20000, "fps": 60,
+    return _load(CONF, {"enabled": False, "port": PORT, "quality": "balanced", "view_quality": "balanced",
+                        "fps": 60,
                         "audio": True, "encoder": "auto", "clients": {},
                         "web": False, "web_port": WEB_PORT, "ssh_keys": False})
 
@@ -745,7 +754,7 @@ class WebViewer(Channel):
     which this runs like Channel runs an app's connection (one thread)."""
 
     VIDEO_PT, AUDIO_PT = 96, 97
-    INPUT = set("IGFWUQ")                   # what a page may send once it's watching
+    INPUT = set("IGFWUQZ")                   # what a page may send once it's watching
 
     def __init__(self, sock, rest=b""):
         super().__init__(sock, None, self._closed)
@@ -1320,14 +1329,35 @@ class Injector:
             self.rel_mouse.close()
 
 
-def video_encoders(kbps, fps):
+# Picture quality: (id, name, kbit/s, effort). The bitrate can change while
+# streaming (each viewer's Ctrl+Alt+Shift+Up/Down, or its setting); the
+# encoder's effort is chosen when the stream starts, from this computer's
+# setting. Effort: VA-API/QSV target-usage (1 best .. 7 fastest), x264's
+# speed preset, OpenH264's complexity.
+QUALITIES = [
+    ("speed", "Speed", 12000, {"target-usage": 7, "x264": "ultrafast", "openh264": "low"}),
+    ("balanced", "Balanced", 30000, {"target-usage": 4, "x264": "veryfast", "openh264": "medium"}),
+    ("quality", "Quality", 50000, {"target-usage": 2, "x264": "faster", "openh264": "high"}),
+    ("best", "Best", 80000, {"target-usage": 1, "x264": "fast", "openh264": "high"}),
+]
+QUALITY_IDS = [q[0] for q in QUALITIES]
+
+
+def quality_of(name):
+    """(id, name, kbit/s, effort) for a quality id; Balanced if unknown."""
+    return next((q for q in QUALITIES if q[0] == name), QUALITIES[1])
+
+
+def video_encoders(kbps, fps, quality="balanced"):
     """H.264 encoders to try, best first: (element, [(factory, properties)]).
     Hardware encoders only appear when the graphics card has one."""
+    effort = quality_of(quality)[3]
     gop = fps * 5
     nv12 = ("capsfilter", {"caps": "video/x-raw,format=NV12"})
     i420 = ("capsfilter", {"caps": "video/x-raw,format=I420"})
     va = [("vapostproc", {}), ("capsfilter", {"caps": "video/x-raw(memory:VAMemory),format=NV12"})]
-    va_props = {"bitrate": kbps, "key-int-max": gop, "b-frames": 0, "rate-control": "cbr", "target-usage": 6}
+    va_props = {"bitrate": kbps, "key-int-max": gop, "b-frames": 0, "rate-control": "cbr",
+                "target-usage": effort["target-usage"]}
     return [
         ("nvh264enc", [("videoconvert", {}), nv12,
                        ("nvh264enc", {"bitrate": kbps, "gop-size": gop, "bframes": 0, "rc-mode": "cbr",
@@ -1336,12 +1366,13 @@ def video_encoders(kbps, fps):
         ("vah264enc", va + [("vah264enc", va_props)]),
         ("qsvh264enc", [("videoconvert", {}), nv12,
                         ("qsvh264enc", {"bitrate": kbps, "gop-size": gop, "b-frames": 0,
-                                        "rate-control": "cbr", "low-latency": True})]),
+                                        "rate-control": "cbr", "low-latency": True,
+                                        "target-usage": effort["target-usage"]})]),
         ("x264enc", [("videoconvert", {"n-threads": 0}), i420,
-                     ("x264enc", {"tune": "zerolatency", "speed-preset": "superfast", "bitrate": kbps,
+                     ("x264enc", {"tune": "zerolatency", "speed-preset": effort["x264"], "bitrate": kbps,
                                   "key-int-max": gop, "threads": 0})]),
         ("openh264enc", [("videoconvert", {"n-threads": 0}), i420,
-                         ("openh264enc", {"bitrate": kbps * 1000, "gop-size": gop, "complexity": "low",
+                         ("openh264enc", {"bitrate": kbps * 1000, "gop-size": gop, "complexity": effort["openh264"],
                                           "rate-control": "bitrate"})]),
     ]
 
@@ -1409,11 +1440,13 @@ class Capture:
         Gst = self.Gst
         wanted = self.conf.get("encoder") or "auto"
         key = (wanted, Capture._gpu_buffers)
+        quality = self.conf.get("quality") or "balanced"
         if key in Capture._encoder:
-            return Capture._encoder[key]
+            name = Capture._encoder[key]
+            return name, dict(video_encoders(kbps, fps, quality))[name]
         # Through OpenGL (NVIDIA), VA-API is another chip's, or none: on the
         # first NVIDIA computer it garbled the colours and stopped after a frame
-        candidates = [c for c in video_encoders(kbps, fps)
+        candidates = [c for c in video_encoders(kbps, fps, quality)
                       if wanted in ("auto", c[0]) and Gst.ElementFactory.find(c[0])
                       and not (Capture._gpu_buffers and wanted == "auto" and c[0].startswith("va"))]
         for name, elements in candidates:
@@ -1431,7 +1464,7 @@ class Capture:
             msg = pipeline.get_bus().timed_pop_filtered(10 * Gst.SECOND, Gst.MessageType.EOS | Gst.MessageType.ERROR)
             pipeline.set_state(Gst.State.NULL)
             if msg is not None and msg.type == Gst.MessageType.EOS:
-                Capture._encoder[key] = (name, elements)
+                Capture._encoder[key] = name
                 return name, elements
             log(f"{name}: " + (msg.parse_error()[0].message if msg is not None else "no picture after 10 seconds"))
         raise RuntimeError("no H.264 encoder works on this computer" if wanted == "auto"
@@ -1439,7 +1472,8 @@ class Capture:
 
     def start_video(self):
         Gst = self.Gst
-        kbps, fps = int(self.conf.get("bitrate") or 20000), int(self.conf.get("fps") or 60)
+        fps = int(self.conf.get("fps") or 60)
+        kbps = int(self.conf.get("start_kbps") or quality_of(self.conf.get("quality"))[2])
         name, elements = self.pick_encoder(kbps, fps)
         self.video = self._video_pipeline(elements, fps)
         self.video.set_state(Gst.State.PLAYING)
@@ -1450,6 +1484,24 @@ class Capture:
         self.encoder = name
         log(f"video: {name}, {kbps} kbit/s")
         return name
+
+    def set_bitrate(self, kbps):
+        """Change the picture's bitrate while streaming (kbit/s)."""
+        if self.video is None:
+            return False
+        it = self.video.iterate_elements()
+        done = False
+        while True:
+            ok, el = it.next()
+            if ok != self.Gst.IteratorResult.OK:
+                break
+            name = el.get_factory().get_name() if el.get_factory() else ""
+            if name in dict((e[0], 1) for e in video_encoders(kbps, 60)) and el.find_property("bitrate"):
+                el.set_property("bitrate", kbps * 1000 if name == "openh264enc" else kbps)
+                done = True
+        if done:
+            log(f"video: now {kbps} kbit/s")
+        return done
 
     def _video_pipeline(self, encoder, fps):
         Gst = self.Gst
@@ -1810,6 +1862,7 @@ class Session:
         self.locked = False
         self.ended = False
         self.output = None
+        self.quality = None                 # the picture quality now (viewers can change it)
 
     @property
     def closed(self):                       # (open_capture gives up when it is)
@@ -1829,6 +1882,7 @@ class Session:
     def start(self, conf):
         import firox_monitors
         self.conf = conf
+        self.quality = quality_of(conf.get("quality"))[0]
         self.locked = screen_locked()
         keep_awake(True)
         wake_screen()
@@ -1867,6 +1921,7 @@ class Session:
         # The newcomer's decoder needs the stream headers and a key frame
         for kind, caps in (self.capture.caps if self.capture else {}).items():
             channel.send("K", {"kind": kind, "caps": caps})
+        channel.send("z", {"quality": self.quality})
         if self.capture:
             self.capture.request_key()
         if others:
@@ -1959,6 +2014,18 @@ class Session:
                 self.capture.request_key()
         elif kind == "W":
             threading.Thread(target=wake_screen, daemon=True).start()
+        elif kind == "Z":
+            # A viewer's picture quality: everyone watching shares one picture
+            try:
+                wanted = str(json.loads(payload).get("quality", ""))
+            except (ValueError, AttributeError):
+                wanted = ""
+            if wanted in QUALITY_IDS and wanted != self.quality and self.capture is not None:
+                if self.capture.set_bitrate(quality_of(wanted)[2]):
+                    self.quality = wanted
+                    self.conf["start_kbps"] = quality_of(wanted)[2]     # (if the capture restarts)
+                    log(f"{client} set the picture quality to {quality_of(wanted)[1]}")
+            self.broadcast("z", {"quality": self.quality, "by": client})
         elif kind == "U":
             try:
                 password = str(json.loads(payload).get("password", ""))
@@ -3198,6 +3265,8 @@ def client_ui(address=None):
             self.stopping = False
             self.ended = False
             self.pads = None                    # game controllers (Pads), once connected
+            self.quality = None                 # the picture quality the host is sending
+            self.wanted_quality = quality_of(load_conf().get("view_quality"))[0]
             self.overlay = Gtk.Overlay()
             self.add(self.overlay)
             self.area = Gtk.EventBox(can_focus=True)
@@ -3205,7 +3274,8 @@ def client_ui(address=None):
             css.load_from_data(b"eventbox { background-color: black; }")
             self.area.get_style_context().add_provider(css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
             self.overlay.add(self.area)
-            hint = "Ctrl+Alt+Shift+F full screen · Ctrl+Alt+Shift+Q stop"
+            hint = ("Ctrl+Alt+Shift+F full screen · Ctrl+Alt+Shift+↑/↓ picture quality · "
+                    "Ctrl+Alt+Shift+Q stop")
             if info.get("input"):
                 hint = "Click to capture the mouse, Ctrl+Alt+Shift+Z to release it · " + hint
             if not info.get("input"):
@@ -3353,8 +3423,37 @@ def client_ui(address=None):
                 msg = json.loads(payload)
                 self.pads.rumble(int(msg.get("p", 0)), int(msg.get("lo", 0)) & 0xFFFF,
                                  int(msg.get("hi", 0)) & 0xFFFF, max(0, int(msg.get("ms", 0))))
+            elif kind == "z":
+                msg = json.loads(payload)
+                GLib.idle_add(self.quality_now, str(msg.get("quality", "")), str(msg.get("by") or ""))
             elif kind == "E":
                 self.channel.close(json.loads(payload).get("error", ""))
+
+        def quality_now(self, quality, by):
+            """The host says which picture quality it's sending."""
+            first = self.quality is None
+            self.quality = quality if quality in QUALITY_IDS else "balanced"
+            if first and self.wanted_quality != self.quality:
+                self.channel.send("Z", {"quality": self.wanted_quality})     # this computer's setting
+            elif not first:
+                q = quality_of(self.quality)
+                self.show_hint(f"Picture quality: {q[1]} ({q[2] // 1000} Mbit/s)" +
+                               (f", set by {by}" if by and by != computer_name() else ""), 3)
+            return False
+
+        def step_quality(self, step):
+            current = QUALITY_IDS.index(self.quality or self.wanted_quality)
+            target = QUALITY_IDS[max(0, min(len(QUALITY_IDS) - 1, current + step))]
+            q = quality_of(target)
+            if target == (self.quality or self.wanted_quality):
+                self.show_hint(f"Picture quality: {q[1]} (the {'highest' if step > 0 else 'lowest'})", 2)
+                return
+            self.wanted_quality = target
+            conf = load_conf()
+            conf["view_quality"] = target           # remembered for next time
+            save_conf(conf)
+            self.channel.send("Z", {"quality": target})
+            self.show_hint(f"Picture quality: {q[1]} ({q[2] // 1000} Mbit/s)…", 2)
 
         def set_video_size(self, w, h):
             self.vsize = (w, h)
@@ -3589,6 +3688,9 @@ def client_ui(address=None):
                     self.show_hint("Clicking captures the mouse" if self.capture_on_click else
                                    "Clicking no longer captures the mouse (Ctrl+Alt+Shift+M turns it back on)", 4)
                     return True
+                if key in (Gdk.KEY_Up, Gdk.KEY_Down):
+                    self.step_quality(1 if key == Gdk.KEY_Up else -1)
+                    return True
                 if key == Gdk.KEY_f:
                     self.release_all()
                     (self.unfullscreen if self.fullscreened else self.fullscreen)()
@@ -3654,12 +3756,36 @@ def client_ui(address=None):
             box.add(row)
             self.status = Gtk.Label(xalign=0, wrap=True)
             box.add(self.status)
+            qrow = Gtk.Box(spacing=8)
+            qrow.add(Gtk.Label(label="Picture quality:", xalign=0))
+            self.view_quality = Gtk.ComboBoxText()
+            for qid, qname, kbps, _e in QUALITIES:
+                self.view_quality.append(qid, f"{qname} ({kbps // 1000} Mbit/s)")
+            self.view_quality.set_active_id(quality_of(load_conf().get("view_quality"))[0])
+            self.view_quality.set_tooltip_text("For the computers you stream from here. Ctrl+Alt+Shift+Up/Down "
+                                               "changes it while streaming. Higher needs a faster network: "
+                                               "a wired one for Best.")
+            self.view_quality.connect("changed", self.on_view_quality)
+            qrow.add(self.view_quality)
+            box.add(qrow)
             box.add(Gtk.Separator(margin_top=6, margin_bottom=6))
             self.allow = Gtk.CheckButton(label="Let other computers stream this one")
             self.allow.set_active(bool(load_conf().get("enabled")) and not policy_forbids())
             self.allow.set_sensitive(not policy_forbids())
             self.allow.connect("toggled", self.on_allow)
             box.add(self.allow)
+            hrow = Gtk.Box(spacing=8, margin_start=24)
+            hrow.add(Gtk.Label(label="Picture quality when others stream it:", xalign=0))
+            self.host_quality = Gtk.ComboBoxText()
+            for qid, qname, kbps, _e in QUALITIES:
+                self.host_quality.append(qid, qname)
+            self.host_quality.set_active_id(quality_of(load_conf().get("quality"))[0])
+            self.host_quality.set_tooltip_text("How hard this computer works on the picture, and where it starts: "
+                                               "Speed is lightest, Best sharpest. Each viewer can still raise or "
+                                               "lower the bitrate. Takes effect at the next stream.")
+            self.host_quality.connect("changed", self.on_host_quality)
+            hrow.add(self.host_quality)
+            box.add(hrow)
             self.web = Gtk.CheckButton(label="Let web browsers stream it too (phones, tablets, any computer)")
             self.web.set_active(bool(load_conf().get("web")))
             self.web.set_margin_start(24)
@@ -3713,6 +3839,7 @@ def client_ui(address=None):
             n = len(conf.get("clients", {}))
             self.web.set_sensitive(bool(conf.get("enabled")) and not policy_forbids())
             self.sshkeys.set_sensitive(bool(conf.get("enabled")) and not policy_forbids())
+            self.host_quality.set_sensitive(bool(conf.get("enabled")) and not policy_forbids())
             if policy_forbids():
                 self.allow_note.set_text("Your organization's policy doesn't allow other computers to stream "
                                          "this one.")
@@ -3749,6 +3876,16 @@ def client_ui(address=None):
                 self.status.set_text("The firewall still blocks the ports web browsers need (TCP "
                                      f"{WEB_PORT}, UDP {ICE_PORTS[0]}–{ICE_PORTS[1]}). Untick and tick the "
                                      "box to try again.")
+
+        def on_view_quality(self, combo):
+            conf = load_conf()
+            conf["view_quality"] = combo.get_active_id()
+            save_conf(conf)
+
+        def on_host_quality(self, combo):
+            conf = load_conf()
+            conf["quality"] = combo.get_active_id()
+            save_conf(conf)
 
         def on_sshkeys(self, button):
             conf = load_conf()
