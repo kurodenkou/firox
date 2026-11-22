@@ -1469,12 +1469,14 @@ class Injector:
 # streaming (each viewer's Ctrl+Alt+Shift+Up/Down, or its setting); the
 # encoder's effort is chosen when the stream starts, from this computer's
 # setting. Effort: VA-API/QSV target-usage (1 best .. 7 fastest), x264's
-# speed preset, OpenH264's complexity, SVT-AV1's preset (0 best .. 13).
+# speed preset, OpenH264's complexity, SVT-AV1's preset (0 best .. 13),
+# NVENC AV1's preset (p1 fastest .. p7).
 QUALITIES = [
-    ("speed", "Speed", 12000, {"target-usage": 7, "x264": "ultrafast", "openh264": "low", "svt": 12}),
-    ("balanced", "Balanced", 30000, {"target-usage": 4, "x264": "veryfast", "openh264": "medium", "svt": 11}),
-    ("quality", "Quality", 50000, {"target-usage": 2, "x264": "faster", "openh264": "high", "svt": 10}),
-    ("best", "Best", 80000, {"target-usage": 1, "x264": "fast", "openh264": "high", "svt": 9}),
+    ("speed", "Speed", 12000, {"target-usage": 7, "x264": "ultrafast", "openh264": "low", "svt": 12, "nv": "p1"}),
+    ("balanced", "Balanced", 30000, {"target-usage": 4, "x264": "veryfast", "openh264": "medium", "svt": 11,
+                                     "nv": "p3"}),
+    ("quality", "Quality", 50000, {"target-usage": 2, "x264": "faster", "openh264": "high", "svt": 10, "nv": "p4"}),
+    ("best", "Best", 80000, {"target-usage": 1, "x264": "fast", "openh264": "high", "svt": 9, "nv": "p5"}),
 ]
 QUALITY_IDS = [q[0] for q in QUALITIES]
 
@@ -1506,7 +1508,7 @@ def video_encoders(kbps, fps, quality="balanced", codec="h264"):
     if codec == "h265":
         return h265_encoders(kbps, gop, effort)
     if codec == "av1":
-        return av1_encoders(kbps, gop, effort)
+        return av1_encoders(kbps, gop, effort, fps)
     nv12 = ("capsfilter", {"caps": "video/x-raw,format=NV12"})
     i420 = ("capsfilter", {"caps": "video/x-raw,format=I420"})
     va = [("vapostproc", {}), ("capsfilter", {"caps": "video/x-raw(memory:VAMemory),format=NV12"})]
@@ -1556,7 +1558,7 @@ def h265_encoders(kbps, gop, effort):
     ]
 
 
-def av1_encoders(kbps, gop, effort):
+def av1_encoders(kbps, gop, effort, fps=60):
     """AV1: sharper again than H.265, above all for text and flat colours (it
     has tools for screen content). The graphics card's encoders (NVIDIA RTX
     40, AMD RX 7000, Intel Arc and newer); SVT-AV1 on the processor only when
@@ -1567,9 +1569,14 @@ def av1_encoders(kbps, gop, effort):
     va = [("vapostproc", {}), ("capsfilter", {"caps": "video/x-raw(memory:VAMemory),format=NV12"})]
     va_props = {"bitrate": kbps, "key-int-max": gop, "rate-control": "cbr", "target-usage": effort["target-usage"]}
     return [
+        # (GStreamer's NVENC encoder: rc-mode, not rate-control. Constant
+        # bitrate, low-latency tuning with room for about four frames:
+        # ultra-low-latency allows one, which smears key frames and motion.
+        # Spatial AQ: fewer blocks in dark, flat areas, as in games.)
         ("nvav1enc", [("videoconvert", {}), nv12,
-                      ("nvav1enc", {"bitrate": kbps, "gop-size": gop, "rate-control": "cbr",
-                                    "tune": "ultra-low-latency", "zero-reorder-delay": True})]),
+                      ("nvav1enc", {"bitrate": kbps, "gop-size": gop, "rc-mode": "cbr", "preset": effort["nv"],
+                                    "tune": "low-latency", "zerolatency": True, "bframes": 0,
+                                    "vbv-buffer-size": max(kbps * 4 // fps, 1), "spatial-aq": True})]),
         ("vaav1lpenc", va + [("vaav1lpenc", va_props)]),
         ("vaav1enc", va + [("vaav1enc", va_props)]),
         ("qsvav1enc", [("videoconvert", {}), nv12,
