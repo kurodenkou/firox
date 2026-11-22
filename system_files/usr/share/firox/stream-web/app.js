@@ -11,6 +11,18 @@ const $ = (id) => document.getElementById(id);
 const TOKEN = "firox-stream-token", NAME = "firox-stream-name", QUALITY = "firox-stream-quality";
 
 let ws = null, pc = null, info = {}, streaming = false, pairing = false, hostName = "", qualityKnown = false;
+// The picture comes on one of two tracks, H.264 or AV1 (when this browser
+// plays it): the host says which the stream is in ("track")
+let videoTracks = [], audioTrack = null, wantedCodec = "h264";
+
+// What this browser can play over WebRTC, best first (told to the host)
+function playableCodecs() {
+    try {
+        const caps = RTCRtpReceiver.getCapabilities("video");
+        if (caps && caps.codecs.some((c) => c.mimeType.toLowerCase() === "video/av1")) return ["av1", "h264"];
+    } catch (e) { /* older browsers */ }
+    return ["h264"];
+}
 
 function store(key, value) {
     try {
@@ -81,7 +93,7 @@ function connect(name) {
     say("Connecting…");
     $("connect").disabled = true;
     ws = new WebSocket(`wss://${location.host}/ws`);
-    ws.onopen = () => send("H", { name, token: store(TOKEN) || "", v: 1, web: true });
+    ws.onopen = () => send("H", { name, token: store(TOKEN) || "", v: 1, web: true, codecs: playableCodecs() });
     ws.onmessage = (ev) => {
         let msg;
         try { msg = JSON.parse(ev.data); } catch (e) { return; }
@@ -142,6 +154,10 @@ async function handle(k, d, name) {
     case "offer":
         await answer(d.sdp);
         break;
+    case "track":                               // the picture is on this track now
+        wantedCodec = d.codec || "h264";
+        showTracks();
+        break;
     case "ice":
         if (pc && d.c) await pc.addIceCandidate({ candidate: d.c, sdpMLineIndex: d.m }).catch(() => {});
         break;
@@ -181,15 +197,15 @@ async function handle(k, d, name) {
 async function answer(sdp) {
     if (pc) pc.close();
     pc = new RTCPeerConnection({ iceServers: [], bundlePolicy: "max-bundle" });
-    const stream = new MediaStream();
-    const video = $("video");
-    video.srcObject = stream;
+    videoTracks = [];
+    audioTrack = null;
     pc.ontrack = (ev) => {
         // as little waiting as the browser allows: this is a live screen
         try { ev.receiver.jitterBufferTarget = 0; } catch (e) { /* older browsers */ }
         try { ev.receiver.playoutDelayHint = 0; } catch (e) { /* only Chrome */ }
-        stream.addTrack(ev.track);
-        play();
+        if (ev.track.kind === "audio") audioTrack = ev.track;
+        else videoTracks.push({ transceiver: ev.transceiver, track: ev.track });
+        showTracks();
     };
     pc.onicecandidate = (ev) => {
         if (ev.candidate && ev.candidate.candidate)
@@ -205,6 +221,29 @@ async function answer(sdp) {
     const ans = await pc.createAnswer();
     await pc.setLocalDescription(ans);
     send("answer", { sdp: pc.localDescription.sdp });
+    showTracks();
+}
+
+// Which of the picture's tracks this is: the codec it was offered with
+function trackCodec(transceiver) {
+    try {
+        const codecs = transceiver.receiver.getParameters().codecs;
+        if (codecs.length && codecs[0].mimeType.toLowerCase() === "video/av1") return "av1";
+    } catch (e) { /* older browsers: H.264 only */ }
+    return "h264";
+}
+
+// The sound, and the picture's track the stream is in now
+function showTracks() {
+    const video = $("video");
+    // (known once the answer is set: showTracks runs again then)
+    const pick = (codec) => videoTracks.find((v) => trackCodec(v.transceiver) === codec);
+    const track = (pick(wantedCodec) || pick("h264") || videoTracks[0] || {}).track;
+    const now = video.srcObject ? video.srcObject.getTracks() : [];
+    const want = [track, audioTrack].filter(Boolean);
+    if (want.length === now.length && want.every((t) => now.includes(t))) return;
+    video.srcObject = new MediaStream(want);
+    play();
 }
 
 function play() {
@@ -234,6 +273,9 @@ function begin() {
 function stop() {
     streaming = false;
     if (pc) { pc.close(); pc = null; }
+    videoTracks = [];
+    audioTrack = null;
+    wantedCodec = "h264";
     ws = null;
     qualityKnown = false;
     if (document.pointerLockElement) document.exitPointerLock();

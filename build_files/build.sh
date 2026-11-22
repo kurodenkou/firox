@@ -119,7 +119,8 @@ PACKAGES=(
     rsync                        # Backup and Restore (firox-backup)
     syncthing                    # Sync between Firox computers (firox-sync)
     # Firox Stream (firox-stream): stream another computer's screen and sound
-    gstreamer1-plugins-bad       # full build (fedora-multimedia): VA-API/NVENC/QSV H.264 encoders, h264parse
+    gstreamer1-plugins-bad       # full build (fedora-multimedia): VA-API/NVENC/QSV H.264, H.265 and AV1 encoders, SVT-AV1, parsers
+    gstreamer1-plugin-dav1d      # dav1ddec: playing AV1 streams (when the graphics card can't)
     gstreamer1-plugins-ugly      # x264enc, when the graphics card can't encode
     gstreamer1-plugins-good-gtk  # gtksink/gtkglsink: the picture in a GTK window
     pipewire-gstreamer           # pipewiresrc: the shared screen

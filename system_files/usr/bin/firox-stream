@@ -73,9 +73,11 @@ the first time). It pairs with the same PIN, gets the picture and sound over
 WebRTC (UDP ports 48302-48399), and sends its keyboard, mouse, touches and
 game controllers back. Local network only.
 
-Video format: H.265 (sharper at the same bitrate) when the host's graphics
-card can encode it and everyone watching can play it; H.264 otherwise.
-A web browser joining switches everyone to H.264, and back when it leaves.
+Video format: the best of AV1, H.265 and H.264 (each sharper than the next
+at the same bitrate) that the host's graphics card can encode and everyone
+watching can play. Web browsers play AV1 (most) or H.264; phones H.264.
+Someone joining who can't play it switches everyone, and back when they
+leave.
 
 Picture quality: on the computer being streamed, its setting (Speed,
 Balanced, Quality, Best) chooses the encoder's effort and the starting
@@ -752,17 +754,101 @@ class WebHandshake:
         self.sock.close()
 
 
+def leb128(n):
+    out = bytearray()
+    while True:
+        byte, n = n & 0x7F, n >> 7
+        out.append(byte | (0x80 if n else 0))
+        if not n:
+            return bytes(out)
+
+
+class AV1Packetizer:
+    """AV1 into RTP packets, as the AV1 RTP payload format says (GStreamer's
+    own, rtpav1pay, is in the Rust plugins, which Fedora doesn't ship). One
+    temporal unit (a frame, as av1parse gives it: OBUs with their sizes) in,
+    packets of at most mtu bytes out; the last has the marker bit."""
+
+    SEQUENCE_HEADER, TEMPORAL_DELIMITER, TILE_LIST, PADDING = 1, 2, 8, 15
+
+    def __init__(self, pt, mtu=1200):
+        self.pt, self.mtu = pt, mtu
+        self.seq = secrets.randbelow(1 << 16)
+        self.ssrc = secrets.randbelow(1 << 32)
+
+    def obus(self, tu):
+        """The OBUs worth sending, without their size fields (the payload
+        format's own lengths take their place)."""
+        out, i = [], 0
+        while i < len(tu):
+            header = tu[i]
+            kind, ext, has_size = (header >> 3) & 15, (header >> 2) & 1, (header >> 1) & 1
+            j = i + 1 + ext
+            if has_size:
+                size = shift = 0
+                while j < len(tu):
+                    b = tu[j]
+                    j += 1
+                    size |= (b & 0x7F) << shift
+                    shift += 7
+                    if b < 0x80:
+                        break
+            else:
+                size = len(tu) - j
+            if kind not in (self.TEMPORAL_DELIMITER, self.TILE_LIST, self.PADDING):
+                out.append((kind, bytes([header & ~0x02]) + tu[i + 1:i + 1 + ext] + tu[j:j + size]))
+            i = j + size
+        return out
+
+    def packets(self, tu, timestamp):
+        obus = self.obus(tu)
+        new_sequence = any(kind == self.SEQUENCE_HEADER for kind, _ in obus)
+        room = self.mtu - 12 - 1                # (the RTP header, the aggregation header)
+        payloads, body, at, off, first_cont = [], bytearray(), 0, 0, False
+        while at < len(obus):
+            data = obus[at][1]
+            left, free = len(data) - off, room - len(body)
+            n = min(left, free - 1)
+            while n > 0 and len(leb128(n)) + n > free:
+                n -= 1
+            if n <= 0:                          # full: the next packet
+                payloads.append((first_cont, False, bytes(body)))
+                body, first_cont = bytearray(), False
+                continue
+            body += leb128(n) + data[off:off + n]
+            if n < left:                        # the rest of this OBU in the next packet
+                off += n
+                payloads.append((first_cont, True, bytes(body)))
+                body, first_cont = bytearray(), True
+            else:
+                at, off = at + 1, 0
+        if body or not payloads:
+            payloads.append((first_cont, False, bytes(body)))
+        out = []
+        for k, (z, y, body) in enumerate(payloads):
+            last = k == len(payloads) - 1
+            aggregation = (z << 7) | (y << 6) | ((new_sequence and k == 0) << 3)
+            out.append(struct.pack(">BBHII", 0x80, (last << 7) | self.pt, self.seq, timestamp & 0xFFFFFFFF,
+                                   self.ssrc) + bytes([aggregation]) + body)
+            self.seq = (self.seq + 1) & 0xFFFF
+        return out
+
+
 class WebViewer(Channel):
     """A web browser watching. To Session it's a Channel like an app's:
     send() takes the same messages. The picture and sound go into a WebRTC
     sender (webrtcbin); everything else is JSON on the page's WebSocket,
-    which this runs like Channel runs an app's connection (one thread)."""
+    which this runs like Channel runs an app's connection (one thread).
 
-    VIDEO_PT, AUDIO_PT = 96, 97
-    codecs = ["h264"]                       # (browsers' WebRTC: H.264; the stream switches for them)
+    The picture: H.264 (every browser), and AV1 too when the page says the
+    browser plays it, each on its own track, offered once; the page shows
+    the one the stream is in ("track", by codec: browsers don't all keep the
+    stream ids)."""
+
+    VIDEO_PT, AUDIO_PT, AV1_PT = 96, 97, 98
     INPUT = set("IGFWUQZ")                   # what a page may send once it's watching
 
-    def __init__(self, sock, rest=b""):
+    def __init__(self, sock, rest=b"", codecs=None):
         super().__init__(sock, None, self._closed)
         import gi
         gi.require_version("Gst", "1.0")
@@ -779,6 +865,11 @@ class WebViewer(Channel):
         self.offered = False
         self.caps_set = set()
         self.pipeline = None
+        # What it can be sent: what the browser plays, of these (the stream
+        # switches for it, as for an app)
+        self.codecs = [c for c in ("av1", "h264") if c in (codecs or ()) or c == "h264"]
+        self.vcodec = None                  # the codec the stream is in now
+        self.av1 = AV1Packetizer(self.AV1_PT) if "av1" in self.codecs else None
         try:
             self._build()
         except (RuntimeError, AttributeError) as e:
@@ -804,7 +895,7 @@ class WebViewer(Channel):
         rtc.connect("notify::connection-state", self._on_connection_state)
         sendonly = GstWebRTC.WebRTCRTPTransceiverDirection.SENDONLY
         self.src = {}
-        for kind, rtp, pt, pay in (
+        tracks = [
                 # (no profile-level-id: it's whatever the encoder makes, and
                 # browsers decode any profile they're sent)
                 ("video", "application/x-rtp,media=video,encoding-name=H264,clock-rate=90000,"
@@ -812,7 +903,12 @@ class WebViewer(Channel):
                  ("rtph264pay", {"config-interval": -1, "aggregate-mode": "zero-latency", "mtu": 1200})),
                 ("audio", "application/x-rtp,media=audio,encoding-name=OPUS,clock-rate=48000,"
                           "encoding-params=(string)2,stereo=(string)1,sprop-stereo=(string)1", self.AUDIO_PT,
-                 ("rtpopuspay", {"mtu": 1200}))):
+                 ("rtpopuspay", {"mtu": 1200}))]
+        if self.av1 is not None:
+            # (packets made here: AV1Packetizer)
+            tracks.append(("av1", "application/x-rtp,media=video,encoding-name=AV1,clock-rate=90000",
+                           self.AV1_PT, None))
+        for kind, rtp, pt, pay in tracks:
             rtp_caps = Gst.Caps.from_string(f"{rtp},payload={pt}")
             # The picture is stamped as it arrives. The sound is stamped by
             # its length instead (send()): stamped on arrival, packets that
@@ -820,15 +916,14 @@ class WebViewer(Channel):
             # fills the gaps with made-up sound (crackling)
             src = make_element("appsrc", {"is-live": True, "format": "time", "do-timestamp": kind == "video",
                                           "max-bytes": 8 << 20, "block": False}, kind)
-            payloader = make_element(pay[0], dict(pay[1], pt=pt))
             capsf = make_element("capsfilter", {})
             capsf.set_property("caps", rtp_caps)
-            queue_ = make_element("queue", {"max-size-time": 0, "max-size-bytes": 0, "max-size-buffers": 200})
-            for el in (src, payloader, capsf, queue_):
-                p.add(el)
-            src.link(payloader)
-            payloader.link(capsf)
-            capsf.link(queue_)
+            queue_ = make_element("queue", {"max-size-time": 0, "max-size-bytes": 0, "max-size-buffers": 400})
+            if pay is None:
+                src.set_property("caps", rtp_caps)
+                chain(p, [src, capsf, queue_])
+            else:
+                chain(p, [src, make_element(pay[0], dict(pay[1], pt=pt)), capsf, queue_])
             # Its own sender, offered with these codecs: the offer needn't
             # wait for the first frames (they only flow once it's connected)
             pad = rtc.request_pad_simple("sink_%u")
@@ -841,7 +936,9 @@ class WebViewer(Channel):
             sender.set_property("codec-preferences", rtp_caps)
             self.src[kind] = src
         # The browser asks for a key frame (a new decoder, or a lost packet)
-        self.src["video"].get_static_pad("src").add_probe(Gst.PadProbeType.EVENT_UPSTREAM, self._on_upstream)
+        for kind in ("video", "av1"):
+            if kind in self.src:
+                self.src[kind].get_static_pad("src").add_probe(Gst.PadProbeType.EVENT_UPSTREAM, self._on_upstream)
         p.get_bus().set_sync_handler(self._on_bus)
         p.set_state(Gst.State.PLAYING)
 
@@ -912,8 +1009,11 @@ class WebViewer(Channel):
     # -- what Session sends
     def send(self, kind, payload=b""):
         if kind in ("V", "A"):
-            src = self.src["video" if kind == "V" else "audio"]
+            src = self.src["audio" if kind == "A" else "av1" if self.vcodec == "av1" else "video"]
             if not self.connected or self.closed or src.get_name() not in self.caps_set:
+                return True
+            if src.get_name() == "av1":
+                self._push_av1(src, bytes(payload))
                 return True
             buf = self.Gst.Buffer.new_wrapped(bytes(payload))
             if kind == "A":
@@ -922,10 +1022,9 @@ class WebViewer(Channel):
             return True
         if kind == "K":
             info = payload if isinstance(payload, dict) else json.loads(payload)
+            if info.get("kind") == "video":
+                return self._video_caps(str(info.get("caps", "")))
             src = self.src.get(info.get("kind"))
-            if info.get("kind") == "video" and not str(info.get("caps", "")).startswith("video/x-h264"):
-                self.caps_set.discard("video")      # (until the stream is H.264 again)
-                return True
             if src is not None:
                 src.set_property("caps", self.Gst.Caps.from_string(info["caps"]))
                 self.caps_set.add(src.get_name())
@@ -936,6 +1035,34 @@ class WebViewer(Channel):
             except ValueError:
                 payload = {}
         return self._json(kind, payload)
+
+    def _video_caps(self, caps):
+        """The stream's new video caps: which track it goes out on now (none,
+        until the stream is in a codec this browser plays)."""
+        codec = codec_of_caps(caps)
+        self.caps_set -= {"video", "av1"}
+        if codec == "h264":
+            self.src["video"].set_property("caps", self.Gst.Caps.from_string(caps))
+            self.caps_set.add("video")
+        elif codec == "av1" and "av1" in self.src:
+            self.caps_set.add("av1")
+        else:
+            codec = None
+        if codec and codec != self.vcodec:
+            self._json("track", {"codec": codec})
+        self.vcodec = codec
+        return True
+
+    def _push_av1(self, src, tu):
+        Gst = self.Gst
+        clock = self.pipeline.get_clock() if self.pipeline else None
+        now = clock.get_time() - self.pipeline.get_base_time() if clock else 0
+        packets = Gst.BufferList.new_sized(len(tu) // 1100 + 2)
+        for packet in self.av1.packets(tu, now * 9 // 100000):     # (90 kHz)
+            buf = Gst.Buffer.new_wrapped(packet)
+            buf.pts = now
+            packets.insert(-1, buf)
+        src.emit("push-buffer-list", packets)
 
     def _stamp_audio(self, buf, packet):
         """Each Opus packet starts where the last one ended, so the browser
@@ -1342,12 +1469,12 @@ class Injector:
 # streaming (each viewer's Ctrl+Alt+Shift+Up/Down, or its setting); the
 # encoder's effort is chosen when the stream starts, from this computer's
 # setting. Effort: VA-API/QSV target-usage (1 best .. 7 fastest), x264's
-# speed preset, OpenH264's complexity.
+# speed preset, OpenH264's complexity, SVT-AV1's preset (0 best .. 13).
 QUALITIES = [
-    ("speed", "Speed", 12000, {"target-usage": 7, "x264": "ultrafast", "openh264": "low"}),
-    ("balanced", "Balanced", 30000, {"target-usage": 4, "x264": "veryfast", "openh264": "medium"}),
-    ("quality", "Quality", 50000, {"target-usage": 2, "x264": "faster", "openh264": "high"}),
-    ("best", "Best", 80000, {"target-usage": 1, "x264": "fast", "openh264": "high"}),
+    ("speed", "Speed", 12000, {"target-usage": 7, "x264": "ultrafast", "openh264": "low", "svt": 12}),
+    ("balanced", "Balanced", 30000, {"target-usage": 4, "x264": "veryfast", "openh264": "medium", "svt": 11}),
+    ("quality", "Quality", 50000, {"target-usage": 2, "x264": "faster", "openh264": "high", "svt": 10}),
+    ("best", "Best", 80000, {"target-usage": 1, "x264": "fast", "openh264": "high", "svt": 9}),
 ]
 QUALITY_IDS = [q[0] for q in QUALITIES]
 
@@ -1357,7 +1484,18 @@ def quality_of(name):
     return next((q for q in QUALITIES if q[0] == name), QUALITIES[1])
 
 
-CODECS = {"h264": ("H.264", "h264parse", "video/x-h264"), "h265": ("H.265", "h265parse", "video/x-h265")}
+# id -> (name, parser, caps, the stream format sent). Best first: AV1, then
+# H.265, then H.264, which everything plays.
+CODECS = {
+    "av1": ("AV1", "av1parse", "video/x-av1", "stream-format=obu-stream,alignment=tu"),
+    "h265": ("H.265", "h265parse", "video/x-h265", "stream-format=byte-stream,alignment=au"),
+    "h264": ("H.264", "h264parse", "video/x-h264", "stream-format=byte-stream,alignment=au"),
+}
+
+
+def codec_of_caps(caps):
+    """The codec id of a stream's caps ("video/x-av1, ..." -> "av1")."""
+    return next((c for c, v in CODECS.items() if str(caps).startswith(v[2])), "h264")
 
 
 def video_encoders(kbps, fps, quality="balanced", codec="h264"):
@@ -1367,6 +1505,8 @@ def video_encoders(kbps, fps, quality="balanced", codec="h264"):
     gop = fps * 5
     if codec == "h265":
         return h265_encoders(kbps, gop, effort)
+    if codec == "av1":
+        return av1_encoders(kbps, gop, effort)
     nv12 = ("capsfilter", {"caps": "video/x-raw,format=NV12"})
     i420 = ("capsfilter", {"caps": "video/x-raw,format=I420"})
     va = [("vapostproc", {}), ("capsfilter", {"caps": "video/x-raw(memory:VAMemory),format=NV12"})]
@@ -1416,13 +1556,42 @@ def h265_encoders(kbps, gop, effort):
     ]
 
 
-SOFTWARE_ENCODERS = ("x264enc", "openh264enc", "x265enc")
+def av1_encoders(kbps, gop, effort):
+    """AV1: sharper again than H.265, above all for text and flat colours (it
+    has tools for screen content). The graphics card's encoders (NVIDIA RTX
+    40, AMD RX 7000, Intel Arc and newer); SVT-AV1 on the processor only when
+    AV1 is chosen outright. (SVT-AV1's low-delay mode stalls after the first
+    frame in GStreamer: a short look-ahead instead, about 170 ms behind.)"""
+    nv12 = ("capsfilter", {"caps": "video/x-raw,format=NV12"})
+    i420 = ("capsfilter", {"caps": "video/x-raw,format=I420"})
+    va = [("vapostproc", {}), ("capsfilter", {"caps": "video/x-raw(memory:VAMemory),format=NV12"})]
+    va_props = {"bitrate": kbps, "key-int-max": gop, "rate-control": "cbr", "target-usage": effort["target-usage"]}
+    return [
+        ("nvav1enc", [("videoconvert", {}), nv12,
+                      ("nvav1enc", {"bitrate": kbps, "gop-size": gop, "rate-control": "cbr",
+                                    "tune": "ultra-low-latency", "zero-reorder-delay": True})]),
+        ("vaav1lpenc", va + [("vaav1lpenc", va_props)]),
+        ("vaav1enc", va + [("vaav1enc", va_props)]),
+        ("qsvav1enc", [("videoconvert", {}), nv12,
+                       ("qsvav1enc", {"bitrate": kbps, "gop-size": gop, "rate-control": "cbr",
+                                      "low-latency": True, "target-usage": effort["target-usage"]})]),
+        ("svtav1enc", [("videoconvert", {"n-threads": 0}), i420,
+                       ("svtav1enc", {"preset": effort["svt"], "target-bitrate": kbps, "intra-period-length": gop,
+                                      "parameters-string": "lookahead=0:hierarchical-levels=2"})]),
+    ]
+
+
+SOFTWARE_ENCODERS = ("x264enc", "openh264enc", "x265enc", "svtav1enc")
+# The bitrate property, where it isn't "bitrate" in kbit/s: (name, per kbit/s,
+# whether it changes while streaming)
+BITRATE_PROPS = {"openh264enc": ("bitrate", 1000, True), "svtav1enc": ("target-bitrate", 1, False)}
 
 
 VIDEO_DECODERS = {
     # (best first) the graphics card's, then FFmpeg's, then Cisco's OpenH264
     "h264": [("vah264dec", {}), ("nvh264dec", {}), ("avdec_h264", {"thread-type": "slice"}), ("openh264dec", {})],
     "h265": [("vah265dec", {}), ("nvh265dec", {}), ("avdec_h265", {"thread-type": "slice"})],
+    "av1": [("vaav1dec", {}), ("nvav1dec", {}), ("dav1ddec", {"n-threads": 0, "max-frame-delay": 1})],
 }
 
 
@@ -1435,7 +1604,7 @@ def decodable_codecs():
         Gst.init(None)
     except (ImportError, ValueError):
         return ["h264"]
-    out = [c for c in ("h265", "h264") if any(Gst.ElementFactory.find(f) for f, _p in VIDEO_DECODERS[c])
+    out = [c for c in CODECS if any(Gst.ElementFactory.find(f) for f, _p in VIDEO_DECODERS[c])
            and Gst.ElementFactory.find(CODECS[c][1])]
     return out or ["h264"]
 
@@ -1489,8 +1658,11 @@ class Capture:
         self.broken = threading.Event()     # the video stopped (any time)
         self.failed = None
         self.encoder = None
-        self.codec = conf.get("stream_codec") or "h264"     # chosen by Session for everyone watching
-        self.no_h265 = False                                # no H.265 encoder works here
+        # The codecs to try, best first, chosen by Session for everyone
+        # watching (always ending with H.264); the one it's sending
+        self.ladder = list(conf.get("stream_codecs") or ["h264"])
+        self.codec = self.ladder[0]
+        self.unavailable = set()                # codecs no encoder works for here
 
     # video
     _encoder = {}                       # the setting -> the encoder that worked (tried once per daemon)
@@ -1505,8 +1677,10 @@ class Capture:
         Gst = self.Gst
         wanted = self.conf.get("encoder") or "auto"
         codec = self.codec
-        # (whether software H.265 may be used is part of it: only when chosen outright)
-        key = (wanted, codec, Capture._gpu_buffers, codec == "h265" and self.conf.get("codec") == "h265")
+        # (whether the processor may encode H.265 or AV1 is part of it: only
+        # when chosen outright, it's too slow otherwise)
+        software = codec == "h264" or self.conf.get("codec") == codec
+        key = (wanted, codec, Capture._gpu_buffers, software)
         quality = self.conf.get("quality") or "balanced"
         if key in Capture._encoder:
             name = Capture._encoder[key]
@@ -1517,8 +1691,7 @@ class Capture:
         # first NVIDIA computer it garbled the colours and stopped after a frame
         candidates = [c for c in video_encoders(kbps, fps, quality, codec)
                       if wanted in ("auto", c[0]) and Gst.ElementFactory.find(c[0])
-                      # (software H.265 only when it's asked for outright: too slow otherwise)
-                      and not (codec == "h265" and c[0] == "x265enc" and self.conf.get("codec") != "h265")
+                      and (software or c[0] not in SOFTWARE_ENCODERS)
                       and not (Capture._gpu_buffers and wanted == "auto" and c[0].startswith("va"))]
         for name, elements in candidates:
             pipeline = Gst.Pipeline.new("probe")
@@ -1547,15 +1720,17 @@ class Capture:
         Gst = self.Gst
         fps = int(self.conf.get("fps") or 60)
         kbps = int(self.conf.get("start_kbps") or quality_of(self.conf.get("quality"))[2])
-        try:
-            name, elements = self.pick_encoder(kbps, fps)
-        except RuntimeError as e:
-            if self.codec == "h264":
-                raise
-            log(f"{e}: using H.264")
-            self.codec = "h264"
-            self.no_h265 = True                 # (Session won't ask for it again)
-            name, elements = self.pick_encoder(kbps, fps)
+        # The best codec in the ladder that an encoder here works for
+        for codec in [c for c in self.ladder if c not in self.unavailable] + ["h264"]:
+            self.codec = codec
+            try:
+                name, elements = self.pick_encoder(kbps, fps)
+                break
+            except RuntimeError as e:
+                if codec == "h264":
+                    raise
+                log(f"{e}: trying the next")
+                self.unavailable.add(codec)         # (Session won't ask for it again)
         self.video = self._video_pipeline(elements, fps)
         self.video.set_state(Gst.State.PLAYING)
         if not self.first.wait(8) or self.failed:
@@ -1566,46 +1741,63 @@ class Capture:
         log(f"video: {CODECS[self.codec][0]} with {name}, {kbps} kbit/s")
         return name
 
-    def switch_codec(self, codec):
-        """Encode in codec from now on (someone joined who can't decode the
-        other): only the video pipeline is rebuilt, on the same screen
-        capture. True if it's now codec."""
-        if codec == self.codec or self.video is None:
-            return codec == self.codec
-        old = self.codec
-        self.video.set_state(self.Gst.State.NULL)
-        self.video = None
+    def switch_codec(self, ladder):
+        """Encode in the best codec of ladder from now on (someone joined who
+        can't decode this one, or they left): only the video pipeline is
+        rebuilt, on the same screen capture. True if the codec changed."""
+        want = next((c for c in ladder if c not in self.unavailable), "h264")
+        if want == self.codec or self.video is None:
+            return False
+        old, self.ladder = self.codec, list(ladder)
+        self.restart_video()
+        if self.video is None:                  # (nothing worked: back to what did)
+            log(f"couldn't switch from {CODECS[old][0]}; staying with it")
+            self.ladder = [old]
+            self.restart_video()
+        return self.codec != old
+
+    def restart_video(self):
+        """A new video pipeline on the same screen capture (another codec, or
+        a bitrate the encoder can't change while it runs)."""
+        if self.video is not None:
+            old, self.video = self.video, None
+            # No more frames from it (or key frame requests into it, which
+            # can stall its stopping), and not waited on for long: an
+            # encoder that won't stop doesn't stop the stream
+            old.get_by_name("sink").set_property("emit-signals", False)
+            stopping = threading.Thread(target=old.set_state, args=(self.Gst.State.NULL,), daemon=True)
+            stopping.start()
+            stopping.join(3)
+            if stopping.is_alive():
+                log("video: the old encoder didn't stop; going on without it")
         self.caps.pop("video", None)
         self.first.clear()
-        self.codec = codec
+        self.failed = None
         try:
             self.start_video()
         except RuntimeError as e:
-            log(f"couldn't switch to {CODECS[codec][0]} ({e}); staying with {CODECS[old][0]}")
-            self.no_h265 = self.no_h265 or codec == "h265"
-            self.codec = old
-            self.failed = None
-            self.start_video()
-        return self.codec == codec
+            log(f"video: {e}")
+            self.video = None
 
     def set_bitrate(self, kbps):
-        """Change the picture's bitrate while streaming (kbit/s)."""
-        if self.video is None:
-            return False
-        it = self.video.iterate_elements()
-        done = False
-        while True:
-            ok, el = it.next()
-            if ok != self.Gst.IteratorResult.OK:
-                break
-            name = el.get_factory().get_name() if el.get_factory() else ""
-            if name in dict((e[0], 1) for e in video_encoders(kbps, 60) + h265_encoders(kbps, 300, QUALITIES[1][3])) \
-                    and el.find_property("bitrate"):
-                el.set_property("bitrate", kbps * 1000 if name == "openh264enc" else kbps)
-                done = True
-        if done:
+        """Change the picture's bitrate while streaming (kbit/s). "live", or
+        "restarted" (the encoder can't change it while it runs: a new video
+        pipeline, whose new stream headers everyone needs), or None."""
+        if self.video is None or self.encoder is None:
+            return None
+        el = self.video.get_by_name("encoder")
+        prop, scale, live = BITRATE_PROPS.get(self.encoder, ("bitrate", 1, True))
+        self.conf["start_kbps"] = kbps
+        if el is None or el.find_property(prop) is None:
+            return None
+        if live:
+            el.set_property(prop, kbps * scale)
             log(f"video: now {kbps} kbit/s")
-        return done
+            return "live"
+        self.ladder = [self.codec]
+        self.restart_video()
+        log(f"video: restarted at {kbps} kbit/s")
+        return "restarted" if self.video is not None else None
 
     def _video_pipeline(self, encoder, fps):
         Gst = self.Gst
@@ -1636,9 +1828,11 @@ class Capture:
         # (skipping encoded frames would spoil the picture until the next key frame)
         leak = make_element("queue", {"leaky": "downstream", "max-size-buffers": 1,
                                       "max-size-bytes": 0, "max-size-time": 0})
-        enc = [make_element(f, dict(p)) for f, p in encoder]
+        # (the encoder itself named, for set_bitrate)
+        enc = [make_element(f, dict(p), "encoder" if i == len(encoder) - 1 else None)
+               for i, (f, p) in enumerate(encoder)]
         parse = make_element(CODECS[self.codec][1], {"config-interval": -1})
-        caps = make_element("capsfilter", {"caps": f"{CODECS[self.codec][2]},stream-format=byte-stream,alignment=au"})
+        caps = make_element("capsfilter", {"caps": f"{CODECS[self.codec][2]},{CODECS[self.codec][3]}"})
         sink = make_element("appsink", {"emit-signals": True, "sync": False, "max-buffers": 8}, "sink")
         chain(pipeline, src + [leak] + enc + [parse, caps, sink])
         sink.connect("new-sample", self._on_video)
@@ -1683,6 +1877,8 @@ class Capture:
         sample = sink.emit("pull-sample")
         if sample is None:
             return Gst.FlowReturn.EOS
+        if self.video is None or sink.get_parent() is not self.video:
+            return Gst.FlowReturn.OK            # (a pipeline being replaced)
         buf = sample.get_buffer()
         self.first.set()
         if self.failed:
@@ -1985,19 +2181,22 @@ class Session:
                 "locked": self.locked, "viewers": self.names()}
 
     # -- starting and stopping
-    def wanted_codec(self, codec_sets):
-        """H.265 if this computer's setting allows it and everyone watching
-        can decode it, else H.264."""
+    def codec_ladder(self, codec_sets):
+        """The codecs to try, best first: those everyone watching can decode,
+        that this computer's setting allows (the one chosen comes first) and
+        that an encoder here worked for; always ending with H.264."""
         setting = self.conf.get("codec") or "auto"
-        if setting == "h264" or (self.capture is not None and self.capture.no_h265):
-            return "h264"
-        return "h265" if all("h265" in c for c in codec_sets) else "h264"
+        if setting == "h264":
+            return ["h264"]
+        unavailable = self.capture.unavailable if self.capture is not None else set()
+        order = ([setting] if setting in CODECS else []) + [c for c in ("av1", "h265") if c != setting]
+        return [c for c in order if c not in unavailable and all(c in s for s in codec_sets)] + ["h264"]
 
     def start(self, conf):
         import firox_monitors
         self.conf = conf
         self.quality = quality_of(conf.get("quality"))[0]
-        conf["stream_codec"] = self.wanted_codec([self.first_codecs])
+        conf["stream_codecs"] = self.codec_ladder([self.first_codecs])
         self.locked = screen_locked()
         keep_awake(True)
         wake_screen()
@@ -2044,24 +2243,30 @@ class Session:
             self.broadcast("S", {"viewers": self.names(), "joined": name})
 
     def match_codec(self):
-        """Switch the picture to the codec everyone watching can decode (a
-        web browser joining a H.265 stream: H.264 for all; it leaving: H.265
+        """Switch the picture to the best codec everyone watching can decode
+        (a phone joining a H.265 stream: H.264 for all; it leaving: H.265
         again). The viewers get the new stream headers and a key frame."""
         with self.lock:
             sets = [getattr(ch, "codecs", ["h264"]) for ch in self.viewers if not ch.closed]
         capture = self.capture
         if not sets or capture is None:
             return
-        want = self.wanted_codec(sets)
-        if want == capture.codec:
+        ladder = self.codec_ladder(sets)
+        if ladder[0] == capture.codec:
             return
-        log(f"switching the picture to {CODECS[want][0]} for everyone watching")
-        if capture.switch_codec(want):
-            self.conf["stream_codec"] = want            # (if the capture restarts)
-            with self.lock:
-                for v in self.viewers.values():
-                    v["need_key"] = True
-            capture.request_key()
+        log(f"switching the picture to {CODECS[ladder[0]][0]} for everyone watching")
+        if capture.switch_codec(ladder):
+            log(f"now {CODECS[capture.codec][0]}")
+            self.conf["stream_codecs"] = ladder         # (if the capture restarts)
+            self.need_keys()
+
+    def need_keys(self):
+        """A new video stream: everyone waits for its first key frame."""
+        with self.lock:
+            for v in self.viewers.values():
+                v["need_key"] = True
+        if self.capture is not None:
+            self.capture.request_key()
 
     def remove(self, channel):
         """Returns how many are still watching."""
@@ -2157,12 +2362,18 @@ class Session:
                 wanted = str(json.loads(payload).get("quality", ""))
             except (ValueError, AttributeError):
                 wanted = ""
-            if wanted in QUALITY_IDS and wanted != self.quality and self.capture is not None:
-                if self.capture.set_bitrate(quality_of(wanted)[2]):
-                    self.quality = wanted
-                    self.conf["start_kbps"] = quality_of(wanted)[2]     # (if the capture restarts)
-                    log(f"{client} set the picture quality to {quality_of(wanted)[1]}")
-            self.broadcast("z", {"quality": self.quality, "by": client})
+
+            def change():
+                if wanted in QUALITY_IDS and wanted != self.quality and self.capture is not None:
+                    done = self.capture.set_bitrate(quality_of(wanted)[2])
+                    if done:
+                        self.quality = wanted
+                        log(f"{client} set the picture quality to {quality_of(wanted)[1]}")
+                    if done == "restarted":
+                        self.need_keys()
+                self.broadcast("z", {"quality": self.quality, "by": client})
+            # (some encoders start again for it: not on this viewer's thread)
+            threading.Thread(target=change, daemon=True).start()
         elif kind == "U":
             try:
                 password = str(json.loads(payload).get("password", ""))
@@ -2372,7 +2583,9 @@ class Host:
             ws.close()
             return
         try:
-            viewer = WebViewer(sock, bytes(ws.raw))
+            with self.session_lock:
+                codecs = self.client_codecs.get(id(ws))
+            viewer = WebViewer(sock, bytes(ws.raw), codecs)
         except RuntimeError as e:
             log(f"{address}: {e}")
             self._refuse(ws, f"This computer can't stream to web browsers: {e}")
@@ -3541,7 +3754,7 @@ def client_ui(address=None):
                 msg = json.loads(payload)
                 caps = Gst.Caps.from_string(msg.get("caps", ""))
                 if msg.get("kind") == "video":
-                    codec = "h265" if msg.get("caps", "").startswith("video/x-h265") else "h264"
+                    codec = codec_of_caps(msg.get("caps", ""))
                     if codec != getattr(self, "codec", "h264"):
                         # The host switched (someone joined or left): a decoder for it
                         done = threading.Event()
@@ -3946,13 +4159,16 @@ def client_ui(address=None):
             crow = Gtk.Box(spacing=8, margin_start=24)
             crow.add(Gtk.Label(label="Video format:", xalign=0))
             self.host_codec = Gtk.ComboBoxText()
-            self.host_codec.append("auto", "Automatic (H.265 when everyone can play it)")
+            self.host_codec.append("auto", "Automatic (the best everyone can play)")
             self.host_codec.append("h264", "H.264 only")
             self.host_codec.append("h265", "H.265 (even on the processor)")
+            self.host_codec.append("av1", "AV1 (even on the processor)")
             self.host_codec.set_active_id(load_conf().get("codec") or "auto")
-            self.host_codec.set_tooltip_text("H.265 is sharper than H.264 at the same bitrate. Automatic uses it "
-                                             "when this computer's graphics card can encode it and everyone "
-                                             "watching can play it (web browsers and phones get H.264).")
+            self.host_codec.set_tooltip_text("AV1 is sharper than H.265, and H.265 than H.264, at the same "
+                                             "bitrate. Automatic uses the best one this computer's graphics card "
+                                             "can encode and everyone watching can play (most web browsers play "
+                                             "AV1; phones get H.264). On the processor, AV1 and H.265 are slow "
+                                             "and add delay.")
             self.host_codec.connect("changed", self.on_host_codec)
             crow.add(self.host_codec)
             box.add(crow)
