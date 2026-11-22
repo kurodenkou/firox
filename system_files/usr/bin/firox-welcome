@@ -32,7 +32,7 @@ from gi.repository import Gdk, GdkPixbuf, GLib, Gtk  # noqa: E402
 THEMES = "/usr/share/firox/themes"
 ICONS = "/var/lib/AccountsService/icons"
 USERS_DIR = "/var/lib/AccountsService/users"
-DEFAULT_FACE = "/usr/share/firox/icons/user-default.svg"
+DEFAULT_FACE = "/usr/share/firox/icons/user-default.png"
 ENVIRONMENTS = "/etc/greetd/environments"
 NOLOGIN = ("nologin", "false", "sync", "shutdown", "halt")
 

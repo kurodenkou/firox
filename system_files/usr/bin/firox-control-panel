@@ -1730,7 +1730,7 @@ class PowerDialog(Gtk.Dialog):
 
 PICTURES_DIR = "/usr/share/firox/pictures"
 FACE = os.path.expanduser("~/.face")
-DEFAULT_FACE = "/usr/share/firox/icons/user-default.svg"
+DEFAULT_FACE = "/usr/share/firox/icons/user-default.png"
 FACE_SIZE = 256
 
 
