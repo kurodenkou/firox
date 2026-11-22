@@ -1275,7 +1275,8 @@ class BackgroundDialog(Gtk.Dialog):
 
     FOLDERS = ["/usr/share/backgrounds/firox", "/usr/share/backgrounds/fedora-workstation",
                "/usr/share/backgrounds/f44/default", "/usr/share/backgrounds/images"]
-    NAMES = {"rune-glade.jpg": "Rune's Glade", "default.svg": "Firox Classic", "modern.svg": "Firox Modern",
+    NAMES = {"rune-glade.jpg": "Rune's Glade", "rune-stars.jpg": "Starry Rune",
+             "rune-forest.jpg": "Rune's Forest Nap", "default.svg": "Firox Classic", "modern.svg": "Firox Modern",
              "glass.svg": "Firox Glass"}
     EXTS = (".svg", ".png", ".jpg", ".jpeg", ".webp", ".jxl", ".bmp", ".gif", ".tif", ".tiff")
 
@@ -1730,7 +1731,7 @@ class PowerDialog(Gtk.Dialog):
 
 PICTURES_DIR = "/usr/share/firox/pictures"
 FACE = os.path.expanduser("~/.face")
-DEFAULT_FACE = "/usr/share/firox/icons/user-default.svg"
+DEFAULT_FACE = "/usr/share/firox/icons/user-default.png"
 FACE_SIZE = 256
 
 
@@ -1801,7 +1802,8 @@ class AccountsDialog(Gtk.Dialog):
             except GLib.Error:
                 continue
             child.path = path
-            child.set_tooltip_text(os.path.splitext(os.path.basename(path))[0].title())
+            # ("rune-sly.png" is "Rune Sly")
+            child.set_tooltip_text(os.path.splitext(os.path.basename(path))[0].replace("-", " ").title())
             flow.add(child)
         flow.connect("child-activated", lambda _f, c: self._choose(c.path))
         box.pack_start(flow, False, False, 0)

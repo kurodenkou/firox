@@ -197,7 +197,7 @@ AVATAR_CANDIDATES = [
     os.path.expanduser("~/.face"),
     os.path.expanduser("~/.face.icon"),
     f"/var/lib/AccountsService/icons/{GLib.get_user_name()}",
-    "/usr/share/firox/icons/user-default.svg",
+    "/usr/share/firox/icons/user-default.png",
 ]
 MASCOT = "/usr/share/firox/icons/firox-mascot.png"
 

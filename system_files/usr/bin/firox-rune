@@ -558,6 +558,7 @@ class ChatWindow(Gtk.Window):
         bubble = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         bubble.set_name("bubble")
         bubble.set_size_request(self.WIDTH, self.HEIGHT)
+        self.bubble = bubble
         self.add(bubble)
 
         head = Gtk.Box(spacing=8)
@@ -687,9 +688,24 @@ class ChatWindow(Gtk.Window):
 
     def place(self):
         conf = self.app.conf
+        _w, h = self.app.rune.size() if self.app.rune else (0, 0)
+        above = h - (SHADOW if conf["glade"] else 0) + 6
         if layer(self, conf, "overlay", "firox-rune-chat", keyboard=True):
-            w, h = self.app.rune.size() if self.app.rune else (0, 0)
-            margins(self, conf, h - (SHADOW if conf["glade"] else 0) + 6)
+            margins(self, conf, above)
+        # As tall as fits between Rune and the far edge of the screen (a
+        # 768-pixel laptop screen has room for less than the full bubble)
+        display = Gdk.Display.get_default()
+        mon = None
+        if firox_monitors is not None:
+            try:
+                mon = firox_monitors.main_gdk_monitor(display)
+            except Exception:
+                mon = None
+        mon = mon or display.get_primary_monitor() or display.get_monitor(0)
+        if mon is not None:
+            geo = mon.get_workarea()
+            room = geo.height - (PANEL_HEIGHT + EDGE) - above - EDGE
+            self.bubble.set_size_request(min(self.WIDTH, geo.width - 2 * EDGE), max(260, min(self.HEIGHT, room)))
         self.resize(1, 1)
 
     # -- the conversation

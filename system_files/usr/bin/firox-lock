@@ -35,7 +35,7 @@ import time
 
 THEMES = "/usr/share/firox/themes"
 SOCKET = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}", "firox-lock.sock")
-DEFAULT_FACE = "/usr/share/firox/icons/user-default.svg"
+DEFAULT_FACE = "/usr/share/firox/icons/user-default.png"
 PAM_SERVICE = "firox-lock"
 CONFIG = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "firox")
 
