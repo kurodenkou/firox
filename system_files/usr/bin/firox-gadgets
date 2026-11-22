@@ -1268,7 +1268,8 @@ class PicturePuzzle(Gadget):
                     out.append(os.path.join(folder, name))
         except OSError:
             pass
-        for path in ("/usr/share/backgrounds/firox/default.svg", "/usr/share/backgrounds/firox/glass.svg"):
+        for path in ("/usr/share/backgrounds/firox/rune-glade.jpg", "/usr/share/backgrounds/firox/default.svg",
+                     "/usr/share/backgrounds/firox/glass.svg"):
             if os.path.exists(path):
                 out.append(path)
         return out

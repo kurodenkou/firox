@@ -8,13 +8,14 @@
 <meta property="og:title" content="Looks · Firox Linux">
 <meta property="og:description" content="Firox Linux comes in three looks with the same layout: Modern (grey, dark apps), Classic (blue and green) and Glass (frosted glass).">
 <meta property="og:image" content="screenshots/glass.png">
-<link rel="icon" href="assets/firox-orb.svg" type="image/svg+xml">
+<link rel="icon" href="assets/firox-mascot-icon.png" type="image/png">
+<link rel="apple-touch-icon" href="assets/firox-mascot-icon.png">
 <link rel="stylesheet" href="assets/style.css">
 </head>
 <body>
 <header class="site-header">
     <div class="wrap">
-        <a class="brand" href="index.html"><img src="assets/firox-orb.svg" alt=""><span>firox</span> Linux</a>
+        <a class="brand" href="index.html"><img src="assets/firox-mascot-icon.png" alt=""><span>firox</span> Linux</a>
         <nav class="nav" aria-label="Site">
         <a href="index.html">Home</a>
         <a href="looks.html" aria-current="page">Looks</a>
@@ -22,6 +23,7 @@
         <a href="policy.html">Policy</a>
         <a href="install.html">Install</a>
         <a href="guide.html">Guide</a>
+        <a href="rune.html">Rune</a>
         <a href="ai.html">AI use</a>
         <a href="https://github.com/kurodenkou/firox">GitHub</a>
         </nav>
@@ -79,7 +81,7 @@
 </div>
 
 <h2 id="glass">Glass</h2>
-<p><b>Glass</b> turns the taskbar, Start menu, pop-ups and window title bars into frosted glass: light and translucent, with bright rims and round glass window buttons. It has its own indigo-to-rose wallpaper. Apps stay light.</p>
+<p><b>Glass</b> turns the taskbar, Start menu, pop-ups and window title bars into frosted glass: light and translucent, with bright rims and round glass window buttons. Its indigo-to-rose wallpaper is in Desktop Background. Apps stay light.</p>
 <figure>
     <img src="screenshots/glass.png" alt="Glass look: frosted taskbar, translucent Start menu and glass title bars over a colourful wallpaper" loading="lazy">
     <figcaption>The Glass look</figcaption>
@@ -119,8 +121,8 @@
 <p>Use <code>classic</code>, <code>modern</code> or <code>glass</code>; <code>firox-theme set NAME</code> does the same.</p>
 <ul>
     <li><b>When it applies:</b> straight away on the running desktop, and it's saved for each user.</li>
-    <li><b>Wallpaper:</b> switches too, unless you've picked your own.</li>
-    <li><b>New users:</b> get the look set in <code>/etc/firox/theme</code> (<code>modern</code>), with its wallpaper and app style, on their first login. Change it to <code>classic</code> or <code>glass</code> to make that look the default.</li>
+    <li><b>Wallpaper:</b> every look starts with <a href="rune.html">Rune's Glade</a>: Rune, the Firox mascot, in a starry ring of runestones. Each look's own wallpaper (Firox Classic, Modern and Glass) is in <b>Desktop Background</b>. Once you've picked your own, switching looks leaves it alone.</li>
+    <li><b>New users:</b> get the look set in <code>/etc/firox/theme</code> (<code>modern</code>), with Rune's Glade as the wallpaper and that look's app style, on their first login. Change it to <code>classic</code> or <code>glass</code> to make that look the default.</li>
 </ul>
 <p>Want a look of your own? See <a href="guide.html#customising">Customising</a>.</p>
 <p class="tech">Screenshots are from the built image running headless (labwc and grim).</p>
