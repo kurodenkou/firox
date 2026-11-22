@@ -282,6 +282,19 @@ x86_64-w64-mingw32-gcc -O2 -s -mwindows -o /usr/lib/firox/windows/firox-sleep.ex
 dnf5 remove -y mingw64-gcc          # takes the rest of the toolchain with it
 test -s /usr/lib/firox/windows/firox-sleep.exe
 
+# Rune, the desktop helper (firox-rune), talks to Claude with Anthropic's
+# Python SDK, which Fedora doesn't package: a pinned copy, private to Firox
+# (/usr/lib/firox/python-vendor; nothing else imports it). pip is only
+# needed here, and removed again.
+ANTHROPIC_SDK_VERSION=2.12.0
+dnf5 install -y --setopt=install_weak_deps=False python3-pip
+python3 -m pip install --no-cache-dir --disable-pip-version-check --root-user-action=ignore \
+    --target /usr/lib/firox/python-vendor "anthropic==${ANTHROPIC_SDK_VERSION}"
+rm -rf /usr/lib/firox/python-vendor/bin
+dnf5 remove -y python3-pip
+python3 -I -c "import sys; sys.path.insert(0, '/usr/lib/firox/python-vendor'); import anthropic; \
+assert anthropic.__version__ == '${ANTHROPIC_SDK_VERSION}'"
+
 # Virus definitions for Virus Scan: freshclam downloads them (about 200 MB
 # the first time) and checks for new ones every two hours
 systemctl enable clamav-freshclam.service
