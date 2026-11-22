@@ -1275,7 +1275,7 @@ class BackgroundDialog(Gtk.Dialog):
 
     FOLDERS = ["/usr/share/backgrounds/firox", "/usr/share/backgrounds/fedora-workstation",
                "/usr/share/backgrounds/f44/default", "/usr/share/backgrounds/images"]
-    NAMES = {"default.svg": "Firox Classic", "modern.svg": "Firox Modern", "glass.svg": "Firox Glass"}
+    NAMES = {"firox-mascot.jpg": "Firox", "default.svg": "Firox Classic", "modern.svg": "Firox Modern", "glass.svg": "Firox Glass"}
     EXTS = (".svg", ".png", ".jpg", ".jpeg", ".webp", ".jxl", ".bmp", ".gif", ".tif", ".tiff")
 
     def __init__(self, parent):
