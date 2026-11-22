@@ -1,0 +1,1054 @@
+#!/usr/bin/python3
+"""
+firox-rune: Rune, the Firox mascot, on the desktop, and your helper.
+
+Rune sits in a corner of the desktop in his glade, alive: he breathes and
+blinks, his tail throws embers, the runes and crystals glow and the stars
+twinkle, and the scene tilts a little toward the mouse (2.5D: the wallpaper's
+picture cut into layers, /usr/share/firox/rune, made by scripts/rune-layers.py).
+
+Click him to chat. He answers with Claude, using your own Claude API key
+(kept in the keyring), can search the web, and can do a few things on the
+computer, asking you first every time (see firox_rune_brain). Nothing is sent
+anywhere until you've given him a key and typed something.
+
+    firox-rune              show Rune (if he's already here: open his chat)
+    firox-rune --at-login   at login: only if he's turned on
+    firox-rune --chat       open his chat
+    firox-rune --settings   his settings
+    firox-rune --hide       put him away (until you open Rune again)
+    firox-rune --frames DIR [N] [WIDTH]
+                            render N frames of the animation to DIR (tests)
+
+Right-click him for his settings: the corner, the size, his glade or just
+him, above or under windows, the Claude model and key. A policy can turn him
+off (rune.allowed) or keep him from chatting (rune.chat).
+"""
+
+import json
+import math
+import os
+import random
+import sys
+import threading
+import time
+
+sys.path.insert(0, "/usr/lib/firox/python")
+import firox_rune_brain as B  # noqa: E402
+
+import gi  # noqa: E402
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+gi.require_version("GdkPixbuf", "2.0")
+from gi.repository import Gdk, GdkPixbuf, Gio, GLib, Gtk, Pango  # noqa: E402
+import cairo  # noqa: E402
+
+try:
+    gi.require_version("GtkLayerShell", "0.1")
+    from gi.repository import GtkLayerShell  # noqa: E402
+except (ValueError, ImportError):
+    GtkLayerShell = None
+
+try:
+    import firox_monitors  # noqa: E402
+except ImportError:
+    firox_monitors = None
+
+ASSETS = os.environ.get("FIROX_RUNE_ASSETS", "/usr/share/firox/rune")
+AVATAR = "/usr/share/firox/icons/start-mascot.png"
+KEYS_URL = "https://console.anthropic.com/settings/keys"
+PANEL_HEIGHT = 30
+EDGE = 10                       # from the screen's edge (and the taskbar)
+SHADOW = 10                     # room around the glade for its shadow
+FPS = 30                        # while he's busy, hovered or chatting
+IDLE_FPS = 15                   # the rest of the time (half the work)
+# The part of the wallpaper shown in the glade, in its pixels
+GLADE_CROP = (180, 40, 1230, 735)
+WIDTHS = {"small": 260, "medium": 340, "large": 440}
+
+
+# ------------------------------------------------------------------ scene --
+
+def load_surface(path, scale):
+    pb = GdkPixbuf.Pixbuf.new_from_file(path)
+    w, h = max(1, round(pb.get_width() * scale)), max(1, round(pb.get_height() * scale))
+    pb = pb.scale_simple(w, h, GdkPixbuf.InterpType.HYPER)
+    surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, w, h)
+    ctx = cairo.Context(surf)
+    Gdk.cairo_set_source_pixbuf(ctx, pb, 0, 0)
+    ctx.paint()
+    return surf
+
+
+def rounded(ctx, x, y, w, h, r):
+    ctx.new_sub_path()
+    ctx.arc(x + w - r, y + r, r, -math.pi / 2, 0)
+    ctx.arc(x + w - r, y + h - r, r, 0, math.pi / 2)
+    ctx.arc(x + r, y + h - r, r, math.pi / 2, math.pi)
+    ctx.arc(x + r, y + r, r, math.pi, 3 * math.pi / 2)
+    ctx.close_path()
+
+
+class Scene:
+    """Rune and his glade, drawn for one frame at a time (Cairo).
+
+    In the wallpaper's own pixels (scene.json): his box and the point he
+    breathes from, his eyes, his tail flame, the glowing parts and the stars.
+    The layers are scaled once, for the size shown."""
+
+    def __init__(self, width, glade=True, device_scale=1):
+        with open(os.path.join(ASSETS, "scene.json")) as fh:
+            self.meta = json.load(fh)
+        self.glade = glade
+        box = self.meta["rune_box"]
+        if glade:
+            self.crop = GLADE_CROP
+        else:
+            pad = 26
+            self.crop = (box[0] - pad, box[1] - pad, box[2] + pad, box[3] + pad)
+        cw, ch = self.crop[2] - self.crop[0], self.crop[3] - self.crop[1]
+        if not glade:
+            width = round(width * 0.62)
+        self.w, self.h = width, round(width * ch / cw)
+        self.s = width / cw                     # scene pixels -> widget pixels
+        k = self.s * device_scale
+        self.ds = device_scale
+        if glade:
+            # (a little larger than shown: it shifts with the mouse)
+            self.bg = load_surface(os.path.join(ASSETS, "background.jpg"), k * 1.04)
+            self.glow = load_surface(os.path.join(ASSETS, "glow.png"), k * 1.04)
+            self.rune = load_surface(os.path.join(ASSETS, "rune.png"), k)
+        else:
+            self.bg = self.glow = None
+            self.rune = load_surface(os.path.join(ASSETS, "rune-solo.png"), k)
+        rnd = random.Random(7)
+        self.stars = [dict(s, phase=rnd.uniform(0, 6.3), speed=rnd.uniform(0.6, 1.6)) for s in self.meta["stars"]
+                      if self.inside(s["x"], s["y"])]
+        self.embers = []
+        self.last = None
+        self.blink_at, self.blink_len = 2.0, 0.18
+        self.tilt = [0.0, 0.0]                  # eased toward the mouse
+        self.mouse = None
+        self.busy = 0.0                         # eased: 1 while he's thinking
+        self.want_busy = False
+        self.hop_until = 0.0
+
+    def inside(self, x, y):
+        return self.crop[0] <= x <= self.crop[2] and self.crop[1] <= y <= self.crop[3]
+
+    def to_widget(self, x, y):
+        return (x - self.crop[0]) * self.s, (y - self.crop[1]) * self.s
+
+    # -- what moves
+    def step(self, t):
+        dt = 0 if self.last is None else min(0.1, t - self.last)
+        self.last = t
+        target = self.mouse or (0.25 * math.sin(t * 0.21), 0.18 * math.sin(t * 0.17 + 1))
+        for i in (0, 1):
+            self.tilt[i] += (target[i] - self.tilt[i]) * min(1, dt * 3)
+        self.busy += ((1.0 if self.want_busy else 0.0) - self.busy) * min(1, dt * 2.5)
+        if t > self.blink_at + self.blink_len:
+            # every few seconds; now and then twice
+            self.blink_at = t + (0.25 if random.random() < 0.15 else random.uniform(2.5, 6.5))
+        # embers from the tail flame: more while he's thinking
+        fb = self.meta.get("flame_box")
+        if fb:
+            rate = 5 + 20 * self.busy
+            n = int(rate * dt + random.random())
+            for _ in range(n):
+                x = random.uniform(fb[0] + 8, fb[0] + (fb[2] - fb[0]) * 0.55)
+                y = random.uniform(fb[1] + 50, fb[1] + (fb[3] - fb[1]) * 0.7)
+                self.embers.append({"x": x, "y": y, "vx": random.uniform(-8, 8), "vy": random.uniform(-48, -22),
+                                    "born": t, "life": random.uniform(1.4, 3.0), "r": random.uniform(1.2, 2.8),
+                                    "wob": random.uniform(0, 6.3)})
+        for e in self.embers:
+            e["x"] += (e["vx"] + 10 * math.sin(t * 2 + e["wob"])) * dt
+            e["y"] += e["vy"] * dt
+        self.embers = [e for e in self.embers if t - e["born"] < e["life"]]
+
+    def blink(self, t):
+        """How shut his eyes are, 0 to 1."""
+        u = (t - self.blink_at) / self.blink_len
+        return 0.0 if u < 0 or u > 1 else math.sin(u * math.pi)
+
+    # -- one frame
+    def draw(self, ctx, t, x0=0, y0=0):
+        self.step(t)
+        ctx.save()
+        ctx.translate(x0, y0)
+        tx, ty = self.tilt
+        if self.glade:
+            rounded(ctx, 0, 0, self.w, self.h, 16)
+            ctx.clip()
+            ctx.save()
+            ctx.scale(1 / self.ds, 1 / self.ds)
+            # the glade, far: moves a little (opposite the mouse)
+            m = self.w * self.ds * 0.02
+            bx = -self.crop[0] * self.s * self.ds * 1.04 - m - tx * 3 * self.ds
+            by = -self.crop[1] * self.s * self.ds * 1.04 - m * self.h / self.w - ty * 2 * self.ds
+            ctx.set_source_surface(self.bg, bx, by)
+            ctx.paint()
+            # the runes and crystals breathe light (faster and brighter while thinking)
+            pulse = 0.28 + 0.22 * math.sin(t * (1.1 + 2.0 * self.busy)) + 0.35 * self.busy
+            ctx.set_operator(cairo.OPERATOR_ADD)
+            ctx.set_source_surface(self.glow, bx, by)
+            ctx.paint_with_alpha(max(0.0, min(1.0, pulse)))
+            ctx.set_operator(cairo.OPERATOR_OVER)
+            ctx.restore()
+            for s in self.stars:
+                a = max(0.0, math.sin(t * s["speed"] + s["phase"])) ** 3
+                if a < 0.02:
+                    continue
+                sx, sy = self.to_widget(s["x"], s["y"])
+                sx -= tx * 3
+                sy -= ty * 2
+                r = max(1.6, (s["w"] + s["h"]) * 0.25 * self.s * 1.6) * (0.7 + 0.5 * a)
+                g = cairo.RadialGradient(sx, sy, 0, sx, sy, r)
+                g.add_color_stop_rgba(0, 0.92, 0.97, 1, 0.85 * a)
+                g.add_color_stop_rgba(1, 0.6, 0.8, 1, 0)
+                ctx.set_source(g)
+                ctx.arc(sx, sy, r, 0, 2 * math.pi)
+                ctx.fill()
+                ctx.set_source_rgba(0.95, 0.98, 1, 0.7 * a)
+                ctx.set_line_width(0.8)
+                ctx.move_to(sx - r * 1.6, sy)
+                ctx.line_to(sx + r * 1.6, sy)
+                ctx.move_to(sx, sy - r * 1.6)
+                ctx.line_to(sx, sy + r * 1.6)
+                ctx.stroke()
+        else:
+            # just Rune: a soft shadow where he sits
+            box = self.meta["rune_box"]
+            cx, cy = self.to_widget((box[0] + box[2]) / 2, box[3] - 18)
+            ctx.save()
+            ctx.translate(cx, cy)
+            ctx.scale(1, 0.22)
+            g = cairo.RadialGradient(0, 0, 0, 0, 0, self.w * 0.42)
+            g.add_color_stop_rgba(0, 0, 0, 0, 0.35)
+            g.add_color_stop_rgba(1, 0, 0, 0, 0)
+            ctx.set_source(g)
+            ctx.arc(0, 0, self.w * 0.42, 0, 2 * math.pi)
+            ctx.fill()
+            ctx.restore()
+
+        # Rune, near: moves more than the glade (depth), breathes, hops while talking
+        box = self.meta["rune_box"]
+        ax, ay = self.to_widget(*self.meta["rune_anchor"])
+        breath = math.sin(t * 2 * math.pi / 4.2)
+        hop = abs(math.sin(t * 9)) * 3 if t < self.hop_until else 0
+        ctx.save()
+        ctx.translate(ax + tx * 5, ay + ty * 3 - hop)
+        ctx.scale(1 + 0.006 * breath, 1 + 0.014 * breath)
+        ctx.translate(-ax, -ay)
+        rx, ry = self.to_widget(box[0], box[1])
+        ctx.save()
+        ctx.translate(rx, ry)
+        ctx.scale(1 / self.ds, 1 / self.ds)
+        ctx.set_source_surface(self.rune, 0, 0)
+        ctx.paint()
+        ctx.restore()
+        # his eyelids
+        shut = self.blink(t)
+        if shut > 0.02:
+            for e in self.meta["eyes"]:
+                ex, ey = self.to_widget(e["x"], e["y"])
+                ew, eh = (e["w"] + 4) * self.s, (e["h"] + 4) * self.s
+                ctx.save()
+                # (only over the eye: its outline, a touch bigger)
+                ctx.save()
+                ctx.translate(ex, ey)
+                ctx.scale(ew / 2, eh / 2)
+                ctx.arc(0, 0, 1.05, 0, 2 * math.pi)
+                ctx.restore()
+                ctx.clip()
+                r, g, b = (c / 255 for c in e["fur"])
+                ctx.set_source_rgb(r, g, b)
+                ctx.rectangle(ex - ew, ey - eh / 2 - 1, ew * 2, (eh + 2) * shut)
+                ctx.fill()
+                # the lid's dark edge
+                ctx.set_source_rgba(0.07, 0.13, 0.3, 0.9)
+                ctx.set_line_width(max(0.8, 1.6 * self.s))
+                ctx.move_to(ex - ew, ey - eh / 2 + (eh + 2) * shut - 1)
+                ctx.line_to(ex + ew, ey - eh / 2 + (eh + 2) * shut - 1)
+                ctx.stroke()
+                ctx.restore()
+        ctx.restore()
+
+        # the flame's flicker: warm light that wavers
+        fb = self.meta.get("flame_box")
+        if fb:
+            fx, fy = self.to_widget(fb[0] + (fb[2] - fb[0]) * 0.3, fb[1] + (fb[3] - fb[1]) * 0.45)
+            flick = 0.10 + 0.06 * math.sin(t * 11) * math.sin(t * 7.3 + 1) + 0.12 * self.busy
+            rad = (fb[3] - fb[1]) * 0.45 * self.s
+            g = cairo.RadialGradient(fx, fy, 0, fx, fy, rad)
+            g.add_color_stop_rgba(0, 1.0, 0.55, 0.15, flick)
+            g.add_color_stop_rgba(1, 1.0, 0.45, 0.1, 0)
+            ctx.set_operator(cairo.OPERATOR_ADD)
+            ctx.set_source(g)
+            ctx.arc(fx, fy, rad, 0, 2 * math.pi)
+            ctx.fill()
+            ctx.set_operator(cairo.OPERATOR_OVER)
+        # embers
+        for e in self.embers:
+            age = (t - e["born"]) / e["life"]
+            a = (1 - age) * min(1, age * 6)
+            ex, ey = self.to_widget(e["x"], e["y"])
+            ex += tx * 5
+            ey += ty * 3
+            r = e["r"] * self.s * 2.2
+            g = cairo.RadialGradient(ex, ey, 0, ex, ey, r * 2.5)
+            g.add_color_stop_rgba(0, 1, 0.92, 0.6, 0.95 * a)
+            g.add_color_stop_rgba(0.35, 1, 0.55, 0.15, 0.7 * a)
+            g.add_color_stop_rgba(1, 1, 0.4, 0.1, 0)
+            ctx.set_source(g)
+            ctx.arc(ex, ey, r * 2.5, 0, 2 * math.pi)
+            ctx.fill()
+        ctx.restore()
+        if self.glade:
+            # the glade's rim
+            rounded(ctx, x0 + 0.5, y0 + 0.5, self.w - 1, self.h - 1, 16)
+            ctx.set_source_rgba(0.75, 0.9, 1, 0.28)
+            ctx.set_line_width(1)
+            ctx.stroke()
+
+
+def draw_shadow(ctx, x, y, w, h):
+    for i in range(SHADOW, 0, -2):
+        rounded(ctx, x - i + 1, y - i + 4, w + 2 * i - 2, h + 2 * i - 2, 16 + i)
+        ctx.set_source_rgba(0, 0, 0, 0.035)
+        ctx.fill()
+
+
+def render_frames(out, count=60, width=340):
+    """Draw frames to PNG files (for checking the animation without a screen)."""
+    os.makedirs(out, exist_ok=True)
+    for glade in (True, False):
+        scene = Scene(width, glade)
+        scene.want_busy = False
+        for i in range(count):
+            t = i / FPS
+            if i == count // 2:
+                scene.want_busy = True          # he's thinking, halfway through
+                scene.hop_until = t + 0.8
+            scene.blink_at = 0.9 if i < count // 2 else scene.blink_at
+            surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, scene.w + 2 * SHADOW, scene.h + 2 * SHADOW)
+            ctx = cairo.Context(surf)
+            if glade:
+                draw_shadow(ctx, SHADOW, SHADOW, scene.w, scene.h)
+            scene.draw(ctx, t, SHADOW, SHADOW)
+            surf.write_to_png(os.path.join(out, f"{'glade' if glade else 'solo'}-{i:03d}.png"))
+    return 0
+
+
+# ---------------------------------------------------------------- windows --
+
+def layer(window, conf, top, namespace, keyboard=False):
+    """Put a window in the corner (wlr-layer-shell); False if that isn't possible here."""
+    if not (GtkLayerShell and GtkLayerShell.is_supported()):
+        return False
+    if not GtkLayerShell.is_layer_window(window):
+        GtkLayerShell.init_for_window(window)
+        GtkLayerShell.set_namespace(window, namespace)
+    GtkLayerShell.set_layer(window, GtkLayerShell.Layer.OVERLAY if top == "overlay" else
+                            GtkLayerShell.Layer.TOP if top else GtkLayerShell.Layer.BOTTOM)
+    corner = conf["corner"]
+    for edge in (GtkLayerShell.Edge.TOP, GtkLayerShell.Edge.BOTTOM, GtkLayerShell.Edge.LEFT,
+                 GtkLayerShell.Edge.RIGHT):
+        GtkLayerShell.set_anchor(window, edge, False)
+    GtkLayerShell.set_anchor(window, GtkLayerShell.Edge.BOTTOM if corner.startswith("bottom")
+                             else GtkLayerShell.Edge.TOP, True)
+    GtkLayerShell.set_anchor(window, GtkLayerShell.Edge.RIGHT if corner.endswith("right")
+                             else GtkLayerShell.Edge.LEFT, True)
+    if keyboard:
+        GtkLayerShell.set_keyboard_mode(window, GtkLayerShell.KeyboardMode.ON_DEMAND)
+    if firox_monitors is not None:
+        try:
+            mon = firox_monitors.main_gdk_monitor(Gdk.Display.get_default())
+            if mon is not None:
+                GtkLayerShell.set_monitor(window, mon)
+        except Exception:
+            pass
+    return True
+
+
+def margins(window, conf, extra=0):
+    if not GtkLayerShell or not GtkLayerShell.is_layer_window(window):
+        return
+    bottom = conf["corner"].startswith("bottom")
+    vert = (PANEL_HEIGHT + EDGE if bottom else EDGE) + extra
+    GtkLayerShell.set_margin(window, GtkLayerShell.Edge.BOTTOM if bottom else GtkLayerShell.Edge.TOP, vert)
+    GtkLayerShell.set_margin(window, GtkLayerShell.Edge.RIGHT if conf["corner"].endswith("right")
+                             else GtkLayerShell.Edge.LEFT, EDGE)
+
+
+def transparent(window):
+    screen = window.get_screen()
+    visual = screen.get_rgba_visual()
+    if visual is not None:
+        window.set_visual(visual)
+    window.set_app_paintable(True)
+
+
+class RuneWindow(Gtk.Window):
+    """Rune in his corner."""
+
+    def __init__(self, app):
+        super().__init__(title="Rune")
+        self.app = app
+        self.set_decorated(False)
+        self.set_resizable(False)
+        transparent(self)
+        self.area = Gtk.DrawingArea()
+        self.area.add_events(Gdk.EventMask.POINTER_MOTION_MASK | Gdk.EventMask.LEAVE_NOTIFY_MASK |
+                             Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK)
+        self.area.connect("draw", self.on_draw)
+        self.area.connect("motion-notify-event", self.on_motion)
+        self.area.connect("leave-notify-event", lambda *_: setattr(self.scene, "mouse", None))
+        self.area.connect("button-release-event", self.on_click)
+        self.area.set_tooltip_text("Rune: click to chat, right-click for settings")
+        self.add(self.area)
+        self.scene = None
+        self.t0 = time.monotonic()
+        self.tick = None
+        self.apply()
+
+    def apply(self):
+        conf = self.app.conf
+        busy = self.scene.want_busy if self.scene else False
+        self.scene = Scene(WIDTHS.get(conf["size"], 340), conf["glade"], self.get_scale_factor())
+        self.scene.want_busy = busy
+        pad = SHADOW if conf["glade"] else 0
+        self.area.set_size_request(self.scene.w + 2 * pad, self.scene.h + 2 * pad)
+        self.resize(1, 1)
+        if not layer(self, conf, conf["on_top"], "firox-rune"):
+            self.move(40, 40)
+        margins(self, conf, -pad)
+        if self.tick is None:
+            self.fps = IDLE_FPS
+            self.tick = GLib.timeout_add(1000 // self.fps, self.on_tick)
+
+    def size(self):
+        pad = SHADOW if self.app.conf["glade"] else 0
+        return self.scene.w + 2 * pad, self.scene.h + 2 * pad
+
+    def on_tick(self):
+        self.area.queue_draw()
+        chatting = self.app.chat is not None and self.app.chat.get_visible()
+        want = FPS if (self.scene.mouse or self.scene.want_busy or self.scene.busy > 0.05 or chatting) else IDLE_FPS
+        if want != self.fps:
+            self.fps = want
+            self.tick = GLib.timeout_add(1000 // want, self.on_tick)
+            return False
+        return True
+
+    def on_draw(self, _w, ctx):
+        ctx.set_operator(cairo.OPERATOR_SOURCE)
+        ctx.set_source_rgba(0, 0, 0, 0)
+        ctx.paint()
+        ctx.set_operator(cairo.OPERATOR_OVER)
+        pad = SHADOW if self.app.conf["glade"] else 0
+        if self.app.conf["glade"]:
+            draw_shadow(ctx, pad, pad, self.scene.w, self.scene.h)
+        self.scene.draw(ctx, time.monotonic() - self.t0, pad, pad)
+        return True
+
+    def on_motion(self, _w, ev):
+        w, h = self.size()
+        self.scene.mouse = (max(-1, min(1, ev.x / w * 2 - 1)), max(-1, min(1, ev.y / h * 2 - 1)))
+
+    def on_click(self, _w, ev):
+        if ev.button == 1:
+            self.app.toggle_chat()
+        elif ev.button == 3:
+            self.menu(ev)
+        return True
+
+    def menu(self, ev):
+        conf = self.app.conf
+        m = Gtk.Menu()
+
+        def item(label, cb, check=None):
+            it = Gtk.CheckMenuItem(label=label) if check is not None else Gtk.MenuItem(label=label)
+            if check is not None:
+                it.set_active(check)
+            it.connect("activate", lambda *_: cb())
+            m.append(it)
+        item("Chat with Rune", self.app.toggle_chat)
+        m.append(Gtk.SeparatorMenuItem())
+        item("Show his glade", lambda: self.app.set("glade", not conf["glade"]), conf["glade"])
+        item("Keep above windows", lambda: self.app.set("on_top", not conf["on_top"]), conf["on_top"])
+        item("Settings…", self.app.settings)
+        m.append(Gtk.SeparatorMenuItem())
+        item("Put Rune away", self.app.put_away)
+        m.show_all()
+        m.popup_at_pointer(ev)
+
+
+def pango_markup(text):
+    """Light Markdown (bold, code, links) in an answer, as Pango markup."""
+    import re
+    out = GLib.markup_escape_text(text)
+    out = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", out)
+    out = re.sub(r"`([^`\n]+)`", r"<tt>\1</tt>", out)
+    out = re.sub(r"\[([^\]\n]+)\]\((https?://[^)\s]+)\)", r'<a href="\2">\1</a>', out)
+    out = re.sub(r'(?<!href=")(?<![">])(https?://[^\s<]+[^\s<.,;:!?)\]])', r'<a href="\1">\1</a>', out)
+    out = re.sub(r"(?m)^(\s*)[-*] ", r"\1• ", out)
+    return out
+
+
+CSS = b"""
+#rune-chat { background: transparent; }
+#bubble {
+    padding: 12px;
+    background-image: linear-gradient(to bottom, rgba(22, 44, 78, 0.97), rgba(14, 28, 52, 0.97));
+    border: 1px solid rgba(150, 210, 255, 0.35);
+    border-radius: 16px;
+    color: #eef5ff;
+}
+#bubble label { color: #eef5ff; }
+#bubble .dim { color: rgba(220, 235, 255, 0.65); font-size: 0.9em; }
+#bubble .title { font-weight: bold; font-size: 1.1em; }
+#bubble .me {
+    background-color: rgba(120, 180, 255, 0.22); border-radius: 12px; padding: 6px 10px;
+}
+#bubble .rune {
+    background-color: rgba(255, 255, 255, 0.07); border-radius: 12px; padding: 6px 10px;
+}
+#bubble .ask {
+    background-color: rgba(255, 170, 70, 0.16); border: 1px solid rgba(255, 170, 70, 0.55);
+    border-radius: 12px; padding: 8px 10px;
+}
+#bubble .error { color: #ffb4a8; }
+#bubble entry {
+    background: rgba(255, 255, 255, 0.10); color: #ffffff; border: 1px solid rgba(150, 210, 255, 0.35);
+    border-radius: 10px; caret-color: #ffffff; padding: 6px 8px; box-shadow: none;
+}
+#bubble button {
+    border-radius: 10px; background-image: none; background-color: rgba(255, 255, 255, 0.12);
+    border: 1px solid rgba(150, 210, 255, 0.30); color: #eef5ff; box-shadow: none; text-shadow: none;
+}
+#bubble button label { color: #eef5ff; }
+#bubble button:hover { background-color: rgba(255, 255, 255, 0.22); }
+#bubble button.suggested-action { background-color: #2f7fd8; border-color: #5aa6f0; }
+#bubble button.suggested-action:hover { background-color: #3a8de6; }
+#bubble button.flat { background-color: transparent; border-color: transparent; }
+#bubble button.flat:hover { background-color: rgba(255, 255, 255, 0.14); }
+#bubble button image { color: #eef5ff; }
+#bubble link, #bubble label link { color: #8fd0ff; }
+"""
+
+
+class ChatWindow(Gtk.Window):
+    """Rune's speech bubble: the conversation, his questions, your box."""
+
+    WIDTH, HEIGHT = 390, 470
+
+    def __init__(self, app):
+        super().__init__(title="Rune")
+        self.app = app
+        self.set_name("rune-chat")
+        self.set_decorated(False)
+        transparent(self)
+        self.connect("key-press-event", self.on_key)
+        self.pending = []           # [(event, answer dict)] his questions waiting for you
+        self.answer_label = None
+        self.answer_text = ""
+
+        bubble = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        bubble.set_name("bubble")
+        bubble.set_size_request(self.WIDTH, self.HEIGHT)
+        self.add(bubble)
+
+        head = Gtk.Box(spacing=8)
+        try:
+            head.pack_start(Gtk.Image.new_from_pixbuf(GdkPixbuf.Pixbuf.new_from_file_at_scale(AVATAR, 30, 30, True)),
+                            False, False, 0)
+        except GLib.Error:
+            pass
+        names = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        title = Gtk.Label(label="Rune", xalign=0)
+        title.get_style_context().add_class("title")
+        names.pack_start(title, False, False, 0)
+        self.status = Gtk.Label(label="", xalign=0)
+        self.status.get_style_context().add_class("dim")
+        names.pack_start(self.status, False, False, 0)
+        head.pack_start(names, True, True, 0)
+        # lit while a request is on its way to Anthropic
+        self.online = Gtk.Image.new_from_icon_name("network-transmit-receive-symbolic", Gtk.IconSize.MENU)
+        self.online.set_tooltip_text("Talking to Anthropic")
+        self.online.set_no_show_all(True)
+        head.pack_start(self.online, False, False, 0)
+        for icon, tip, cb in (("document-new-symbolic", "New conversation", self.new_chat),
+                              ("emblem-system-symbolic", "Rune's settings", app.settings),
+                              ("window-close-symbolic", "Close", self.hide_chat)):
+            b = Gtk.Button.new_from_icon_name(icon, Gtk.IconSize.MENU)
+            b.get_style_context().add_class("flat")
+            b.set_tooltip_text(tip)
+            b.connect("clicked", lambda _b, cb=cb: cb())
+            head.pack_start(b, False, False, 0)
+        bubble.pack_start(head, False, False, 0)
+
+        self.stack = Gtk.Stack()
+        bubble.pack_start(self.stack, True, True, 0)
+
+        # the conversation
+        talk = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        self.scroll = Gtk.ScrolledWindow()
+        self.scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self.list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        self.list.set_valign(Gtk.Align.END)
+        self.scroll.add(self.list)
+        # Stay at the newest message (unless you've scrolled up to read)
+        self.stick = True
+        adj = self.scroll.get_vadjustment()
+        adj.connect("changed", self.on_grow)
+        adj.connect("value-changed", lambda a: setattr(
+            self, "stick", a.get_value() >= a.get_upper() - a.get_page_size() - 4))
+        talk.pack_start(self.scroll, True, True, 0)
+        row = Gtk.Box(spacing=6)
+        self.entry = Gtk.Entry()
+        self.entry.set_placeholder_text("Ask Rune…")
+        self.entry.connect("activate", lambda *_: self.send())
+        row.pack_start(self.entry, True, True, 0)
+        self.send_btn = Gtk.Button.new_from_icon_name("mail-send-symbolic", Gtk.IconSize.BUTTON)
+        self.send_btn.set_tooltip_text("Send")
+        self.send_btn.connect("clicked", lambda *_: self.stop() if self.app.busy else self.send())
+        row.pack_start(self.send_btn, False, False, 0)
+        talk.pack_start(row, False, False, 0)
+        self.stack.add_named(talk, "talk")
+
+        # first time: the key
+        self.setup = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        self.stack.add_named(self.setup, "setup")
+        self.build_setup()
+
+        # a policy keeps him from chatting
+        no = Gtk.Label(xalign=0, wrap=True, max_width_chars=40)
+        no.set_text("Your organization's policy doesn't allow me to chat on this computer. "
+                    "I'll keep you company anyway.")
+        self.stack.add_named(no, "policy")
+
+        bubble.show_all()
+        self.refresh()
+
+    def build_setup(self):
+        box = self.setup
+        hello = Gtk.Label(xalign=0, wrap=True, max_width_chars=42)
+        hello.set_markup(
+            "<b>Hi! I'm Rune.</b> I can answer questions about Firox and anything else, search the web, "
+            "and do things on this computer for you, asking you first every time.\n\n"
+            "To talk, I use <b>Claude</b>, made by Anthropic, with your own <b>Claude API key</b>. "
+            "You pay Anthropic for what you use (usually a few cents a day of chatting); "
+            f"<a href=\"{KEYS_URL}\">get a key in the Claude Console</a>.\n\n"
+            "<small>Only what you type goes to Anthropic, straight from this computer: nothing is sent until "
+            "you ask me something. Our conversation stays on this computer.</small>")
+        box.pack_start(hello, False, False, 0)
+        self.key_entry = Gtk.Entry()
+        self.key_entry.set_visibility(False)
+        self.key_entry.set_placeholder_text("Paste your API key (sk-ant-…)")
+        self.key_entry.connect("activate", lambda *_: self.save_key())
+        box.pack_start(self.key_entry, False, False, 0)
+        save = Gtk.Button(label="Start chatting")
+        save.get_style_context().add_class("suggested-action")
+        save.connect("clicked", lambda *_: self.save_key())
+        box.pack_start(save, False, False, 0)
+        self.key_note = Gtk.Label(xalign=0, wrap=True, max_width_chars=42)
+        self.key_note.get_style_context().add_class("dim")
+        box.pack_start(self.key_note, False, False, 0)
+
+    def save_key(self):
+        key = self.key_entry.get_text().strip()
+        if not key.startswith("sk-") or len(key) < 20:
+            self.key_note.set_text("That doesn't look like a Claude API key: they start with sk-ant-.")
+            return
+        where = self.app.keys.set(key)
+        self.key_entry.set_text("")
+        self.key_note.set_text("")
+        self.refresh()
+        if where != "keyring":
+            self.say("rune", "(There's no keyring here, so I've kept your key in a file only you can read: "
+                             "~/.config/firox/rune-key.)", "dim")
+
+    def refresh(self):
+        if not B.policy()["chat"]:
+            self.stack.set_visible_child_name("policy")
+        elif not self.app.keys.get():
+            self.stack.set_visible_child_name("setup")
+        else:
+            self.stack.set_visible_child_name("talk")
+            if not self.list.get_children():
+                for who, text in self.app.brain.transcript():
+                    self.say(who, text)
+                if not self.list.get_children():
+                    self.say("rune", "Hi! What can I help you with? I can explain Firox, look things up, "
+                                     "or do things like open Settings or turn on Night Light (I'll ask first).")
+        self.place()
+
+    def place(self):
+        conf = self.app.conf
+        if layer(self, conf, "overlay", "firox-rune-chat", keyboard=True):
+            w, h = self.app.rune.size() if self.app.rune else (0, 0)
+            margins(self, conf, h - (SHADOW if conf["glade"] else 0) + 6)
+        self.resize(1, 1)
+
+    # -- the conversation
+    def say(self, who, text, css=None):
+        lab = Gtk.Label(xalign=0, wrap=True, selectable=True, max_width_chars=40)
+        lab.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
+        lab.set_markup(pango_markup(text))
+        lab.get_style_context().add_class(css or ("me" if who == "user" else "rune"))
+        lab.set_halign(Gtk.Align.END if who == "user" else Gtk.Align.START)
+        self.list.pack_start(lab, False, False, 0)
+        lab.show()
+        self.scroll_down()
+        return lab
+
+    def scroll_down(self):
+        # (once the new message is laid out: on_grow)
+        self.stick = True
+
+    def on_grow(self, adj):
+        if self.stick:
+            adj.set_value(adj.get_upper() - adj.get_page_size())
+
+    def send(self):
+        text = self.entry.get_text().strip()
+        if not text or self.app.busy:
+            return
+        self.entry.set_text("")
+        self.say("user", text)
+        self.answer_label, self.answer_text = None, ""
+        self.app.ask_brain(text)
+
+    def stop(self):
+        self.app.brain.cancelled.set()
+        for ev, ans in self.pending:
+            ans["yes"] = False
+            ev.set()
+
+    def new_chat(self):
+        if self.app.busy:
+            return
+        self.app.brain.forget()
+        for c in self.list.get_children():
+            c.destroy()
+        self.refresh()
+
+    # -- what the brain says (on the main thread)
+    def event(self, kind, data):
+        if kind == "busy":
+            self.online.set_visible(bool(data))
+            self.app.rune.scene.want_busy = bool(data)
+            self.status.set_text("Thinking…" if data else "")
+            self.send_btn.set_image(Gtk.Image.new_from_icon_name(
+                "process-stop-symbolic" if self.app.busy else "mail-send-symbolic", Gtk.IconSize.BUTTON))
+            self.send_btn.set_tooltip_text("Stop" if self.app.busy else "Send")
+        elif kind == "text":
+            self.answer_text += data
+            if self.answer_label is None:
+                self.answer_label = self.say("rune", self.answer_text.lstrip())
+            else:
+                self.answer_label.set_markup(pango_markup(self.answer_text.lstrip()))
+                self.scroll_down()
+            self.app.rune.scene.hop_until = time.monotonic() - self.app.rune.t0 + 0.4
+            self.status.set_text("")
+        elif kind == "status":
+            self.status.set_text(data)
+            if self.answer_label is not None:
+                self.answer_text += "\n\n"
+        elif kind == "did":
+            self.say("rune", f"✓ {data}", "dim")
+            self.answer_label, self.answer_text = None, ""
+        elif kind == "sources":
+            links = "  ".join(f'<a href="{GLib.markup_escape_text(u)}">{GLib.markup_escape_text(t[:40])}</a>'
+                              for t, u in data)
+            lab = self.say("rune", "", "dim")
+            lab.set_markup("<small>Sources: " + links + "</small>")
+        elif kind == "error":
+            lab = self.say("rune", data)
+            lab.get_style_context().add_class("error")
+            self.status.set_text("")
+        elif kind == "done":
+            self.event("busy", False)
+            self.answer_label, self.answer_text = None, ""
+
+    def ask(self, question, ev, answer):
+        """His question about doing something: Allow / Not now."""
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        card.get_style_context().add_class("ask")
+        q = Gtk.Label(xalign=0, wrap=True, max_width_chars=38)
+        q.set_markup("<b>May I?</b>  " + GLib.markup_escape_text(question))
+        card.pack_start(q, False, False, 0)
+        row = Gtk.Box(spacing=6)
+        yes = Gtk.Button(label="Allow")
+        yes.get_style_context().add_class("suggested-action")
+        no = Gtk.Button(label="Not now")
+        row.pack_end(yes, False, False, 0)
+        row.pack_end(no, False, False, 0)
+        card.pack_start(row, False, False, 0)
+        self.pending.append((ev, answer))
+
+        def choose(ok):
+            answer["yes"] = ok
+            row.destroy()
+            done = Gtk.Label(label="Allowed" if ok else "Not allowed", xalign=1)
+            done.get_style_context().add_class("dim")
+            card.pack_start(done, False, False, 0)
+            done.show()
+            if (ev, answer) in self.pending:
+                self.pending.remove((ev, answer))
+            ev.set()
+        yes.connect("clicked", lambda *_: choose(True))
+        no.connect("clicked", lambda *_: choose(False))
+        self.list.pack_start(card, False, False, 0)
+        card.show_all()
+        yes.grab_focus()
+        self.answer_label, self.answer_text = None, ""
+        self.scroll_down()
+        self.app.show_chat()
+
+    def hide_chat(self):
+        # (closing the bubble says no to anything he was asking)
+        for ev, ans in list(self.pending):
+            ans["yes"] = False
+            ev.set()
+        self.pending.clear()
+        self.hide()
+
+    def on_key(self, _w, ev):
+        if ev.keyval == Gdk.KEY_Escape:
+            self.hide_chat()
+            return True
+        return False
+
+
+class SettingsWindow(Gtk.Window):
+    def __init__(self, app):
+        super().__init__(title="Rune's Settings")
+        self.app = app
+        self.set_icon_from_file(AVATAR) if os.path.exists(AVATAR) else None
+        self.set_resizable(False)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        box.set_border_width(16)
+        self.add(box)
+        conf = app.conf
+
+        def section(text):
+            lab = Gtk.Label(xalign=0)
+            lab.set_markup(f"<b>{text}</b>")
+            box.pack_start(lab, False, False, 4)
+
+        def row(label, widget):
+            r = Gtk.Box(spacing=10)
+            r.pack_start(Gtk.Label(label=label, xalign=0), True, True, 0)
+            r.pack_end(widget, False, False, 0)
+            box.pack_start(r, False, False, 0)
+
+        def combo(key, options):
+            c = Gtk.ComboBoxText()
+            for k, v in options:
+                c.append(k, v)
+            c.set_active_id(conf[key])
+            c.connect("changed", lambda w: app.set(key, w.get_active_id()))
+            return c
+
+        def check(key, label):
+            c = Gtk.CheckButton(label=label)
+            c.set_active(conf[key])
+            c.connect("toggled", lambda w: app.set(key, w.get_active()))
+            box.pack_start(c, False, False, 0)
+
+        section("On the desktop")
+        row("Corner", combo("corner", [("bottom-right", "Bottom right"), ("bottom-left", "Bottom left"),
+                                       ("top-right", "Top right"), ("top-left", "Top left")]))
+        row("Size", combo("size", [("small", "Small"), ("medium", "Medium"), ("large", "Large")]))
+        check("glade", "Show his glade (or just Rune)")
+        check("on_top", "Keep him above windows")
+
+        section("Talking (Claude)")
+        row("Model", combo("model", [(m, f"{n}: {d}") for m, n, d in B.MODELS]))
+        self.key_label = Gtk.Label(xalign=0, wrap=True, max_width_chars=48)
+        box.pack_start(self.key_label, False, False, 0)
+        keys = Gtk.Box(spacing=8)
+        self.key_entry = Gtk.Entry()
+        self.key_entry.set_visibility(False)
+        self.key_entry.set_placeholder_text("New API key (sk-ant-…)")
+        keys.pack_start(self.key_entry, True, True, 0)
+        save = Gtk.Button(label="Save Key")
+        save.connect("clicked", lambda *_: self.save_key())
+        keys.pack_start(save, False, False, 0)
+        remove = Gtk.Button(label="Remove Key")
+        remove.connect("clicked", lambda *_: self.remove_key())
+        keys.pack_start(remove, False, False, 0)
+        box.pack_start(keys, False, False, 0)
+        link = Gtk.Label(xalign=0)
+        link.set_markup(f"<a href=\"{KEYS_URL}\">Get an API key in the Claude Console</a>")
+        box.pack_start(link, False, False, 0)
+        privacy = Gtk.Label(xalign=0, wrap=True, max_width_chars=56)
+        privacy.set_markup("<small>Only what you type goes to Anthropic (with Firox's help, so I know Firox), "
+                           "straight from this computer, and only once you ask me something. Before I do anything "
+                           "on the computer I ask you. Our conversation is kept on this computer until you "
+                           "start a new one.</small>")
+        privacy.get_style_context().add_class("dim-label")
+        box.pack_start(privacy, False, False, 0)
+        forget = Gtk.Button(label="Forget Our Conversation")
+        forget.connect("clicked", lambda *_: self.app.forget())
+        box.pack_start(forget, False, False, 0)
+
+        bottom = Gtk.Box(spacing=8)
+        away = Gtk.Button(label="Put Rune Away")
+        away.set_tooltip_text("He leaves the desktop until you open Rune from the Start menu")
+        away.connect("clicked", lambda *_: (self.destroy(), app.put_away()))
+        bottom.pack_start(away, False, False, 0)
+        close = Gtk.Button(label="Close")
+        close.connect("clicked", lambda *_: self.destroy())
+        bottom.pack_end(close, False, False, 0)
+        box.pack_start(bottom, False, False, 6)
+        self.update_key()
+        self.show_all()
+
+    def update_key(self):
+        where = self.app.keys.where()
+        self.key_label.set_text({"keyring": "Your API key is saved in your keyring.",
+                                 "file": "Your API key is saved in a file only you can read "
+                                         "(~/.config/firox/rune-key), because there's no keyring here.",
+                                 None: "No API key yet: I can't chat until you add one."}[where])
+
+    def save_key(self):
+        key = self.key_entry.get_text().strip()
+        if not key.startswith("sk-") or len(key) < 20:
+            self.key_label.set_text("That doesn't look like a Claude API key: they start with sk-ant-.")
+            return
+        self.app.keys.set(key)
+        self.key_entry.set_text("")
+        self.update_key()
+        self.app.key_changed()
+
+    def remove_key(self):
+        self.app.keys.clear()
+        self.update_key()
+        self.app.key_changed()
+
+
+class RuneApp(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id="org.firox.Rune", flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE)
+        self.conf = B.load_conf()
+        self.keys = B.KeyStore()
+        self.brain = B.Brain(self.keys)
+        self.rune = self.chat = self.prefs = None
+        self.busy = False
+
+    def do_startup(self):
+        Gtk.Application.do_startup(self)
+        prov = Gtk.CssProvider()
+        prov.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), prov,
+                                                 Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+    def do_command_line(self, cmdline):
+        args = cmdline.get_arguments()[1:]
+        if not B.policy()["allowed"]:
+            print("firox-rune: a policy has turned Rune off on this computer", file=sys.stderr)
+            if self.rune is None:
+                self.quit()
+            return 0
+        if "--hide" in args:
+            self.put_away()
+            return 0
+        if "--at-login" in args and not self.conf["enabled"]:
+            if self.rune is None:
+                self.quit()
+            return 0
+        if not self.conf["enabled"]:
+            self.set("enabled", True)       # opened from the Start menu: he's back
+        first = self.rune is None
+        if first:
+            self.rune = RuneWindow(self)
+            self.add_window(self.rune)
+            self.rune.show_all()
+        if "--settings" in args:
+            self.settings()
+        elif "--chat" in args or (not first and "--at-login" not in args):
+            self.show_chat()
+        return 0
+
+    # -- settings
+    def set(self, key, value):
+        self.conf[key] = value
+        B.save_conf(self.conf)
+        if key in ("corner", "size", "glade", "on_top") and self.rune is not None:
+            self.rune.apply()
+            if self.chat is not None:
+                self.chat.place()
+
+    def settings(self):
+        if self.prefs is not None:
+            self.prefs.present()
+            return
+        self.prefs = SettingsWindow(self)
+        self.prefs.connect("destroy", lambda *_: setattr(self, "prefs", None))
+        self.add_window(self.prefs)
+
+    def key_changed(self):
+        if self.chat is not None:
+            self.chat.refresh()
+
+    def forget(self):
+        if self.busy:
+            return
+        self.brain.forget()
+        if self.chat is not None:
+            for c in self.chat.list.get_children():
+                c.destroy()
+            self.chat.refresh()
+
+    def put_away(self):
+        self.set("enabled", False)
+        self.quit()
+
+    # -- chat
+    def show_chat(self):
+        if self.chat is None:
+            self.chat = ChatWindow(self)
+            self.add_window(self.chat)
+        self.chat.refresh()
+        self.chat.show()
+        self.chat.present()
+        if self.chat.stack.get_visible_child_name() == "talk":
+            self.chat.entry.grab_focus()
+        else:
+            self.chat.key_entry.grab_focus()
+
+    def toggle_chat(self):
+        if self.chat is not None and self.chat.get_visible():
+            self.chat.hide_chat()
+        else:
+            self.show_chat()
+
+    def ask_brain(self, text):
+        self.busy = True
+
+        def on_event(kind, data):
+            if kind == "done":
+                self.busy = False
+            GLib.idle_add(lambda: self.chat.event(kind, data) or False)
+
+        def ask(question):
+            ev, answer = threading.Event(), {"yes": False}
+            GLib.idle_add(lambda: self.chat.ask(question, ev, answer) or False)
+            ev.wait()
+            return answer["yes"]
+
+        threading.Thread(target=self.brain.send, args=(text, on_event, ask), daemon=True).start()
+
+
+def main(argv):
+    if len(argv) >= 3 and argv[1] == "--frames":
+        return render_frames(argv[2], int(argv[3]) if len(argv) > 3 else 60, int(argv[4]) if len(argv) > 4 else 340)
+    return RuneApp().run(argv)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

@@ -57,6 +57,7 @@
     <li><a href="#glade">The crystals and the scroll</a></li>
     <li><a href="#tail">The tail</a></li>
     <li><a href="#facts">Rune, in short</a></li>
+    <li><a href="#desktop">Rune on your desktop</a></li>
     <li><a href="#find">Where to find him</a></li>
 </ul>
 
@@ -92,10 +93,63 @@
     <dt>Named</dt><dd>In November 2026, by the project's maintainer, from a shortlist that also had Flint, Cinder and Fen.</dd>
 </dl>
 
+<h2 id="desktop">Rune on your desktop</h2>
+<div class="feature">
+    <div class="feature-text">
+        <p>Rune lives in a corner of your desktop, in a little window onto his glade. He isn't a still picture: he breathes and blinks, his tail throws embers, the runes and crystals glow, the stars twinkle, and the glade tilts a little when your mouse is over him.</p>
+        <p><b>Click him to chat.</b> Ask him anything: how to do something in Firox, what a setting means, or something about the wider world. He knows Firox's help by heart and can search the web for anything recent.</p>
+        <p><b>He can do things for you, but he always asks first.</b> Before he does anything on your computer, a card pops up saying exactly what he wants to do, with <b>Allow</b> and <b>Not now</b>. He can:</p>
+        <ul>
+            <li>open Settings, at the right page</li>
+            <li>open Firox's tools (Task Manager, Disk Cleanup, Backup and Restore…)</li>
+            <li>open your apps, folders or a web page</li>
+            <li>switch the look</li>
+            <li>turn Night Light on or off</li>
+            <li>set the volume</li>
+            <li>check for updates</li>
+            <li>start a backup</li>
+        </ul>
+        <p>He can't run commands, read your files or see your screen.</p>
+    </div>
+    <figure>
+        <img src="assets/rune-alive.webp" alt="Rune in his glade, animated: breathing, blinking, embers rising from his tail and the runes glowing" loading="lazy">
+        <figcaption>Rune in the corner of the desktop</figcaption>
+    </figure>
+</div>
+<div class="feature">
+    <div class="feature-text">
+        <h3>How he talks: Claude, with your own key</h3>
+        <p>Rune thinks with <b>Claude</b>, Anthropic's AI. To chat, he needs your own <b>Claude API key</b>, from the <a href="https://console.anthropic.com/settings/keys">Claude Console</a>. You pay Anthropic directly for what you use, usually a few cents a day of chatting. In his settings you can pick a cheaper, faster model.</p>
+        <p><b>No spyware.</b></p>
+        <ul>
+            <li><b>Nothing until you ask:</b> nothing leaves your computer until you've given him a key and asked him something.</li>
+            <li><b>What's sent:</b> only what you type goes to Anthropic, together with Firox's help so he knows Firox. It goes straight from your computer, with no Firox server in between and no tracking.</li>
+            <li><b>When it's sent:</b> a small network icon shows while a request is on its way.</li>
+            <li><b>Your key:</b> kept in your keyring.</li>
+            <li><b>Your conversation:</b> stays on your computer until you start a new one.</li>
+        </ul>
+        <p><b>Right-click him</b> for his settings:</p>
+        <ul>
+            <li>which corner he sits in, and his size</li>
+            <li>his glade or just him</li>
+            <li>above or under your windows</li>
+            <li>which model, and your key</li>
+            <li><b>Put Rune Away</b>; open <b>Rune</b> from the Start menu to bring him back</li>
+        </ul>
+        <p>Schools and offices can turn him off, or keep him as a mascot who never chats, with a <a href="policy.html">policy</a>.</p>
+        <p class="tech">firox-rune (GTK, layer-shell, Cairo; the wallpaper cut into layers by scripts/rune-layers.py), firox_rune_brain (the Anthropic Python SDK, streaming; Claude's web search tool; ten tools, each needing your OK)</p>
+    </div>
+    <figure>
+        <img src="screenshots/rune-helper.png" alt="Rune's chat bubble above him: asked to turn on Night Light, he says he can and shows a card, May I? Turn Night Light on?, with Not now and Allow buttons" loading="lazy">
+        <figcaption>He asks before he does anything</figcaption>
+    </figure>
+</div>
+
 <h2 id="find">Where to find him</h2>
 <div class="feature">
     <div class="feature-text">
         <ul>
+            <li><b>The corner of your desktop,</b> in his glade: click him to chat.</li>
             <li><b>The boot screen,</b> above the firox name, with his ember circling underneath.</li>
             <li><b>The Start button,</b> in every look.</li>
             <li><b>The Start menu,</b> at the top right, across from your picture.</li>
@@ -111,7 +165,7 @@
     </figure>
 </div>
 
-<div class="note">Rune's pictures were made by the project's maintainer with Nano Banana, Google's image-generating AI. His story was written by Claude, the AI that writes most of Firox. <a href="ai.html">How AI was used</a>.</div>
+<div class="note">Rune's pictures were made by the project's maintainer with Nano Banana, Google's image-generating AI. His story was written by Claude, the AI that writes most of Firox, and when you chat with him on your desktop, Claude is who answers. <a href="ai.html">How AI was used</a>.</div>
 
 </div>
 </main>

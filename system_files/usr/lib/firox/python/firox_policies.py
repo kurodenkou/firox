@@ -330,6 +330,18 @@ def apply_stream(allowed):
     return "allowed" if allowed else "not allowed (running hosts stopped)"
 
 
+def apply_rune(allowed):
+    # Read by firox-rune from managed.json; put him away now
+    if not allowed:
+        run("pkill", "-f", "firox-rune", check=False)
+    return "allowed" if allowed else "not allowed (Rune put away)"
+
+
+def apply_rune_chat(allowed):
+    # Read by firox-rune when someone asks him something
+    return "allowed" if allowed else "not allowed"
+
+
 def apply_powerwash(allowed):
     # Read by firox-powerwash and /usr/libexec/firox/reset from managed.json
     return "allowed" if allowed else "not allowed"
@@ -1197,6 +1209,15 @@ POLICIES = [
            "Whether other computers may stream this one with Firox Stream. Not allowed turns it off and "
            "keeps it off; allowed leaves it to each person.",
            "bool", apply_stream, on_label="Allowed", off_label="Not allowed"),
+    Policy("rune.allowed", "Applications/Rune", "Rune on the desktop",
+           "Whether Rune, the Firox mascot, can sit on the desktop at all. Not allowed puts him away and keeps "
+           "him away; allowed leaves it to each person (he can be put away from his menu).",
+           "bool", apply_rune, on_label="Allowed", off_label="Not allowed"),
+    Policy("rune.chat", "Applications/Rune", "Chatting with Claude",
+           "Whether Rune can answer questions and do things for people, using Claude (Anthropic's AI) with "
+           "their own Claude API key. Not allowed keeps him as a mascot only: nothing is ever sent to "
+           "Anthropic.",
+           "bool", apply_rune_chat, on_label="Allowed", off_label="Not allowed"),
 ]
 
 BY_KEY = {p.key: p for p in POLICIES}

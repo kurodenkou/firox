@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Rune
+GenericName=Desktop Helper
+Comment=Rune, the Firox mascot: ask him about your computer, or anything else
+Exec=firox-rune
+Icon=/usr/share/firox/icons/start-mascot.png
+Categories=Utility;
+Keywords=rune;mascot;helper;assistant;claude;ai;chat;help;
+StartupNotify=false
