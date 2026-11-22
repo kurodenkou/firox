@@ -42,7 +42,7 @@ tooltip label {
     margin-right: 6px;
     border-radius: 0 12px 12px 0;
     background-image:
-        url("/usr/share/firox/icons/start-orb.svg"),
+        url("/usr/share/firox/icons/start-mascot.png"),
         linear-gradient(to bottom,
             #388e38 0%, #5fbf5f 8%, #3c9d3c 20%, #379537 70%,
             #2d7f2d 90%, #1e5f1e 100%);
@@ -53,14 +53,14 @@ tooltip label {
 }
 #custom-start:hover {
     background-image:
-        url("/usr/share/firox/icons/start-orb.svg"),
+        url("/usr/share/firox/icons/start-mascot.png"),
         linear-gradient(to bottom,
             #45a345 0%, #78d478 8%, #4cb34c 20%, #46aa46 70%,
             #379037 90%, #256d25 100%);
 }
 #custom-start:active {
     background-image:
-        url("/usr/share/firox/icons/start-orb.svg"),
+        url("/usr/share/firox/icons/start-mascot.png"),
         linear-gradient(to bottom, #1e5f1e 0%, #2d7f2d 15%, #379537 80%, #3c9d3c 100%);
 }
 
