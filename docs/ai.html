@@ -22,6 +22,7 @@
         <a href="policy.html">Policy</a>
         <a href="install.html">Install</a>
         <a href="guide.html">Guide</a>
+        <a href="rune.html">Rune</a>
         <a href="ai.html" aria-current="page">AI use</a>
         <a href="https://github.com/kurodenkou/firox">GitHub</a>
         </nav>
@@ -36,7 +37,7 @@
 <main>
 <div class="wrap">
 
-<div class="note"><b>In short:</b> nearly every line of code, the website, the built-in help, the themes, icons and wallpapers, and the screenshots were produced by <b>Claude</b>, an AI model made by <a href="https://www.anthropic.com/">Anthropic</a>, working through <a href="https://claude.com/claude-code">Claude Code</a>. A human chose the features, reported what was wrong and reviewed and merged each change. If that matters to you, and it reasonably might, you should know it before you install Firox.</div>
+<div class="note"><b>In short:</b> nearly every line of code, the website, the built-in help, the themes, icons and most wallpapers, and the screenshots were produced by <b>Claude</b>, an AI model made by <a href="https://www.anthropic.com/">Anthropic</a>, working through <a href="https://claude.com/claude-code">Claude Code</a>. A human chose the features, reported what was wrong and reviewed and merged each change. If that matters to you, and it reasonably might, you should know it before you install Firox.</div>
 
 <ul class="toc">
     <li><a href="#numbers">By the numbers</a></li>
@@ -71,6 +72,7 @@
             <li>Installs the builds on their own computers and reports what doesn't work. For example, the Steam mouse problem was found and confirmed fixed on real hardware.</li>
             <li>Overrules the AI when it's wrong. For example, they had a change to the Proton Wayland setting reverted.</li>
             <li>Scans the code with <a href="https://snyk.io/">Snyk</a> and passes its findings on. Claude then fixed them, such as certificate checking in the Android app, a file path check, and replacing SHA-1.</li>
+            <li>Provided the pictures of Rune, the mascot, and his wallpaper, Rune's Glade, and chose his name. Claude cut the picture out of its background and fitted it to the boot screen, Start button, Start menu and fastfetch.</li>
             <li>Reviews and merges, or declines, every pull request.</li>
         </ul>
     </div>
@@ -78,7 +80,8 @@
         <h3>Claude (an AI model)</h3>
         <ul>
             <li>Writes the code: the desktop programs (Python and GTK), the shell scripts, the image build, the Android app for Firox Stream.</li>
-            <li>Draws the artwork as code: the themes, the SVG icons, the user pictures and the wallpapers. No image-generating AI was used for these.</li>
+            <li>Draws the artwork as code: the themes, the SVG icons, the user pictures and the theme wallpapers. No image-generating AI was used for these. Rune, the mascot, and his wallpaper are the exception: the maintainer provided those.</li>
+            <li>Wrote <a href="rune.html">Rune's</a> backstory.</li>
             <li>Writes this website, the README and the help that comes with Firox, including this page.</li>
             <li>Tests its own changes in throwaway Linux containers and takes the screenshots there.</li>
             <li>Writes the commit messages and pull requests.</li>

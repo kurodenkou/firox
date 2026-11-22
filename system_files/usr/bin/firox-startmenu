@@ -350,11 +350,12 @@ class StartMenu(Gtk.Window):
         name = Gtk.Label(label=user_display_name(), xalign=0)
         name.set_ellipsize(Pango.EllipsizeMode.END)
         header.pack_start(name, True, True, 0)
-        # The Firox mascot, on the right of the header
+        # Rune, the Firox mascot, on the right of the header
         try:
             mascot = Gtk.Image.new_from_pixbuf(GdkPixbuf.Pixbuf.new_from_file_at_scale(MASCOT, 56, 56, True))
             mascot.set_name("mascot")
             mascot.set_valign(Gtk.Align.CENTER)
+            mascot.set_tooltip_text("Rune, the Firox mascot")
             header.pack_end(mascot, False, False, 0)
         except GLib.Error:
             pass

@@ -1,9 +1,9 @@
 [Plymouth Theme]
 Name=Firox Linux
-Description=The Firox mascot and name with a spinner under it (Fedora's spinner theme with Firox's picture)
+Description=Rune, the Firox mascot, over the firox name, with a spinner under it (Fedora's spinner theme with Firox's picture)
 ModuleName=two-step
 
-# Images: watermark.png is the mascot over the firox name; the spinner frames are copied in
+# Images: watermark.png is Rune, the mascot, over the firox name; the spinner frames are copied in
 # from the spinner theme when the image is built (build.sh).
 [two-step]
 Font=DejaVu Sans 12

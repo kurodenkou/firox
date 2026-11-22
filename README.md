@@ -11,6 +11,8 @@ A desktop Linux built on [Universal Blue](https://universal-blue.org/) (Fedora A
 
 **Firox is written almost entirely by AI.** Its code, website, help and artwork were written by Claude, an AI model made by Anthropic, using Claude Code. One human maintainer chooses the features, tests the builds and reviews and merges every change. See [How AI was used in this project](https://kurodenkou.github.io/firox/ai.html).
 
+Its mascot is **Rune**, a fox-dragon who keeps the stones Firox is carved into: [meet him](https://kurodenkou.github.io/firox/rune.html).
+
 Themes, icons, wallpapers and the Start menu are original work; no Microsoft assets are used. It was briefly called FirefoxOS, until it was determined that the name was already used, and was quickly renamed Firox Linux.
 
 ![Firox Linux desktop with the Start menu open](docs/screenshots/start-menu.png)

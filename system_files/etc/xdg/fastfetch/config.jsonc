@@ -1,5 +1,5 @@
 // Firox Linux: fastfetch's system-wide settings.
-// Shows the Firox mascot instead of Fedora's logo, drawn in coloured
+// Shows Rune, the Firox mascot, instead of Fedora's logo, drawn in coloured
 // characters (chafa), so it works in any terminal with 24-bit colour. On the
 // text console (16 colours) /etc/profile.d/firox-fetch.sh swaps in the text
 // logo, /usr/share/firox/fastfetch/logo.txt.

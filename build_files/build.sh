@@ -115,7 +115,7 @@ PACKAGES=(
     vlc                          # Media Player (music, videos, DVDs)
     vlc-plugin-ffmpeg            # VLC's codecs (weak deps are off; uses the base's full ffmpeg)
     fastfetch
-    chafa-libs                   # fastfetch draws the Firox mascot (an image) in coloured characters
+    chafa-libs                   # fastfetch draws Rune, the Firox mascot (an image), in coloured characters
     zenity                       # dialogs for shell scripts (zenity --info, --question, --file-selection...)
     rsync                        # Backup and Restore (firox-backup)
     syncthing                    # Sync between Firox computers (firox-sync)
@@ -309,7 +309,7 @@ fi
 mkdir -p /usr/share/firox
 echo "${FIROX_IMAGE_REPO}:latest" > /usr/share/firox/image-ref
 
-# Boot splash: the Firox mascot and name over Fedora's spinner (theme in
+# Boot splash: Rune, the Firox mascot, and the name over Fedora's spinner (theme in
 # system_files/usr/share/plymouth/themes/firox; the spinner frames come from
 # the spinner theme, keeping our watermark.png)
 cp -n /usr/share/plymouth/themes/spinner/*.png /usr/share/plymouth/themes/firox/
