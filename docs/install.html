@@ -56,7 +56,14 @@
 <p>Build an installer ISO yourself, which is the usual way. You need the Firox source and <a href="https://just.systems/">just</a>:</p>
 <div class="code"><pre><code>just build-iso ghcr.io/kurodenkou/firox latest</code></pre></div>
 <p>Or, in GitHub, run <b>Actions → Build disk images</b> (manual only) and download the <code>anaconda-iso</code> artifact.</p>
-<p>The installer creates your user account; there's no separate setup wizard afterwards.</p>
+<p><b>One ISO for every computer.</b></p>
+<ul>
+    <li><b>The installer</b> asks only which disk to use. It installs on its own and restarts.</li>
+    <li><b>Firox's first-time setup</b> then asks for the network (Wi-Fi, if there's no cable), the time zone and keyboard, your account and the computer's name.</li>
+    <li><b>Then it gets the latest Firox.</b> A computer with a supported NVIDIA card (GTX 16 / RTX 20 series and newer) switches to the <a href="#nvidia">NVIDIA image</a> on its own. Any other computer just updates.</li>
+    <li><b>Afterwards</b> it restarts into the new version, and you log in with the account you made.</li>
+    <li><b>Without internet</b> it skips the update, and Firox updates itself later.</li>
+</ul>
 
 <h2 id="nvidia">NVIDIA graphics</h2>
 <p>There's a second image, <code>ghcr.io/kurodenkou/firox-nvidia-open</code>, with NVIDIA's driver built in. It supports <b>GTX 16-series / RTX 20-series and newer</b> cards. It uses Universal Blue's prebuilt, signed open kernel modules, matched to the image's kernel.</p>
@@ -65,10 +72,15 @@
 <p>It checks your card, switches to the NVIDIA image and keeps your files and settings. <code>ujust remove-nvidia</code> switches back.</p>
 <div class="note"><b>Secure Boot:</b> before restarting, run <code>ujust enroll-secure-boot-key</code>, then choose <b>Enroll MOK</b> on the blue screen at the next boot (password <code>universalblue</code>).</div>
 <h3>Fresh install</h3>
-<p>Build the ISO from the NVIDIA image:</p>
+<p>Use the standard ISO: first-time setup finds a supported NVIDIA card and switches to the NVIDIA image by itself, while you're online.</p>
+<ul>
+    <li><b>Secure Boot:</b> if it's on, setup also gets the driver's key ready, and tells you what to choose on the blue screen at the restart. The password is <code>universalblue</code>.</li>
+    <li><b>Older NVIDIA cards</b> (GTX 10-series and older) stay on the standard image, because NVIDIA's open driver doesn't support them.</li>
+</ul>
+<p>To install without internet, you can still build the ISO from the NVIDIA image:</p>
 <div class="code"><pre><code>just build-nvidia</code></pre></div>
 <div class="code"><pre><code>just build-iso localhost/firox-nvidia-open</code></pre></div>
-<p>The installed system keeps updating from the NVIDIA image: each image records its own update address, and the installer points updates there.</p>
+<p>The installed system then keeps updating from the NVIDIA image: each image records its own update address, and the installer points updates there.</p>
 <ul>
     <li><b>Safety net:</b> if a computer with a supported NVIDIA card runs the standard image, a notification at login (shown once) offers to switch.</li>
     <li><b>Android apps</b> use software rendering on NVIDIA; <code>ujust setup-waydroid</code> sets that up for you.</li>

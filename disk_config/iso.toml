@@ -1,8 +1,19 @@
-# Anaconda installer ISO.
-# Firox Linux has no GNOME/KDE initial-setup wizard, so the installer itself
-# creates the first user, sets the timezone and configures the network.
+# Anaconda installer ISO: one ISO for every computer.
+# The installer asks only which disk to use (Installation Destination);
+# everything else is answered here, and it restarts by itself when it's done.
+# There's no account and no root password yet: Firox's own first-time setup
+# (firox-oobe, on the login screen) asks for the network, time zone,
+# keyboard, account and computer name, then gets the latest Firox (the
+# NVIDIA image on computers with an NVIDIA graphics card).
 [customizations.installer.kickstart]
 contents = """
+lang en_US.UTF-8
+keyboard us
+timezone UTC --utc
+network --bootproto=dhcp --device=link --activate --onboot=on
+rootpw --lock
+reboot
+
 %post
 # Point updates at the published image this ISO was built from: the
 # standard image or the NVIDIA one (the image records which in
@@ -17,6 +28,10 @@ if [ -z "$ref" ]; then
     fi
 fi
 bootc switch --mutate-in-place --transport registry "$ref"
+
+# First-time setup on the first start (firox-greeter shows it while this exists)
+mkdir -p /var/lib/firox
+touch /var/lib/firox/oobe
 %end
 """
 

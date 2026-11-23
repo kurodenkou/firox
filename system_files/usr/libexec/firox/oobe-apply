@@ -3,10 +3,22 @@
 The root side of first-time setup (firox-oobe): reads the answers as JSON on
 stdin and makes them so.
 
-    {"user", "fullname", "password", "hostname", "timezone", "layout"}
+    {"user", "fullname", "password", "hostname", "timezone", "layout",
+     "reboot": seconds (optional: restart this long after, into an update)}
 
 or {"audit": true}: audit mode instead (Ctrl+Shift+F3 on first-time setup,
 as in Windows), see firox_reset.enter_audit.
+
+or {"update": true}: get the latest Firox before the account is made. With
+an NVIDIA graphics card, switch to the NVIDIA image (firox-nvidia-open,
+NVIDIA's driver built in); otherwise update the image this computer
+follows. Progress goes to stdout, one line at a time:
+
+    STEP <what's happening>     LOG <bootc's own output>
+    RESULT staged|current       (staged: restart to use it)
+    MOK <password>              (Secure Boot is on: the NVIDIA driver's
+                                 signing key is waiting to be enrolled at
+                                 the next start, with this password)
 
 It only does anything while first-time setup is waiting
 (/var/lib/firox/oobe), and removes that once the account exists, so it
@@ -27,6 +39,10 @@ FLAG = "/var/lib/firox/oobe"
 USER_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
 HOST_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
 LAYOUT_RE = re.compile(r"^[a-z]{2,12}$")
+# Universal Blue's key for the kernel modules it builds (NVIDIA's included),
+# and the password its own `ujust enroll-secure-boot-key` uses
+MOK_CERT = "/etc/pki/akmods/certs/akmods-ublue.der"
+MOK_PASSWORD = "universalblue"
 RESERVED = {"root", "bin", "daemon", "adm", "lp", "sync", "shutdown", "halt", "mail", "operator", "games",
             "ftp", "nobody", "greetd", "admin", "administrator", "guest", "user"}
 
@@ -42,6 +58,97 @@ def run(*cmd, data=None):
         fail(f"{cmd[0]}: {(p.stderr or p.stdout).strip()[:200]}")
 
 
+def nvidia_cards(lspci_output=None):
+    """The NVIDIA graphics cards lspci lists (display controllers, not their HDMI audio)."""
+    if lspci_output is None:
+        try:
+            lspci_output = subprocess.run(["lspci", "-nn"], capture_output=True, text=True, timeout=30).stdout
+        except (OSError, subprocess.SubprocessError):
+            return []
+    return [ln for ln in lspci_output.splitlines()
+            if re.search(r"(VGA compatible|3D|Display) controller.*NVIDIA", ln, re.I)]
+
+
+def has_nvidia(lspci_output=None):
+    """A card NVIDIA's open driver supports (GTX 16 / RTX 20 series and newer). The
+    same check as `ujust install-nvidia` and firox-updates: Kepler to Volta chips
+    (GK/GM/GP/GV, the GTX 10-series and older) stay on the standard image."""
+    return any(not re.search(r"G(K|M|P|V)\d{3}", ln) for ln in nvidia_cards(lspci_output))
+
+
+def bootc_status():
+    p = subprocess.run(["bootc", "status", "--format", "json"], capture_output=True, text=True, timeout=60)
+    if p.returncode != 0:
+        fail(f"bootc status: {(p.stderr or p.stdout).strip()[:200]}")
+    try:
+        return json.loads(p.stdout)
+    except ValueError:
+        fail("bootc status: unreadable output")
+
+
+def followed_image(status):
+    spec = (status.get("spec") or {}).get("image") or {}
+    return spec.get("image") or ""
+
+
+def nvidia_image(ref):
+    """The NVIDIA variant of an image reference (…/firox:latest -> …/firox-nvidia-open:latest)."""
+    name, _, tag = ref.rpartition(":")
+    if not name or "/" in tag:          # (no tag: the colon was the registry's port, or none)
+        name, tag = ref, "latest"
+    if name.endswith("-nvidia-open"):
+        return f"{name}:{tag}"
+    return f"{name}-nvidia-open:{tag}"
+
+
+def say(kind, text=""):
+    print(f"{kind} {text}".rstrip(), flush=True)
+
+
+def update():
+    nvidia = has_nvidia()
+    current = followed_image(bootc_status())
+    if not current:
+        fail("This computer doesn't follow an image, so it can't update itself.")
+    target = nvidia_image(current) if nvidia else current
+    if target != current:
+        say("STEP", "Switching to Firox with NVIDIA's driver")
+        cmd = ["bootc", "switch", target]
+    else:
+        say("STEP", "Downloading the latest Firox")
+        cmd = ["bootc", "upgrade"]
+    # (bootc's progress bars: their carriage returns become lines here)
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+    for line in proc.stdout:
+        line = line.strip()
+        if line:
+            say("LOG", line[:300])
+    if proc.wait() != 0:
+        fail(f"{' '.join(cmd)} failed (exit {proc.returncode})")
+    staged = bool((bootc_status().get("status") or {}).get("staged"))
+    if staged and target != current and os.path.exists(MOK_CERT):
+        sb = subprocess.run(["mokutil", "--sb-state"], capture_output=True, text=True).stdout.lower()
+        known = subprocess.run(["mokutil", "--test-key", MOK_CERT], capture_output=True, text=True)
+        already = "already enrolled" in (known.stdout + known.stderr).lower()
+        if "enabled" in sb and not already:
+            say("STEP", "Getting Secure Boot ready for NVIDIA's driver")
+            subprocess.run(["mokutil", "--timeout", "-1"], capture_output=True, text=True)
+            p = subprocess.run(["mokutil", "--import", MOK_CERT], input=f"{MOK_PASSWORD}\n{MOK_PASSWORD}\n",
+                               capture_output=True, text=True)
+            if p.returncode == 0:
+                say("MOK", MOK_PASSWORD)
+            else:
+                say("LOG", f"mokutil: {(p.stderr or p.stdout).strip()[:200]}")
+    say("RESULT", "staged" if staged else "current")
+
+
+def schedule_reboot(seconds):
+    """Restart in a little while (into the update), after setup has finished."""
+    seconds = max(1, min(120, int(seconds)))
+    subprocess.run(["systemd-run", "--quiet", f"--on-active={seconds}s", "--unit=firox-oobe-reboot",
+                    "systemctl", "reboot"], capture_output=True, text=True)
+
+
 def main():
     if os.geteuid() != 0:
         fail("This needs to run as root (through pkexec).")
@@ -51,6 +158,9 @@ def main():
         a = json.loads(sys.stdin.read(16384))
     except ValueError:
         fail("The answers couldn't be read.", 2)
+    if isinstance(a, dict) and a.get("update") is True:
+        update()
+        return
     if isinstance(a, dict) and a.get("audit") is True:
         # Ctrl+Shift+F3 on first-time setup, as in Windows: audit mode
         sys.path.insert(0, "/usr/lib/firox/python")
@@ -93,6 +203,10 @@ def main():
     run("chpasswd", data=f"{user}:{password}\n")
     os.unlink(FLAG)
     print(f"Made {user} ({fullname}), an administrator; this computer is {hostname}.")
+    reboot = a.get("reboot")
+    if isinstance(reboot, int) and not isinstance(reboot, bool) and reboot > 0:
+        schedule_reboot(reboot)
+        print(f"Restarting in {reboot} seconds.")
 
 
 if __name__ == "__main__":
