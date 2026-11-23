@@ -37,6 +37,7 @@ import struct
 import subprocess
 import sys
 import threading
+import time
 
 import gi
 
@@ -47,6 +48,10 @@ from gi.repository import Gdk, GLib, Gtk, Pango  # noqa: E402
 
 THEMES = "/usr/share/firox/themes"
 APPLY = "/usr/libexec/firox/oobe-apply"
+# The login screen's user has /usr/sbin/nologin for a shell, and pkexec refuses to run
+# ("SHELL ... not found in /etc/shells. This incident has been reported.") when $SHELL
+# isn't a listed shell, so it's left out of pkexec's environment.
+PKEXEC_ENV = {k: v for k, v in os.environ.items() if k != "SHELL"}
 ENVIRONMENTS = "/etc/greetd/environments"
 MANAGED = "/var/lib/firox/policy/managed.json"
 XKB_LIST = "/usr/share/X11/xkb/rules/evdev.lst"
@@ -209,29 +214,69 @@ def has_nvidia():
     return any(not re.search(r"G(K|M|P|V)\d{3}", ln) for ln in cards)
 
 
-def wifi_networks():
-    """[(ssid, signal, secured)] the Wi-Fi card can see, strongest first ([] without one)."""
+def nmcli(*args, timeout=20):
+    """(returncode, stdout, stderr) of nmcli -t ARGS; (1, "", why) if it couldn't run."""
     try:
-        out = subprocess.run(["nmcli", "-t", "-f", "SSID,SIGNAL,SECURITY", "device", "wifi", "list", "--rescan", "yes"],
-                             capture_output=True, text=True, timeout=20).stdout
-    except (OSError, subprocess.SubprocessError):
-        return []
-    seen, nets = set(), []
-    for line in out.splitlines():
-        # (nmcli -t escapes colons in names as \:)
-        parts = re.split(r"(?<!\\):", line)
-        if len(parts) < 3:
-            continue
-        ssid = parts[0].replace("\\:", ":")
-        if not ssid or ssid in seen:
-            continue
-        seen.add(ssid)
-        try:
-            signal = int(parts[1])
-        except ValueError:
-            signal = 0
-        nets.append((ssid, signal, parts[2] not in ("", "--")))
-    return sorted(nets, key=lambda n: -n[1])
+        p = subprocess.run(["nmcli", "-t", *args], capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout, p.stderr.strip()
+    except (OSError, subprocess.SubprocessError) as e:
+        return 1, "", str(e)
+
+
+def wifi_problem():
+    """Why Wi-Fi can't list networks (None if it should). Turns the radio on if it's off."""
+    _, out, _ = nmcli("-f", "TYPE,STATE", "device")
+    states = [ln.split(":", 1)[1] for ln in out.splitlines() if ln.startswith("wifi:")]
+    if not states:
+        return ("No Wi-Fi card is working. If this computer has one, it needs a driver or "
+                "firmware Firox doesn't have: plug in a network cable instead.")
+    _, out, _ = nmcli("-f", "WIFI-HW,WIFI", "radio")
+    hw, _, sw = out.strip().partition(":")
+    if hw == "disabled" or hw == "missing":
+        return ("Wi-Fi is switched off by the computer itself (airplane mode). Turn it on with the "
+                "laptop's Wi-Fi key or switch (often Fn plus a key with an antenna), then click Look again.")
+    if sw != "enabled":
+        nmcli("radio", "wifi", "on")
+        time.sleep(3)
+    if all(st == "unavailable" for st in states):
+        return ("The Wi-Fi card isn't ready (it may be blocked or still starting). Click Look again in a few "
+                "seconds; if it stays like this, plug in a network cable.")
+    return None
+
+
+def wifi_networks():
+    """([(ssid, signal, secured)] strongest first, problem or None). A card that's just started
+    often finds nothing on its first scan, so it looks up to three times."""
+    problem = wifi_problem()
+    if problem:
+        return [], problem
+    nets, err = [], ""
+    for attempt in range(3):
+        if attempt:
+            time.sleep(4)
+        rc, out, err = nmcli("-f", "SSID,SIGNAL,SECURITY", "device", "wifi", "list", "--rescan", "yes")
+        if rc != 0:  # the scan itself was refused or failed: show what was seen so far
+            rc, out, _ = nmcli("-f", "SSID,SIGNAL,SECURITY", "device", "wifi", "list", "--rescan", "no")
+        seen = set()
+        nets = []
+        for line in out.splitlines():
+            # (nmcli -t escapes colons in names as \:)
+            parts = re.split(r"(?<!\\):", line)
+            if len(parts) < 3:
+                continue
+            ssid = parts[0].replace("\\:", ":")
+            if not ssid or ssid in seen:
+                continue
+            seen.add(ssid)
+            try:
+                signal = int(parts[1])
+            except ValueError:
+                signal = 0
+            nets.append((ssid, signal, parts[2] not in ("", "--")))
+        if nets:
+            return sorted(nets, key=lambda n: -n[1]), None
+    return [], ("The Wi-Fi card found no networks" + (f" ({err.splitlines()[-1]})" if err else "") +
+                ". Check that your router is on and nearby, then click Look again.")
 
 
 def log_in(user, password, session):
@@ -427,11 +472,11 @@ class Setup(Gtk.Window):
 
         def work():
             up = online()
-            nets = [] if up and not scan else wifi_networks()
-            GLib.idle_add(self.network_shown, up, nets)
+            nets, problem = ([], None) if up and not scan else wifi_networks()
+            GLib.idle_add(self.network_shown, up, nets, problem)
         threading.Thread(target=work, daemon=True).start()
 
-    def network_shown(self, up, nets):
+    def network_shown(self, up, nets, problem=None):
         self.is_online = up
         for row in self.wifi_list.get_children():
             row.destroy()
@@ -451,7 +496,8 @@ class Setup(Gtk.Window):
         elif nets:
             self.net_state.set_text("Choose your Wi-Fi network.")
         else:
-            self.net_state.set_text("Not connected. Plug in a network cable, or click Look again for Wi-Fi.")
+            self.net_state.set_text("Not connected. " + (problem or "Plug in a network cable, or click Look again "
+                                                                    "for Wi-Fi."))
         self.wifi_box.set_visible(bool(nets) or not up)
         return False
 
@@ -669,8 +715,8 @@ class Setup(Gtk.Window):
         def work():
             rc, err = 1, ""
             try:
-                proc = subprocess.Popen(["pkexec", APPLY], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                        stderr=subprocess.PIPE, text=True, bufsize=1)
+                proc = subprocess.Popen(["pkexec", APPLY], env=PKEXEC_ENV, stdin=subprocess.PIPE,
+                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
                 proc.stdin.write(json.dumps({"update": True}))
                 proc.stdin.close()
                 for line in proc.stdout:
@@ -728,7 +774,7 @@ class Setup(Gtk.Window):
 
         def work():
             try:
-                p = subprocess.run(["pkexec", APPLY], input=json.dumps(settings), capture_output=True,
+                p = subprocess.run(["pkexec", APPLY], env=PKEXEC_ENV, input=json.dumps(settings), capture_output=True,
                                    text=True, timeout=300)
                 ok, msg = p.returncode == 0, (p.stderr or p.stdout).strip()
             except (OSError, subprocess.SubprocessError) as e:
@@ -778,8 +824,8 @@ class Setup(Gtk.Window):
 
             def work():
                 try:
-                    p = subprocess.run(["pkexec", APPLY], input=json.dumps({"audit": True}), capture_output=True,
-                                       text=True, timeout=120)
+                    p = subprocess.run(["pkexec", APPLY], env=PKEXEC_ENV, input=json.dumps({"audit": True}),
+                                       capture_output=True, text=True, timeout=120)
                     ok, msg = p.returncode == 0, (p.stderr or p.stdout).strip()
                 except (OSError, subprocess.SubprocessError) as e:
                     ok, msg = False, str(e)
