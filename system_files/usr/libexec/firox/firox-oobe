@@ -47,6 +47,10 @@ from gi.repository import Gdk, GLib, Gtk, Pango  # noqa: E402
 
 THEMES = "/usr/share/firox/themes"
 APPLY = "/usr/libexec/firox/oobe-apply"
+# The login screen's user has /usr/sbin/nologin for a shell, and pkexec refuses to run
+# ("SHELL ... not found in /etc/shells. This incident has been reported.") when $SHELL
+# isn't a listed shell, so it's left out of pkexec's environment.
+PKEXEC_ENV = {k: v for k, v in os.environ.items() if k != "SHELL"}
 ENVIRONMENTS = "/etc/greetd/environments"
 MANAGED = "/var/lib/firox/policy/managed.json"
 XKB_LIST = "/usr/share/X11/xkb/rules/evdev.lst"
@@ -669,8 +673,8 @@ class Setup(Gtk.Window):
         def work():
             rc, err = 1, ""
             try:
-                proc = subprocess.Popen(["pkexec", APPLY], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                        stderr=subprocess.PIPE, text=True, bufsize=1)
+                proc = subprocess.Popen(["pkexec", APPLY], env=PKEXEC_ENV, stdin=subprocess.PIPE,
+                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
                 proc.stdin.write(json.dumps({"update": True}))
                 proc.stdin.close()
                 for line in proc.stdout:
@@ -728,7 +732,7 @@ class Setup(Gtk.Window):
 
         def work():
             try:
-                p = subprocess.run(["pkexec", APPLY], input=json.dumps(settings), capture_output=True,
+                p = subprocess.run(["pkexec", APPLY], env=PKEXEC_ENV, input=json.dumps(settings), capture_output=True,
                                    text=True, timeout=300)
                 ok, msg = p.returncode == 0, (p.stderr or p.stdout).strip()
             except (OSError, subprocess.SubprocessError) as e:
@@ -778,8 +782,8 @@ class Setup(Gtk.Window):
 
             def work():
                 try:
-                    p = subprocess.run(["pkexec", APPLY], input=json.dumps({"audit": True}), capture_output=True,
-                                       text=True, timeout=120)
+                    p = subprocess.run(["pkexec", APPLY], env=PKEXEC_ENV, input=json.dumps({"audit": True}),
+                                       capture_output=True, text=True, timeout=120)
                     ok, msg = p.returncode == 0, (p.stderr or p.stdout).strip()
                 except (OSError, subprocess.SubprocessError) as e:
                     ok, msg = False, str(e)
