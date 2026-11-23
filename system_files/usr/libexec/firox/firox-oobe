@@ -6,9 +6,16 @@ Shown on the login screen instead of the list of people while
 /var/lib/firox/oobe exists: after System Preparation (firox-sysprep) with
 "Enter first-time setup", or after a Powerwash. It asks for
 
+    the network (Wi-Fi, if there's no cable)
     the time zone and keyboard
     your account (name, user name, password): an administrator
     the computer's name
+
+then, if it's online, gets the latest Firox: with an NVIDIA graphics card it
+switches to the NVIDIA image (NVIDIA's driver built in), otherwise it
+updates. That's what the installer ISO hands over to, so one ISO serves
+every computer. If an update was installed, the computer restarts into it
+(and the login screen asks for the new password).
 
 (Ctrl+Shift+F3 starts audit mode instead, as in Windows: see firox-sysprep)
 then makes them with /usr/libexec/firox/oobe-apply (through pkexec: a polkit
@@ -35,7 +42,8 @@ import gi
 
 gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
-from gi.repository import Gdk, GLib, Gtk  # noqa: E402
+gi.require_version("Pango", "1.0")
+from gi.repository import Gdk, GLib, Gtk, Pango  # noqa: E402
 
 THEMES = "/usr/share/firox/themes"
 APPLY = "/usr/libexec/firox/oobe-apply"
@@ -53,6 +61,13 @@ CSS = b"""
 #card .dim { color: #b8bcc4; }
 #card .title { font-size: 22px; font-weight: 600; }
 #card .error { color: #ff9b8f; }
+#card scrolledwindow { border: 1px solid rgba(255, 255, 255, 0.20); border-radius: 8px; }
+#card list { background-color: rgba(255, 255, 255, 0.06); border-radius: 8px; }
+#card list row { padding: 6px 10px; color: #f2f2f2; }
+#card list row:hover { background-color: rgba(255, 255, 255, 0.08); }
+#card list row:selected { background-color: rgba(70, 130, 255, 0.45); }
+#card list row label { color: #f2f2f2; }
+#card list row .dim { color: #b8bcc4; }
 #card entry {
     min-height: 34px; color: #f2f2f2; caret-color: #f2f2f2;
     background-color: rgba(255, 255, 255, 0.08); background-image: none;
@@ -174,6 +189,51 @@ class Greetd:
         return buf
 
 
+def online(host="ghcr.io", port=443, timeout=4):
+    """Can this computer reach where Firox's images are?"""
+    try:
+        socket.create_connection((host, port), timeout=timeout).close()
+        return True
+    except OSError:
+        return False
+
+
+def has_nvidia():
+    """An NVIDIA card its open driver supports (GTX 16 / RTX 20 and newer; the same
+    check as oobe-apply, which decides)."""
+    try:
+        out = subprocess.run(["lspci", "-nn"], capture_output=True, text=True, timeout=30).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    cards = [ln for ln in out.splitlines() if re.search(r"(VGA compatible|3D|Display) controller.*NVIDIA", ln, re.I)]
+    return any(not re.search(r"G(K|M|P|V)\d{3}", ln) for ln in cards)
+
+
+def wifi_networks():
+    """[(ssid, signal, secured)] the Wi-Fi card can see, strongest first ([] without one)."""
+    try:
+        out = subprocess.run(["nmcli", "-t", "-f", "SSID,SIGNAL,SECURITY", "device", "wifi", "list", "--rescan", "yes"],
+                             capture_output=True, text=True, timeout=20).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    seen, nets = set(), []
+    for line in out.splitlines():
+        # (nmcli -t escapes colons in names as \:)
+        parts = re.split(r"(?<!\\):", line)
+        if len(parts) < 3:
+            continue
+        ssid = parts[0].replace("\\:", ":")
+        if not ssid or ssid in seen:
+            continue
+        seen.add(ssid)
+        try:
+            signal = int(parts[1])
+        except ValueError:
+            signal = 0
+        nets.append((ssid, signal, parts[2] not in ("", "--")))
+    return sorted(nets, key=lambda n: -n[1])
+
+
 def log_in(user, password, session):
     """Log the new account in through greetd. None, or why not."""
     path = os.environ.get("GREETD_SOCK")
@@ -199,7 +259,7 @@ def log_in(user, password, session):
 
 
 class Setup(Gtk.Window):
-    STEPS = ["welcome", "region", "account", "computer", "finish"]
+    STEPS = ["welcome", "network", "region", "account", "computer", "update", "finish"]
 
     def __init__(self, theme):
         super().__init__(title="Set up Firox Linux")
@@ -276,10 +336,16 @@ class Setup(Gtk.Window):
         card.pack_start(buttons, False, False, 0)
 
         self.stack.add_named(self.page_welcome(), "welcome")
+        self.stack.add_named(self.page_network(), "network")
         self.stack.add_named(self.page_region(), "region")
         self.stack.add_named(self.page_account(), "account")
         self.stack.add_named(self.page_computer(), "computer")
+        self.stack.add_named(self.page_update(), "update")
         self.stack.add_named(self.page_finish(), "finish")
+        self.staged = False             # an update is waiting for the restart
+        self.mok = None                 # Secure Boot: the key enrolment password
+        self.updating = False
+        self.pulse = None
         self.index = 0
         self.show_step()
 
@@ -317,8 +383,128 @@ class Setup(Gtk.Window):
 
     def page_welcome(self):
         box = self.title("Welcome to Firox Linux",
-                         "A few questions and your computer is ready: where you are, your keyboard, "
-                         "your account and a name for this computer.")
+                         "A few questions and your computer is ready: the network, where you are, your "
+                         "keyboard, your account and a name for this computer. Then it gets the latest Firox.")
+        return box
+
+    def page_network(self):
+        box = self.title("Connect to the internet",
+                         "So your computer can get the latest Firox (and, with an NVIDIA graphics card, "
+                         "its driver) while you finish setting up.")
+        self.net_state = Gtk.Label(xalign=0, wrap=True, max_width_chars=52)
+        box.pack_start(self.net_state, False, False, 0)
+        self.wifi_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroll.set_min_content_height(150)
+        self.wifi_list = Gtk.ListBox()
+        self.wifi_list.connect("row-selected", self.wifi_selected)
+        scroll.add(self.wifi_list)
+        self.wifi_box.pack_start(scroll, False, False, 0)
+        self.wifi_password = Gtk.Entry(visibility=False, placeholder_text="Wi-Fi password",
+                                       input_purpose=Gtk.InputPurpose.PASSWORD)
+        self.wifi_password.set_no_show_all(True)
+        self.wifi_password.connect("activate", lambda _e: self.wifi_connect())
+        self.wifi_box.pack_start(self.wifi_password, False, False, 0)
+        row = Gtk.Box(spacing=8)
+        self.wifi_go = Gtk.Button.new_with_mnemonic("_Connect")
+        self.wifi_go.connect("clicked", lambda _b: self.wifi_connect())
+        rescan = Gtk.Button.new_with_mnemonic("_Look again")
+        rescan.connect("clicked", lambda _b: self.network_refresh(scan=True))
+        row.pack_start(self.wifi_go, False, False, 0)
+        row.pack_start(rescan, False, False, 0)
+        self.wifi_box.pack_start(row, False, False, 0)
+        box.pack_start(self.wifi_box, False, False, 0)
+        note = Gtk.Label(label="No internet? Click Next: Firox works without it and updates itself later.",
+                         xalign=0, wrap=True, max_width_chars=52)
+        note.get_style_context().add_class("dim")
+        box.pack_start(note, False, False, 0)
+        return box
+
+    def network_refresh(self, scan=False):
+        """Online? Otherwise list the Wi-Fi networks (in the background: scanning takes seconds)."""
+        self.net_state.set_text("Checking the connection…")
+
+        def work():
+            up = online()
+            nets = [] if up and not scan else wifi_networks()
+            GLib.idle_add(self.network_shown, up, nets)
+        threading.Thread(target=work, daemon=True).start()
+
+    def network_shown(self, up, nets):
+        self.is_online = up
+        for row in self.wifi_list.get_children():
+            row.destroy()
+        for ssid, signal, secured in nets:
+            row = Gtk.ListBoxRow()
+            row.net = (ssid, secured)
+            line = Gtk.Box(spacing=8)
+            line.pack_start(Gtk.Label(label=ssid, xalign=0), True, True, 0)
+            info = Gtk.Label(label=f"{'🔒 ' if secured else ''}{signal}%")
+            info.get_style_context().add_class("dim")
+            line.pack_end(info, False, False, 0)
+            row.add(line)
+            self.wifi_list.add(row)
+        self.wifi_list.show_all()
+        if up:
+            self.net_state.set_text("✓ Connected to the internet.")
+        elif nets:
+            self.net_state.set_text("Choose your Wi-Fi network.")
+        else:
+            self.net_state.set_text("Not connected. Plug in a network cable, or click Look again for Wi-Fi.")
+        self.wifi_box.set_visible(bool(nets) or not up)
+        return False
+
+    def wifi_selected(self, _lb, row):
+        secured = row is not None and row.net[1]
+        self.wifi_password.set_visible(secured)
+        if secured:
+            self.wifi_password.grab_focus()
+
+    def wifi_connect(self):
+        row = self.wifi_list.get_selected_row()
+        if row is None:
+            self.error.set_text("Choose a Wi-Fi network first.")
+            return
+        ssid, secured = row.net
+        cmd = ["nmcli", "device", "wifi", "connect", ssid]
+        if secured:
+            cmd += ["password", self.wifi_password.get_text()]
+        self.error.set_text("")
+        self.net_state.set_text(f"Connecting to {ssid}…")
+        self.wifi_go.set_sensitive(False)
+
+        def work():
+            try:
+                p = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+                ok, msg = p.returncode == 0, (p.stderr or p.stdout).strip()
+            except (OSError, subprocess.SubprocessError) as e:
+                ok, msg = False, str(e)
+            GLib.idle_add(self.wifi_connected, ssid, ok and online(), msg)
+        threading.Thread(target=work, daemon=True).start()
+
+    def wifi_connected(self, ssid, ok, msg):
+        self.wifi_go.set_sensitive(True)
+        self.is_online = ok
+        if ok:
+            self.net_state.set_text(f"✓ Connected to {ssid}.")
+            self.wifi_password.set_text("")
+        else:
+            self.net_state.set_text(f"Couldn't connect to {ssid}.")
+            self.error.set_text("Check the password and try again." if "secrets" in msg.lower() or "password" in
+                                msg.lower() else (msg.splitlines()[-1] if msg else ""))
+        return False
+
+    def page_update(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        self.update_title = self.title("Getting the latest Firox…",
+                                       "You can leave it to it: the computer restarts by itself when it's done.")
+        box.pack_start(self.update_title, False, False, 0)
+        self.update_bar = Gtk.ProgressBar()
+        box.pack_start(self.update_bar, False, False, 0)
+        self.update_log = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END, max_width_chars=52)
+        self.update_log.get_style_context().add_class("dim")
+        box.pack_start(self.update_log, False, False, 0)
         return box
 
     def page_region(self):
@@ -400,15 +586,21 @@ class Setup(Gtk.Window):
         name = self.STEPS[self.index]
         self.stack.set_visible_child_name(name)
         self.error.set_text("")
-        self.back.set_visible(0 < self.index < len(self.STEPS) - 1)
+        self.back.set_visible(0 < self.index < len(self.STEPS) - 1 and name != "update")
         self.next.set_visible(self.index < len(self.STEPS) - 1)
-        self.next.set_label({"welcome": "_Get started", "computer": "_Finish"}.get(name, "_Next"))
+        self.next.set_label({"welcome": "_Get started", "computer": "_Finish", "update": "_Skip"}.get(name, "_Next"))
         self.next.set_use_underline(True)
         self.step_label.set_text("" if name in ("welcome", "finish") else
                                  f"Step {self.index} of {len(self.STEPS) - 2}")
-        hints = {"welcome": "Let's set up your computer", "region": "Where you are",
-                 "account": "Who you are", "computer": "Almost done", "finish": "Getting ready"}
+        hints = {"welcome": "Let's set up your computer", "network": "Getting online", "region": "Where you are",
+                 "account": "Who you are", "computer": "Almost done", "update": "The latest Firox",
+                 "finish": "Getting ready"}
         self.hint.set_text(hints[name])
+        if name == "network" and not hasattr(self, "is_online"):
+            self.network_refresh()
+        if name == "update":
+            self.back.set_visible(False)
+            self.start_update()
         if name == "account":
             self.fullname.grab_focus()
         if name == "computer" and not self.hostname.get_text():
@@ -457,12 +649,82 @@ class Setup(Gtk.Window):
         if self.STEPS[self.index] == "finish":
             self.apply()
 
+    # -- the latest Firox (while the account's details wait)
+    def start_update(self):
+        if self.updating or self.staged:
+            return
+        if not getattr(self, "is_online", False) and not online():
+            # nothing to get it from: Firox updates itself later
+            GLib.idle_add(lambda: self.go(1) or False)
+            return
+        self.updating = True
+        if has_nvidia():
+            labels = self.update_title.get_children()
+            labels[0].set_text("Getting Firox with NVIDIA's driver…")
+            labels[1].set_text("This computer has an NVIDIA graphics card, so it gets the version of Firox with "
+                               "NVIDIA's driver built in. It restarts by itself when it's done.")
+        self.update_log.set_text("Starting…")
+        self.pulse = GLib.timeout_add(150, lambda: self.update_bar.pulse() or True)
+
+        def work():
+            rc, err = 1, ""
+            try:
+                proc = subprocess.Popen(["pkexec", APPLY], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                        stderr=subprocess.PIPE, text=True, bufsize=1)
+                proc.stdin.write(json.dumps({"update": True}))
+                proc.stdin.close()
+                for line in proc.stdout:
+                    GLib.idle_add(self.update_line, line.rstrip("\n"))
+                rc, err = proc.wait(), proc.stderr.read().strip()
+            except (OSError, subprocess.SubprocessError) as e:
+                err = str(e)
+            GLib.idle_add(self.update_done, rc, err)
+        threading.Thread(target=work, daemon=True).start()
+
+    def update_line(self, line):
+        kind, _, text = line.partition(" ")
+        if kind == "STEP":
+            self.update_log.set_text(text)
+        elif kind == "LOG":
+            m = re.search(r"(\d{1,3})%", text)
+            if m and self.pulse:
+                GLib.source_remove(self.pulse)
+                self.pulse = None
+            if m:
+                self.update_bar.set_fraction(min(100, int(m.group(1))) / 100)
+            self.update_log.set_text(text)
+        elif kind == "RESULT":
+            self.staged = text == "staged"
+        elif kind == "MOK":
+            self.mok = text
+        return False
+
+    def update_done(self, rc, err):
+        self.updating = False
+        if self.pulse:
+            GLib.source_remove(self.pulse)
+            self.pulse = None
+        if self.STEPS[self.index] != "update":
+            return False            # (skipped: it finished in the background, for the next restart)
+        if rc != 0:
+            self.staged = False
+            self.update_log.set_text("Couldn't get it now (" + (err.splitlines()[-1] if err else "error") +
+                                     "): Firox will update itself later.")
+            GLib.timeout_add(3000, lambda: self.go(1) or False)
+        else:
+            self.update_bar.set_fraction(1.0)
+            self.go(1)
+        return False
+
     def apply(self):
         self.spinner.start()
         settings = {"user": self.username.get_text().strip(), "fullname": self.fullname.get_text().strip(),
                     "password": self.password.get_text(), "hostname": self.hostname.get_text().strip(),
                     "timezone": self.tz.get_child().get_text().strip(),
                     "layout": self.layout_codes[self.kb.get_active()] if self.kb.get_active() >= 0 else "us"}
+        if self.staged:
+            # restart into the update (with time to read how to enrol the key, if Secure Boot needs it)
+            settings["reboot"] = 60 if self.mok else 5
 
         def work():
             try:
@@ -471,7 +733,8 @@ class Setup(Gtk.Window):
                 ok, msg = p.returncode == 0, (p.stderr or p.stdout).strip()
             except (OSError, subprocess.SubprocessError) as e:
                 ok, msg = False, str(e)
-            problem = log_in(settings["user"], settings["password"], session_command()) if ok else None
+            problem = (log_in(settings["user"], settings["password"], session_command())
+                       if ok and not self.staged else None)
             GLib.idle_add(self.applied, ok, msg, problem)
         threading.Thread(target=work, daemon=True).start()
 
@@ -481,6 +744,18 @@ class Setup(Gtk.Window):
             self.index = self.STEPS.index("computer")
             self.show_step()
             self.error.set_text("Setup couldn't finish: " + (msg.splitlines()[-1] if msg else "unknown error"))
+            return False
+        if self.staged:
+            self.result = 3                 # (it restarts by itself: oobe-apply scheduled it)
+            if self.mok:
+                self.set_finish("Restarting in a minute: one more step",
+                                "This computer uses Secure Boot, so NVIDIA's driver needs its key enrolled once. "
+                                "After the restart a blue screen appears: choose Enroll MOK, then Continue, "
+                                f"then Yes, and type the password {self.mok} (it isn't shown as you type). "
+                                "Then choose Reboot. After that, log in with the account you just made.")
+            else:
+                self.set_finish("Restarting into the latest Firox",
+                                "Then log in with the account you just made.")
             return False
         if login_problem is None:
             self.result = 0                 # greetd starts the desktop once this exits
