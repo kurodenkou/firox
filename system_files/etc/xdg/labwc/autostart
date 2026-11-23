@@ -101,7 +101,8 @@ firox-gadgets start >/dev/null 2>&1 &
 
 # Rune, the Firox mascot, in his corner (right-click him: Put Rune Away;
 # open Rune from the Start menu to bring him back)
-( sleep 3; firox-rune --at-login ) >/dev/null 2>&1 &
+# (started again if it crashes; its log: ~/.local/state/firox/rune.log)
+( sleep 3; $KEEP firox-rune --at-login 2>"$STATE/rune.log" ) >/dev/null 2>&1 &
 
 # "Firox Linux was updated" once after an update was applied
 ( sleep 20; firox-updates login ) >/dev/null 2>&1 &

@@ -448,9 +448,16 @@ class RuneWindow(Gtk.Window):
         ctx.paint()
         ctx.set_operator(cairo.OPERATOR_OVER)
         pad = SHADOW if self.app.conf["glade"] else 0
-        if self.app.conf["glade"]:
-            draw_shadow(ctx, pad, pad, self.scene.w, self.scene.h)
-        self.scene.draw(ctx, time.monotonic() - self.t0, pad, pad)
+        try:
+            if self.app.conf["glade"]:
+                draw_shadow(ctx, pad, pad, self.scene.w, self.scene.h)
+            self.scene.draw(ctx, time.monotonic() - self.t0, pad, pad)
+        except Exception:
+            # (said once: a frame that can't be drawn mustn't stop the others)
+            if not getattr(self, "draw_failed", False):
+                self.draw_failed = True
+                import traceback
+                traceback.print_exc()
         return True
 
     def on_motion(self, _w, ev):
@@ -955,6 +962,8 @@ class RuneApp(Gtk.Application):
         self.brain = B.Brain(self.keys)
         self.rune = self.chat = self.prefs = None
         self.busy = False
+        self.leaving = False            # put away or quitting: don't bring him back
+        self.place_timer = None
 
     def do_startup(self):
         Gtk.Application.do_startup(self)
@@ -962,6 +971,15 @@ class RuneApp(Gtk.Application):
         prov.load_from_data(CSS)
         Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), prov,
                                                  Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        # Rune's window can be closed under him (the compositor closes layer
+        # surfaces when their monitor sleeps, wakes or is unplugged): keep
+        # running without it, and put him back (bring_back)
+        self.hold()
+        # Monitors coming and going, or a new main display: back to the right one
+        Gdk.Screen.get_default().connect("monitors-changed", lambda _s: self.schedule_place())
+        if firox_monitors is not None:
+            self.main_mon = Gio.File.new_for_path(firox_monitors.CONF).monitor_file(Gio.FileMonitorFlags.NONE, None)
+            self.main_mon.connect("changed", lambda *_: self.schedule_place())
 
     def do_command_line(self, cmdline):
         args = cmdline.get_arguments()[1:]
@@ -981,9 +999,7 @@ class RuneApp(Gtk.Application):
             self.set("enabled", True)       # opened from the Start menu: he's back
         first = self.rune is None
         if first:
-            self.rune = RuneWindow(self)
-            self.add_window(self.rune)
-            self.rune.show_all()
+            self.make_rune()
         if "--settings" in args:
             self.settings()
         elif "--chat" in args or (not first and "--at-login" not in args):
@@ -1022,7 +1038,49 @@ class RuneApp(Gtk.Application):
 
     def put_away(self):
         self.set("enabled", False)
+        self.leaving = True
+        self.release()
         self.quit()
+
+    # -- keeping him on screen
+    def make_rune(self):
+        self.rune = RuneWindow(self)
+        self.add_window(self.rune)
+        self.rune.connect("destroy", self.on_rune_gone)
+        self.rune.show_all()
+
+    def on_rune_gone(self, win):
+        """His window was closed without being put away: put a new one there."""
+        if self.leaving or win is not self.rune:
+            return
+        print("firox-rune: Rune's window was closed (a monitor slept or woke?); putting him back", file=sys.stderr)
+        self.rune = None
+        if self.chat is not None:
+            self.chat.hide_chat()
+        GLib.timeout_add(1000, self.bring_back)
+
+    def bring_back(self):
+        if self.rune is None and not self.leaving and B.policy()["allowed"] and self.conf["enabled"]:
+            self.make_rune()
+        return False
+
+    def schedule_place(self):
+        if self.place_timer is not None:
+            GLib.source_remove(self.place_timer)
+        self.place_timer = GLib.timeout_add(600, self.replace)
+
+    def replace(self):
+        """A new window on the main display (a layer surface's monitor can't be changed once it's shown)."""
+        self.place_timer = None
+        if self.rune is not None and not self.leaving:
+            old, self.rune = self.rune, None
+            old.destroy()                   # (on_rune_gone sees self.rune isn't old)
+            self.make_rune()
+            if self.chat is not None and self.chat.get_visible():
+                self.chat.hide_chat()
+                self.chat.destroy()
+                self.chat = None
+        return False
 
     # -- chat
     def show_chat(self):
