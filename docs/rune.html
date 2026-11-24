@@ -97,7 +97,7 @@
 <div class="feature">
     <div class="feature-text">
         <p>Rune lives in a corner of your desktop, in a little window onto his glade. He isn't a still picture: he breathes and blinks, his tail throws embers, the runes and crystals glow, the stars twinkle, and the glade tilts a little when your mouse is over him.</p>
-        <p><b>Click him to chat.</b> Ask him anything: how to do something in Firox, what a setting means, or something about the wider world. He knows Firox's help by heart and can search the web for anything recent.</p>
+        <p><b>Click him to chat.</b> Ask him anything: how to do something in Firox, what a setting means, or something about the wider world. He knows Firox's help by heart, and with Claude he can search the web for anything recent.</p>
         <p><b>He can do things for you, but he always asks first.</b> Before he does anything on your computer, a card pops up saying exactly what he wants to do, with <b>Allow</b> and <b>Not now</b>. He can:</p>
         <ul>
             <li>open Settings, at the right page</li>
@@ -118,12 +118,26 @@
 </div>
 <div class="feature">
     <div class="feature-text">
-        <h3>How he talks: Claude, with your own key</h3>
-        <p>Rune thinks with <b>Claude</b>, Anthropic's AI. To chat, he needs your own <b>Claude API key</b>, from the <a href="https://console.anthropic.com/settings/keys">Claude Console</a>. You pay Anthropic directly for what you use, usually a few cents a day of chatting. In his settings you can pick a cheaper, faster model.</p>
+        <h3>How he talks: the AI service you pick</h3>
+        <p>Rune thinks with an AI service, using your own <b>API key</b> (a password that lets programs like him use it). You pay the service directly for what you use, usually pennies a day; some options are free. Pick one:</p>
+        <ul>
+            <li><b>Claude</b> (Anthropic): the best fit, and the only one he can search the web with.</li>
+            <li><b>OpenRouter:</b> one key for hundreds of models, including some free ones.</li>
+            <li><b>OpenAI:</b> the makers of ChatGPT. A ChatGPT subscription doesn't include API use.</li>
+            <li><b>Gemini</b> (Google): free to start with a Google account.</li>
+        </ul>
+        <p><b>He helps you get the key.</b> The first time you click him, choose a service and he walks you through it:</p>
+        <ul>
+            <li>He opens the right page in your browser, and tells you what to click there.</li>
+            <li>As soon as you <b>copy</b> the key, he notices. There's nothing to paste.</li>
+            <li>He checks it with the service and picks a good model.</li>
+            <li>He takes the key off your clipboard and out of clipboard history again.</li>
+        </ul>
+        <p>Already have a key? Paste it in, and he works out which service it's for. You can switch services or models any time in his settings.</p>
         <p><b>No spyware.</b></p>
         <ul>
             <li><b>Nothing until you ask:</b> nothing leaves your computer until you've given him a key and asked him something.</li>
-            <li><b>What's sent:</b> only what you type goes to Anthropic, together with Firox's help so he knows Firox. It goes straight from your computer, with no Firox server in between and no tracking.</li>
+            <li><b>What's sent:</b> only what you type goes to the service you picked, together with Firox's help so he knows Firox. It goes straight from your computer, with no Firox server in between and no tracking.</li>
             <li><b>When it's sent:</b> a small network icon shows while a request is on its way.</li>
             <li><b>Your key:</b> kept in your keyring.</li>
             <li><b>Your conversation:</b> stays on your computer until you start a new one.</li>
@@ -133,12 +147,16 @@
             <li>which corner he sits in, and his size</li>
             <li>his glade or just him</li>
             <li>above or under your windows</li>
-            <li>which model, and your key</li>
+            <li>which service and model, and your key</li>
             <li><b>Put Rune Away</b>; open <b>Rune</b> from the Start menu to bring him back</li>
         </ul>
         <p>Schools and offices can turn him off, or keep him as a mascot who never chats, with a <a href="policy.html">policy</a>.</p>
-        <p class="tech">firox-rune (GTK, layer-shell, Cairo; the wallpaper cut into layers by scripts/rune-layers.py), firox_rune_brain (the Anthropic Python SDK, streaming; Claude's web search tool; ten tools, each needing your OK)</p>
+        <p class="tech">firox-rune (GTK, layer-shell, Cairo; the wallpaper cut into layers by scripts/rune-layers.py), firox_rune_brain (Claude through the Anthropic Python SDK, with its web search tool; OpenRouter, OpenAI and Gemini through their OpenAI-compatible Chat Completions endpoints; streaming; ten tools, each needing your OK)</p>
     </div>
+    <figure>
+        <img src="screenshots/rune-setup.png" alt="Rune's setup in three steps: pick a service (Claude, OpenRouter, OpenAI or Gemini), his steps for getting a Gemini key with an Open Gemini button, and All set! once he has spotted the copied key" loading="lazy">
+        <figcaption>Pick a service, follow his steps, copy the key: he does the rest</figcaption>
+    </figure>
     <figure>
         <img src="screenshots/rune-helper.png" alt="Rune's chat bubble above him: asked to turn on Night Light, he says he can and shows a card, May I? Turn Night Light on?, with Not now and Allow buttons" loading="lazy">
         <figcaption>He asks before he does anything</figcaption>
@@ -165,7 +183,7 @@
     </figure>
 </div>
 
-<div class="note">Rune's pictures were made by the project's maintainer with Nano Banana, Google's image-generating AI. His story was written by Claude, the AI that writes most of Firox, and when you chat with him on your desktop, Claude is who answers. <a href="ai.html">How AI was used</a>.</div>
+<div class="note">Rune's pictures were made by the project's maintainer with Nano Banana, Google's image-generating AI. His story was written by Claude, the AI that writes most of Firox, and when you chat with him on your desktop with Claude picked, Claude is who answers. <a href="ai.html">How AI was used</a>.</div>
 
 </div>
 </main>
