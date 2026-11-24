@@ -61,6 +61,11 @@ KEYS_URL = "https://console.anthropic.com/settings/keys"
 PANEL_HEIGHT = 30
 EDGE = 10                       # from the screen's edge (and the taskbar)
 SHADOW = 10                     # room around the glade for its shadow
+# Desktop Gadgets' sidebar runs down the right edge of the main display (its
+# SIDEBAR width). While it's there, Rune sits beside it instead of on top of it.
+GADGETS_BUS = "org.firox.Gadgets"
+GADGETS_WIDTH = 194
+SIDEBAR_SHOWN = [False]
 FPS = 30                        # while he's busy, hovered or chatting
 IDLE_FPS = 15                   # the rest of the time (half the work)
 # The part of the wallpaper shown in the glade, in its pixels
@@ -378,8 +383,9 @@ def margins(window, conf, extra=0):
     bottom = conf["corner"].startswith("bottom")
     vert = (PANEL_HEIGHT + EDGE if bottom else EDGE) + extra
     GtkLayerShell.set_margin(window, GtkLayerShell.Edge.BOTTOM if bottom else GtkLayerShell.Edge.TOP, vert)
-    GtkLayerShell.set_margin(window, GtkLayerShell.Edge.RIGHT if conf["corner"].endswith("right")
-                             else GtkLayerShell.Edge.LEFT, EDGE)
+    right = conf["corner"].endswith("right")
+    GtkLayerShell.set_margin(window, GtkLayerShell.Edge.RIGHT if right else GtkLayerShell.Edge.LEFT,
+                             EDGE + (GADGETS_WIDTH if right and SIDEBAR_SHOWN[0] else 0))
 
 
 def transparent(window):
@@ -991,6 +997,10 @@ class RuneApp(Gtk.Application):
             self.follow_app_style()
             for key in ("color-scheme", "gtk-theme", "icon-theme"):
                 self.iface.connect(f"changed::{key}", lambda *_: self.follow_app_style())
+        # Beside the gadget sidebar while it's running (it's a Gtk.Application
+        # whose bus name comes and goes with it)
+        Gio.bus_watch_name(Gio.BusType.SESSION, GADGETS_BUS, Gio.BusNameWatcherFlags.NONE,
+                           lambda *_: self.sidebar_changed(True), lambda *_: self.sidebar_changed(False))
         # Rune's window can be closed under him (the compositor closes layer
         # surfaces when their monitor sleeps, wakes or is unplugged): keep
         # running without it, and put him back (bring_back)
@@ -1094,6 +1104,15 @@ class RuneApp(Gtk.Application):
         if self.rune is None and not self.leaving and B.policy()["allowed"] and self.conf["enabled"]:
             self.make_rune()
         return False
+
+    def sidebar_changed(self, shown):
+        if SIDEBAR_SHOWN[0] == shown:
+            return
+        SIDEBAR_SHOWN[0] = shown
+        if self.rune is not None:
+            margins(self.rune, self.conf, -(SHADOW if self.conf["glade"] else 0))
+        if self.chat is not None and self.chat.get_visible():
+            self.chat.place()
 
     def schedule_place(self):
         if self.place_timer is not None:
