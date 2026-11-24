@@ -7,10 +7,14 @@ blinks, his tail throws embers, the runes and crystals glow and the stars
 twinkle, and the scene tilts a little toward the mouse (2.5D: the wallpaper's
 picture cut into layers, /usr/share/firox/rune, made by scripts/rune-layers.py).
 
-Click him to chat. He answers with Claude, using your own Claude API key
-(kept in the keyring), can search the web, and can do a few things on the
-computer, asking you first every time (see firox_rune_brain). Nothing is sent
-anywhere until you've given him a key and typed something.
+Click him to chat. He answers through the AI service you pick (Claude,
+OpenRouter, OpenAI or Gemini) with your own API key, kept in the keyring. The
+first time, he walks you through getting a key: he opens the service's page
+and spots the key on the clipboard as soon as you copy it, checks it, picks
+a model and takes the key off the clipboard again. With Claude he can search
+the web; with any of them he can do a few things on the computer, asking you
+first every time (see firox_rune_brain). Nothing is sent anywhere until
+you've given him a key and typed something.
 
     firox-rune              show Rune (if he's already here: open his chat)
     firox-rune --at-login   at login: only if he's turned on
@@ -21,7 +25,7 @@ anywhere until you've given him a key and typed something.
                             render N frames of the animation to DIR (tests)
 
 Right-click him for his settings: the corner, the size, his glade or just
-him, above or under windows, the Claude model and key. A policy can turn him
+him, above or under windows, the service, model and key. A policy can turn him
 off (rune.allowed) or keep him from chatting (rune.chat).
 """
 
@@ -29,6 +33,8 @@ import json
 import math
 import os
 import random
+import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -57,7 +63,6 @@ except ImportError:
 
 ASSETS = os.environ.get("FIROX_RUNE_ASSETS", "/usr/share/firox/rune")
 AVATAR = "/usr/share/firox/icons/start-mascot.png"
-KEYS_URL = "https://console.anthropic.com/settings/keys"
 PANEL_HEIGHT = 30
 EDGE = 10                       # from the screen's edge (and the taskbar)
 SHADOW = 10                     # room around the glade for its shadow
@@ -549,6 +554,8 @@ CSS = b"""
 #bubble button.flat:hover { background-color: rgba(255, 255, 255, 0.14); }
 #bubble button image { color: #eef5ff; }
 #bubble link, #bubble label link { color: #8fd0ff; }
+#bubble button.service { padding: 6px 10px; }
+#bubble button.service label { font-weight: normal; }
 #bubble entry selection { background-color: #2f7fd8; color: #ffffff; }
 /* GTK's own pieces opened from inside the bubble (the Cut/Copy/Paste menu, the
    emoji picker) are styled as its children: give them back the light/dark
@@ -559,6 +566,44 @@ CSS = b"""
 }
 #bubble popover button label, #bubble popover button image { color: inherit; }
 """
+
+
+def scrolled(child):
+    sw = Gtk.ScrolledWindow()
+    sw.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+    sw.add(child)
+    return sw
+
+
+def open_url(url):
+    try:
+        Gio.AppInfo.launch_default_for_uri(url, None)
+    except GLib.Error as e:
+        print(f"firox-rune: couldn't open {url}: {e.message}", file=sys.stderr)
+
+
+def clipboard_text():
+    try:
+        p = subprocess.run(["wl-paste", "--no-newline", "--type", "text"], capture_output=True, text=True,
+                           timeout=2)
+        return p.stdout.strip() if p.returncode == 0 and len(p.stdout) < 400 else None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def forget_from_clipboard(key):
+    """The key's been saved: off the clipboard, and out of clipboard history
+    (Super+V keeps what you copy)."""
+    try:
+        if clipboard_text() == key:
+            subprocess.run(["wl-copy", "--clear"], timeout=2)
+        if shutil.which("cliphist"):
+            lines = subprocess.run(["cliphist", "list"], capture_output=True, text=True, timeout=5).stdout
+            hits = "".join(ln + "\n" for ln in lines.splitlines() if key[:12] in ln)
+            if hits:
+                subprocess.run(["cliphist", "delete"], input=hits, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        pass
 
 
 class ChatWindow(Gtk.Window):
@@ -641,9 +686,14 @@ class ChatWindow(Gtk.Window):
         talk.pack_start(row, False, False, 0)
         self.stack.add_named(talk, "talk")
 
-        # first time: the key
-        self.setup = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-        self.stack.add_named(self.setup, "setup")
+        # first time: pick a service and get a key for it (scrolls on short screens)
+        self.setup = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        self.stack.add_named(scrolled(self.setup), "setup")
+        self.steps = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        self.stack.add_named(scrolled(self.steps), "steps")
+        self.guide_for = None
+        self.clip_timer = None
+        self.clip_seen = None
         self.build_setup()
 
         # a policy keeps him from chatting
@@ -659,43 +709,169 @@ class ChatWindow(Gtk.Window):
         box = self.setup
         hello = Gtk.Label(xalign=0, wrap=True, max_width_chars=42)
         hello.set_markup(
-            "<b>Hi! I'm Rune.</b> I can answer questions about Firox and anything else, search the web, "
-            "and do things on this computer for you, asking you first every time.\n\n"
-            "To talk, I use <b>Claude</b>, made by Anthropic, with your own <b>Claude API key</b>. "
-            "You pay Anthropic for what you use (usually a few cents a day of chatting); "
-            f"<a href=\"{KEYS_URL}\">get a key in the Claude Console</a>.\n\n"
-            "<small>Only what you type goes to Anthropic, straight from this computer: nothing is sent until "
-            "you ask me something. Our conversation stays on this computer.</small>")
+            "<b>Hi! I'm Rune.</b> I can answer questions about Firox and anything else, and do things on this "
+            "computer for you, asking you first every time.\n\n"
+            "To talk, I use an <b>AI service</b> with your own <b>API key</b> (a password that lets programs "
+            "like me use it). You pay the service for what you use, usually pennies a day; Gemini and "
+            "OpenRouter's free models cost nothing. <b>Pick one</b> and I'll walk you through it:")
         box.pack_start(hello, False, False, 0)
+        for pid in B.PROVIDER_IDS:
+            p = B.PROVIDERS[pid]
+            b = Gtk.Button()
+            b.get_style_context().add_class("service")
+            lab = Gtk.Label(xalign=0, wrap=True, max_width_chars=40)
+            lab.set_markup(f"<b>{p['name']}</b>\n<small>{GLib.markup_escape_text(p['blurb'])}</small>")
+            b.add(lab)
+            b.connect("clicked", lambda _b, pid=pid: self.guide(pid))
+            box.pack_start(b, False, False, 0)
+        have = Gtk.Label(xalign=0, wrap=True, max_width_chars=42)
+        have.set_markup("<small>Already have a key? Paste it here and I'll work out which service it's for:</small>")
+        box.pack_start(have, False, False, 0)
+        row = Gtk.Box(spacing=6)
         self.key_entry = Gtk.Entry()
         self.key_entry.set_visibility(False)
-        self.key_entry.set_placeholder_text("Paste your API key (sk-ant-…)")
-        self.key_entry.connect("activate", lambda *_: self.save_key())
-        box.pack_start(self.key_entry, False, False, 0)
-        save = Gtk.Button(label="Start chatting")
-        save.get_style_context().add_class("suggested-action")
-        save.connect("clicked", lambda *_: self.save_key())
-        box.pack_start(save, False, False, 0)
+        self.key_entry.set_placeholder_text("Paste an API key")
+        self.key_entry.connect("activate", lambda e: self.connect_key(e.get_text(), None, self.key_note))
+        row.pack_start(self.key_entry, True, True, 0)
+        go = Gtk.Button(label="Connect")
+        go.connect("clicked", lambda *_: self.connect_key(self.key_entry.get_text(), None, self.key_note))
+        row.pack_start(go, False, False, 0)
+        box.pack_start(row, False, False, 0)
         self.key_note = Gtk.Label(xalign=0, wrap=True, max_width_chars=42)
         self.key_note.get_style_context().add_class("dim")
         box.pack_start(self.key_note, False, False, 0)
+        privacy = Gtk.Label(xalign=0, wrap=True, max_width_chars=42)
+        privacy.set_markup("<small>Only what you type goes to the service you pick, straight from this computer, "
+                           "and nothing until you ask me something. Our conversation stays on this computer.</small>")
+        privacy.get_style_context().add_class("dim")
+        box.pack_start(privacy, False, False, 0)
 
-    def save_key(self):
-        key = self.key_entry.get_text().strip()
-        if not key.startswith("sk-") or len(key) < 20:
-            self.key_note.set_text("That doesn't look like a Claude API key: they start with sk-ant-.")
+    def guide(self, pid):
+        """Step by step: getting a key for one service. While this page is open
+        he watches the clipboard for a key, so copying it is enough."""
+        p = B.PROVIDERS[pid]
+        self.guide_for = pid
+        for c in self.steps.get_children():
+            c.destroy()
+        box = self.steps
+        title = Gtk.Label(xalign=0, wrap=True, max_width_chars=42)
+        title.set_markup(f"<b>Getting a {p['name']} key</b>")
+        box.pack_start(title, False, False, 0)
+        first = Gtk.Box(spacing=8)
+        n1 = Gtk.Label(xalign=0, wrap=True, max_width_chars=26)
+        n1.set_markup(f"1. Open {GLib.markup_escape_text(p['site'])}:")
+        first.pack_start(n1, True, True, 0)
+        open_b = Gtk.Button(label=f"Open {p['name']}")
+        open_b.get_style_context().add_class("suggested-action")
+        open_b.connect("clicked", lambda *_: open_url(p["keys"]))
+        first.pack_end(open_b, False, False, 0)
+        box.pack_start(first, False, False, 0)
+        for i, step in enumerate(p["steps"], start=2):
+            lab = Gtk.Label(xalign=0, wrap=True, max_width_chars=42)
+            lab.set_markup(f"{i}. {step}")
+            box.pack_start(lab, False, False, 0)
+        last = Gtk.Label(xalign=0, wrap=True, max_width_chars=42)
+        last.set_markup(f"{len(p['steps']) + 2}. Come back here. <b>I'll notice the key as soon as you copy it</b>, "
+                        "or paste it below.")
+        box.pack_start(last, False, False, 0)
+        row = Gtk.Box(spacing=6)
+        entry = Gtk.Entry()
+        entry.set_visibility(False)
+        entry.set_placeholder_text(f"Your {p['name']} key ({p['prefix']}…)")
+        row.pack_start(entry, True, True, 0)
+        go = Gtk.Button(label="Connect")
+        row.pack_start(go, False, False, 0)
+        box.pack_start(row, False, False, 0)
+        note = Gtk.Label(xalign=0, wrap=True, max_width_chars=42)
+        note.get_style_context().add_class("dim")
+        box.pack_start(note, False, False, 0)
+        entry.connect("activate", lambda e: self.connect_key(e.get_text(), pid, note))
+        go.connect("clicked", lambda *_: self.connect_key(entry.get_text(), pid, note))
+        back = Gtk.Button(label="Back")
+        back.get_style_context().add_class("flat")
+        back.set_halign(Gtk.Align.START)
+        back.connect("clicked", lambda *_: self.leave_guide())
+        box.pack_start(back, False, False, 0)
+        self.guide_entry, self.guide_note = entry, note
+        box.show_all()
+        self.stack.set_visible_child_name("steps")
+        entry.grab_focus()
+        self.watch_clipboard(True)
+
+    def leave_guide(self):
+        self.watch_clipboard(False)
+        self.guide_for = None
+        self.refresh()
+
+    def watch_clipboard(self, on):
+        """wl-paste reads the clipboard even while another window has the
+        keyboard (copying the key in the browser). Only a key-shaped text
+        does anything; nothing is kept."""
+        if self.clip_timer is not None:
+            GLib.source_remove(self.clip_timer)
+            self.clip_timer = None
+        if on and shutil.which("wl-paste"):
+            self.clip_seen = clipboard_text()    # (what was there before doesn't count)
+            self.clip_timer = GLib.timeout_add(1200, self.check_clipboard)
+
+    def check_clipboard(self):
+        if self.guide_for is None or not self.get_visible():
+            self.clip_timer = None
+            return False
+        text = clipboard_text()
+        if text and text != self.clip_seen:
+            self.clip_seen = text
+            if B.detect_provider(text):
+                self.clip_timer = None
+                self.guide_entry.set_text(text)
+                self.present()
+                self.connect_key(text, self.guide_for, self.guide_note)
+                return False
+        return True
+
+    def connect_key(self, key, pid, note):
+        """Try the key with its service; on success use it."""
+        key = (key or "").strip()
+        found = B.detect_provider(key)
+        if not found:
+            note.set_text("That doesn't look like an API key. Keys start with sk-ant- (Claude), sk-or- "
+                          "(OpenRouter), sk- (OpenAI) or AIza (Gemini).")
             return
-        where = self.app.keys.set(key)
-        self.key_entry.set_text("")
+        name = B.PROVIDERS[found]["name"]
+        note.set_text(f"Got it! Checking your key with {name}…" if found == pid or pid is None else
+                      f"That's a {name} key, so I'll use {name}. Checking it…")
+
+        def work():
+            try:
+                models = B.check_key(found, key)
+                GLib.idle_add(self.connected, found, key, models)
+            except B.ServiceError as e:
+                GLib.idle_add(note.set_text, str(e))
+        threading.Thread(target=work, daemon=True).start()
+
+    def connected(self, pid, key, models):
+        self.watch_clipboard(False)
+        self.guide_for = None
+        where = self.app.use_service(pid, key, models)
+        forget_from_clipboard(key)
+        for e in (self.key_entry, getattr(self, "guide_entry", None)):
+            if e is not None:
+                e.set_text("")
         self.key_note.set_text("")
         self.refresh()
+        conf = self.app.conf
+        self.say("rune", f"All set! I'm talking through {B.PROVIDERS[pid]['name']} now, with "
+                         f"{B.model_name(conf)}. (I've taken the key off your clipboard.) What can I help with?")
         if where != "keyring":
-            self.say("rune", "(There's no keyring here, so I've kept your key in a file only you can read: "
-                             "~/.config/firox/rune-key.)", "dim")
+            self.say("rune", "(There's no keyring here, so I've kept your key in a file only you can read, "
+                             "in ~/.config/firox.)", "dim")
+        return False
 
     def refresh(self):
         if not B.policy()["chat"]:
             self.stack.set_visible_child_name("policy")
+        elif self.guide_for is not None:
+            self.stack.set_visible_child_name("steps")
         elif not self.app.keys.get():
             self.stack.set_visible_child_name("setup")
         else:
@@ -904,14 +1080,27 @@ class SettingsWindow(Gtk.Window):
         check("glade", "Show his glade (or just Rune)")
         check("on_top", "Keep him above windows")
 
-        section("Talking (Claude)")
-        row("Model", combo("model", [(m, f"{n}: {d}") for m, n, d in B.MODELS]))
+        section("Talking")
+        self.service = Gtk.ComboBoxText()
+        for pid in B.PROVIDER_IDS:
+            self.service.append(pid, B.PROVIDERS[pid]["name"])
+        self.service.connect("changed", lambda w: self.pick_service(w.get_active_id()))
+        row("Service", self.service)
+        models = Gtk.Box(spacing=6)
+        self.model = Gtk.ComboBoxText()
+        self.model.set_size_request(260, -1)
+        self.model.connect("changed", lambda w: self.pick_model(w.get_active_id()))
+        models.pack_start(self.model, True, True, 0)
+        self.reload = Gtk.Button.new_from_icon_name("view-refresh-symbolic", Gtk.IconSize.BUTTON)
+        self.reload.set_tooltip_text("Ask the service which models this key can use")
+        self.reload.connect("clicked", lambda *_: self.reload_models())
+        models.pack_start(self.reload, False, False, 0)
+        row("Model", models)
         self.key_label = Gtk.Label(xalign=0, wrap=True, max_width_chars=48)
         box.pack_start(self.key_label, False, False, 0)
         keys = Gtk.Box(spacing=8)
         self.key_entry = Gtk.Entry()
         self.key_entry.set_visibility(False)
-        self.key_entry.set_placeholder_text("New API key (sk-ant-…)")
         keys.pack_start(self.key_entry, True, True, 0)
         save = Gtk.Button(label="Save Key")
         save.connect("clicked", lambda *_: self.save_key())
@@ -920,14 +1109,18 @@ class SettingsWindow(Gtk.Window):
         remove.connect("clicked", lambda *_: self.remove_key())
         keys.pack_start(remove, False, False, 0)
         box.pack_start(keys, False, False, 0)
-        link = Gtk.Label(xalign=0)
-        link.set_markup(f"<a href=\"{KEYS_URL}\">Get an API key in the Claude Console</a>")
-        box.pack_start(link, False, False, 0)
+        helpme = Gtk.Box(spacing=8)
+        self.guide_b = Gtk.Button()
+        self.guide_b.connect("clicked", lambda *_: self.app.show_guide(self.service.get_active_id()))
+        helpme.pack_start(self.guide_b, False, False, 0)
+        self.money = Gtk.Label(xalign=0)
+        helpme.pack_start(self.money, False, False, 0)
+        box.pack_start(helpme, False, False, 0)
         privacy = Gtk.Label(xalign=0, wrap=True, max_width_chars=56)
-        privacy.set_markup("<small>Only what you type goes to Anthropic (with Firox's help, so I know Firox), "
+        privacy.set_markup("<small>Only what you type goes to the service (with Firox's help, so I know Firox), "
                            "straight from this computer, and only once you ask me something. Before I do anything "
                            "on the computer I ask you. Our conversation is kept on this computer until you "
-                           "start a new one.</small>")
+                           "start a new one. Web search works with Claude.</small>")
         privacy.get_style_context().add_class("dim-label")
         box.pack_start(privacy, False, False, 0)
         forget = Gtk.Button(label="Forget Our Conversation")
@@ -943,25 +1136,106 @@ class SettingsWindow(Gtk.Window):
         close.connect("clicked", lambda *_: self.destroy())
         bottom.pack_end(close, False, False, 0)
         box.pack_start(bottom, False, False, 6)
-        self.update_key()
+        self.update_service()
         self.show_all()
 
+    def update_service(self):
+        """Fill the Talking section for the service in use."""
+        self.filling = True
+        pid = self.app.conf["provider"]
+        self.service.set_active_id(pid)
+        self.fill_models(pid)
+        self.filling = False
+        self.update_key()
+
+    def fill_models(self, pid):
+        conf = self.app.conf
+        self.model.remove_all()
+        if pid == "anthropic":
+            for m, n, d in B.MODELS:
+                self.model.append(m, f"{n}: {d}")
+            self.model.set_active_id(conf["model"])
+        else:
+            ids = B.load_model_list(pid)
+            current = conf["models"].get(pid)
+            if current and current not in ids:
+                ids = [current] + ids
+            for m in ids:
+                label = m.removeprefix("models/")
+                self.model.append(m, label.replace(":free", " (free)"))
+            if current:
+                self.model.set_active_id(current)
+        self.reload.set_visible(pid != "anthropic")
+
+    def pick_service(self, pid):
+        if getattr(self, "filling", False) or not pid or pid == self.app.conf["provider"]:
+            return
+        if not B.KeyStore(pid).get():
+            # (no key for it yet: the guide gets one, and switches when it works)
+            self.app.show_guide(pid)
+            self.update_service()
+            return
+        self.app.use_service(pid)
+
+    def pick_model(self, mid):
+        if getattr(self, "filling", False) or not mid:
+            return
+        pid = self.app.conf["provider"]
+        if pid == "anthropic":
+            self.app.set("model", mid)
+        else:
+            self.app.set("models", dict(self.app.conf["models"], **{pid: mid}))
+
+    def reload_models(self):
+        pid = self.app.conf["provider"]
+        key = self.app.keys.get()
+        if not key:
+            return
+        self.key_label.set_text("Asking for the list of models…")
+
+        def work():
+            try:
+                models = B.check_key(pid, key)
+                B.save_model_list(pid, models)
+                GLib.idle_add(self.update_service)
+            except B.ServiceError as e:
+                GLib.idle_add(self.key_label.set_text, str(e))
+        threading.Thread(target=work, daemon=True).start()
+
     def update_key(self):
+        pid = self.app.conf["provider"]
+        p = B.PROVIDERS[pid]
         where = self.app.keys.where()
-        self.key_label.set_text({"keyring": "Your API key is saved in your keyring.",
-                                 "file": "Your API key is saved in a file only you can read "
-                                         "(~/.config/firox/rune-key), because there's no keyring here.",
-                                 None: "No API key yet: I can't chat until you add one."}[where])
+        self.key_label.set_text({"keyring": f"Your {p['name']} API key is saved in your keyring.",
+                                 "file": f"Your {p['name']} API key is saved in a file only you can read "
+                                         "(in ~/.config/firox), because there's no keyring here.",
+                                 None: f"No {p['name']} API key yet: I can't chat until you add one."}[where])
+        self.key_entry.set_placeholder_text(f"New {p['name']} key ({p['prefix']}…)")
+        self.guide_b.set_label("Help Me Get a Key" if where is None else "Get a New Key")
+        self.money.set_markup(f"<a href=\"{p['money']}\">Credit and usage on {GLib.markup_escape_text(p['site'])}</a>")
 
     def save_key(self):
         key = self.key_entry.get_text().strip()
-        if not key.startswith("sk-") or len(key) < 20:
-            self.key_label.set_text("That doesn't look like a Claude API key: they start with sk-ant-.")
+        pid = B.detect_provider(key)
+        if not pid:
+            self.key_label.set_text("That doesn't look like an API key. Keys start with sk-ant- (Claude), sk-or- "
+                                    "(OpenRouter), sk- (OpenAI) or AIza (Gemini).")
             return
-        self.app.keys.set(key)
+        self.key_label.set_text(f"Checking your key with {B.PROVIDERS[pid]['name']}…")
+
+        def work():
+            try:
+                models = B.check_key(pid, key)
+                GLib.idle_add(self.key_saved, pid, key, models)
+            except B.ServiceError as e:
+                GLib.idle_add(self.key_label.set_text, str(e))
+        threading.Thread(target=work, daemon=True).start()
+
+    def key_saved(self, pid, key, models):
         self.key_entry.set_text("")
-        self.update_key()
-        self.app.key_changed()
+        self.app.use_service(pid, key, models)
+        forget_from_clipboard(key)
+        return False
 
     def remove_key(self):
         self.app.keys.clear()
@@ -973,8 +1247,8 @@ class RuneApp(Gtk.Application):
     def __init__(self):
         super().__init__(application_id="org.firox.Rune", flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE)
         self.conf = B.load_conf()
-        self.keys = B.KeyStore()
-        self.brain = B.Brain(self.keys)
+        self.keys = B.KeyStore(self.conf["provider"])
+        self.brain = B.make_brain(self.conf)
         self.rune = self.chat = self.prefs = None
         self.busy = False
         self.leaving = False            # put away or quitting: don't bring him back
@@ -1068,6 +1342,36 @@ class RuneApp(Gtk.Application):
         if self.chat is not None:
             self.chat.refresh()
 
+    def show_guide(self, pid):
+        """The chat bubble, at the steps for getting pid's key."""
+        self.show_chat()
+        self.chat.guide(pid)
+
+    def use_service(self, pid, key=None, models=None):
+        """Talk through pid from now on (saving its key and model list, if
+        given). Returns where the key was kept."""
+        where = None
+        if key:
+            where = B.KeyStore(pid).set(key)
+        if models is not None:
+            B.save_model_list(pid, models)
+        self.conf = B.load_conf()
+        self.conf["provider"] = pid
+        if pid != "anthropic" and not self.conf["models"].get(pid):
+            self.conf["models"] = dict(self.conf["models"], **{pid: B.default_model(pid, models or [])})
+        B.save_conf(self.conf)
+        self.keys = B.KeyStore(pid)
+        if not self.busy:
+            self.brain = B.make_brain(self.conf)
+            if self.chat is not None:
+                for c in self.chat.list.get_children():
+                    c.destroy()
+        if self.chat is not None:
+            self.chat.refresh()
+        if self.prefs is not None:
+            self.prefs.update_service()
+        return where
+
     def forget(self):
         if self.busy:
             return
@@ -1140,10 +1444,11 @@ class RuneApp(Gtk.Application):
         self.chat.refresh()
         self.chat.show()
         self.chat.present()
-        if self.chat.stack.get_visible_child_name() == "talk":
+        page = self.chat.stack.get_visible_child_name()
+        if page == "talk":
             self.chat.entry.grab_focus()
-        else:
-            self.chat.key_entry.grab_focus()
+        # (the setup page doesn't put the keyboard in its key box: that would
+        # scroll it past his introduction)
 
     def toggle_chat(self):
         if self.chat is not None and self.chat.get_visible():

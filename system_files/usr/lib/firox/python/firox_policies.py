@@ -1213,10 +1213,10 @@ POLICIES = [
            "Whether Rune, the Firox mascot, can sit on the desktop at all. Not allowed puts him away and keeps "
            "him away; allowed leaves it to each person (he can be put away from his menu).",
            "bool", apply_rune, on_label="Allowed", off_label="Not allowed"),
-    Policy("rune.chat", "Applications/Rune", "Chatting with Claude",
-           "Whether Rune can answer questions and do things for people, using Claude (Anthropic's AI) with "
-           "their own Claude API key. Not allowed keeps him as a mascot only: nothing is ever sent to "
-           "Anthropic.",
+    Policy("rune.chat", "Applications/Rune", "Chatting",
+           "Whether Rune can answer questions and do things for people, using the AI service they pick "
+           "(Claude, OpenRouter, OpenAI or Gemini) with their own API key. Not allowed keeps him as a mascot "
+           "only: nothing is ever sent to any of them.",
            "bool", apply_rune_chat, on_label="Allowed", off_label="Not allowed"),
 ]
 
