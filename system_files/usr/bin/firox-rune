@@ -543,6 +543,15 @@ CSS = b"""
 #bubble button.flat:hover { background-color: rgba(255, 255, 255, 0.14); }
 #bubble button image { color: #eef5ff; }
 #bubble link, #bubble label link { color: #8fd0ff; }
+#bubble entry selection { background-color: #2f7fd8; color: #ffffff; }
+/* GTK's own pieces opened from inside the bubble (the Cut/Copy/Paste menu, the
+   emoji picker) are styled as its children: give them back the light/dark
+   theme's colours instead of the bubble's white text */
+#bubble menu label, #bubble menuitem label, #bubble popover label { color: inherit; }
+#bubble popover button, #bubble popover entry {
+    background-color: transparent; background-image: none; border-color: transparent; color: inherit;
+}
+#bubble popover button label, #bubble popover button image { color: inherit; }
 """
 
 
@@ -971,6 +980,17 @@ class RuneApp(Gtk.Application):
         prov.load_from_data(CSS)
         Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), prov,
                                                  Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        # His bubble keeps its own colours, but GTK's own pieces (the Copy/Paste
+        # menu, tooltips, his right-click menu) follow the light/dark setting,
+        # including a change while he's running
+        try:
+            self.iface = Gio.Settings.new("org.gnome.desktop.interface")
+        except Exception:  # noqa: BLE001 - schema missing
+            self.iface = None
+        if self.iface is not None:
+            self.follow_app_style()
+            for key in ("color-scheme", "gtk-theme", "icon-theme"):
+                self.iface.connect(f"changed::{key}", lambda *_: self.follow_app_style())
         # Rune's window can be closed under him (the compositor closes layer
         # surfaces when their monitor sleeps, wakes or is unplugged): keep
         # running without it, and put him back (bring_back)
@@ -980,6 +1000,17 @@ class RuneApp(Gtk.Application):
         if firox_monitors is not None:
             self.main_mon = Gio.File.new_for_path(firox_monitors.CONF).monitor_file(Gio.FileMonitorFlags.NONE, None)
             self.main_mon.connect("changed", lambda *_: self.schedule_place())
+
+    def follow_app_style(self):
+        st = Gtk.Settings.get_default()
+        theme = self.iface.get_string("gtk-theme")
+        if theme:
+            st.set_property("gtk-theme-name", theme)
+        icons = self.iface.get_string("icon-theme")
+        if icons:
+            st.set_property("gtk-icon-theme-name", icons)
+        st.set_property("gtk-application-prefer-dark-theme",
+                        self.iface.get_string("color-scheme") == "prefer-dark")
 
     def do_command_line(self, cmdline):
         args = cmdline.get_arguments()[1:]
