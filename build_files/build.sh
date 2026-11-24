@@ -202,6 +202,10 @@ chmod 0755 /usr/bin/firox-* /usr/bin/umu-run
 # System Preparation, Powerwash and first-time setup (root helpers, polkit rule)
 chmod 0755 /usr/libexec/firox/reset /usr/libexec/firox/oobe-apply /usr/libexec/firox/firox-oobe
 chmod 0644 /usr/share/polkit-1/rules.d/50-firox-oobe.rules
+# SELinux: setup's helper runs from the login screen (xdm_t) through pkexec, which
+# keeps that domain; there useradd can't lock /etc/group. The module labels it
+# like GDM's root hooks so it runs unconfined (see the .cil file).
+semodule -i /usr/share/selinux/packages/firox/firox-oobe.cil
 
 # Our .desktop files' file types (Windows programs open with firox-windows,
 # folders with Firox Explorer): GIO only sees what mimeinfo.cache lists

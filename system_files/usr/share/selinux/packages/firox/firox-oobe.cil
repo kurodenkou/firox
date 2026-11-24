@@ -1,0 +1,8 @@
+; First-time setup's helper (/usr/libexec/firox/oobe-apply) is started from the
+; login screen through pkexec. pkexec doesn't change SELinux domain, so without
+; this it would run confined as the display manager (xdm_t), where useradd can't
+; lock /etc/group ("useradd: cannot lock /etc/group"). Labelled like GDM's own
+; root hook scripts (/etc/gdm/PostLogin etc.), it moves to xdm_unconfined_t when
+; run. Who may run it is still decided by polkit (50-firox-oobe.rules) and by
+; the helper itself (only while /var/lib/firox/oobe exists).
+(filecon "/usr/libexec/firox/oobe-apply" file (system_u object_r xdm_unconfined_exec_t ((s0) (s0))))
