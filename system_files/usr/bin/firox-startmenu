@@ -529,7 +529,7 @@ class StartMenu(Gtk.Window):
         self.bazaar_img = bazaar.get_child().get_children()[0]
         set_icon(self.bazaar_img, self.bazaar_icon, 24)
         right.pack_start(bazaar, False, False, 0)
-        right.pack_start(place("system-config-printer", "Printers and Faxes", "printers"), False, False, 0)
+        right.pack_start(place("printer", "Printers and Faxes", "printers"), False, False, 0)
         right.pack_start(self._sep(), False, False, 0)
         right.pack_start(place("help-browser", "Help and Support", "help"), False, False, 0)
         right.pack_start(place("system-search", "Search", "search"), False, False, 0)

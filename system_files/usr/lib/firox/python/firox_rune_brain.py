@@ -339,6 +339,8 @@ SETTINGS_NAMES = {"home": "Settings", "system": "System Properties", "datetime":
 FIROX_TOOLS = {
     # name: (what it's called, command)
     "file_explorer": ("Firox Explorer", ["firox-explorer"]),
+    "printers": ("Printers and Faxes", ["firox-printers"]),
+    "add_printer": ("Add a Printer", ["firox-printers", "--add"]),
     "task_manager": ("Task Manager", ["firox-taskmgr"]),
     "system_information": ("System Information", ["firox-sysinfo"]),
     "snipping_tool": ("the Snipping Tool", ["firox-snip"]),

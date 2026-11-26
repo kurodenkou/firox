@@ -1,0 +1,78 @@
+#!/usr/bin/python3
+"""
+printer-admin: add, remove or make default a printer, for Printers and Faxes
+(firox-printers). Run as root through pkexec, which asks for an
+administrator's password.
+
+    printer-admin add NAME URI [DESCRIPTION]   driverless (IPP Everywhere)
+    printer-admin remove NAME
+    printer-admin default NAME                 the default for everyone
+
+Only these, with the name and address checked: nothing else is passed to
+lpadmin. The first printer added becomes the default.
+"""
+
+import re
+import subprocess
+import sys
+
+NAME = re.compile(r"[A-Za-z0-9_-]{1,64}")
+URI = re.compile(r"(ipps?|https?)://[A-Za-z0-9.:\[\]%_-]+(:\d+)?(/[A-Za-z0-9._~/%-]*)?")
+
+
+def fail(msg, code=1):
+    print(msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def lpadmin(*args):
+    p = subprocess.run(["lpadmin", *args], capture_output=True, text=True, timeout=90)
+    if p.returncode != 0:
+        err = (p.stderr or p.stdout).strip()
+        if "Unable to create PPD" in err:
+            fail("The printer answered, but didn't describe itself well enough to print without a driver. "
+                 "Use Advanced… to add it with a driver.")
+        if "Unable to query printer" in err or "Unable to connect" in err:
+            fail("Couldn't talk to the printer. Is it switched on, and on the same network as this computer?")
+        if "everywhere" in err.lower() or "driverless" in err.lower():
+            fail("This printer needs a driver: use Advanced… to add it.")
+        fail(err[:300] or "lpadmin failed")
+
+
+def printers():
+    """Printers added to this computer (not the network printers CUPS can merely see)."""
+    p = subprocess.run(["lpstat", "-v"], capture_output=True, text=True, check=False)
+    return [ln.split()[2].rstrip(":") for ln in p.stdout.splitlines() if ln.startswith("device for ")]
+
+
+def main(argv):
+    import os
+    if os.geteuid() != 0:
+        fail("This needs to run as root (through pkexec).")
+    if len(argv) < 3 or argv[1] not in ("add", "remove", "default"):
+        fail(__doc__.strip(), 2)
+    cmd, name = argv[1], argv[2]
+    if not NAME.fullmatch(name):
+        fail("A printer's name can only have letters, numbers, - and _.", 2)
+    if cmd == "add":
+        if len(argv) < 4 or not URI.fullmatch(argv[3]):
+            fail("That doesn't look like a printer's address (ipp://…).", 2)
+        first = not printers()
+        args = ["-p", name, "-E", "-v", argv[3], "-m", "everywhere"]
+        if len(argv) > 4 and argv[4].strip():
+            args += ["-D", argv[4].strip()[:120]]
+        lpadmin(*args)
+        if first:
+            lpadmin("-d", name)
+        print(f"Added {name}.")
+    elif cmd == "remove":
+        lpadmin("-x", name)
+        print(f"Removed {name}.")
+    else:
+        lpadmin("-d", name)
+        print(f"{name} is the default printer.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

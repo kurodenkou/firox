@@ -1,0 +1,541 @@
+#!/usr/bin/python3
+"""
+firox-printers: Printers and Faxes (Settings > Printers and Faxes; Start menu).
+
+    firox-printers          your printers: status, default, test page, what's
+                            printing, remove
+    firox-printers --add    straight to Add a Printer
+
+Add a Printer finds printers on the network and on USB by itself (Bonjour,
+through avahi; USB printers that speak IPP show up through ipp-usb) and adds
+the one you pick driverless (IPP Everywhere), which most printers made in the
+last ten years support. You can also type a printer's address. Adding and
+removing need an administrator's password (pkexec,
+/usr/libexec/firox/printer-admin); choosing your default printer, test pages
+and cancelling your own documents don't. Older printers that need a driver go
+through Advanced… (system-config-printer).
+"""
+
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import threading
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+from gi.repository import Gio, GLib, Gtk  # noqa: E402
+
+sys.path.insert(0, "/usr/lib/firox/python")
+try:
+    import firox_a11y  # noqa: E402
+except ImportError:
+    firox_a11y = None
+
+try:
+    import cups  # python3-cups
+except ImportError:
+    cups = None
+
+ADMIN = "/usr/libexec/firox/printer-admin"
+TESTPAGE = "/usr/share/cups/data/testprint"
+STATES = {3: "Ready", 4: "Printing", 5: "Stopped"}
+
+
+def run(argv, timeout=60, **kw):
+    try:
+        return subprocess.run(argv, capture_output=True, text=True, timeout=timeout, **kw)
+    except (OSError, subprocess.SubprocessError) as e:
+        return subprocess.CompletedProcess(argv, 1, "", str(e))
+
+
+def spawn(argv):
+    try:
+        subprocess.Popen(argv, start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError as e:
+        print(f"firox-printers: couldn't run {argv[0]}: {e}", file=sys.stderr)
+
+
+def queue_name(text):
+    """A CUPS name for a printer from its friendly name."""
+    name = re.sub(r"[^A-Za-z0-9_-]+", "_", text).strip("_")[:60]
+    return name or "Printer"
+
+
+def my_default():
+    """Your default printer, as the Print window sees it: your own choice
+    (lpoptions -d, ~/.cups/lpoptions) or else the computer's."""
+    if cups is None:
+        return None
+    try:
+        d = cups.Connection().getDests().get((None, None))
+        return d.name if d is not None else None
+    except (cups.IPPError, RuntimeError):
+        return None
+
+
+def installed():
+    """{name: attributes} and {name: number of documents waiting}."""
+    if cups is None:
+        return {}, {}
+    try:
+        c = cups.Connection()
+        printers = c.getPrinters()
+        jobs = c.getJobs(which_jobs="not-completed", requested_attributes=["job-printer-uri"])
+    except (cups.IPPError, RuntimeError):
+        return None, None
+    waiting = {}
+    for j in jobs.values():
+        name = (j.get("job-printer-uri") or "").rsplit("/", 1)[-1]
+        waiting[name] = waiting.get(name, 0) + 1
+    return printers, waiting
+
+
+def resolves(host):
+    """Can this computer look the name up? (printer.local needs nss-mdns.) A
+    name survives the printer getting a new address; the address is the
+    fallback."""
+    try:
+        socket.getaddrinfo(host, 631, socket.AF_INET)
+        return True
+    except (OSError, UnicodeError):
+        return False
+
+
+def discover():
+    """Printers the network (and ipp-usb) announces: [{name, model, uri, usb}]."""
+    found = {}
+    for kind in ("_ipps._tcp", "_ipp._tcp"):
+        p = run(["avahi-browse", "-rptk", kind], timeout=12)
+        for line in p.stdout.splitlines():
+            f = line.split(";")
+            if len(f) < 10 or f[0] != "=" or f[2] != "IPv4":
+                continue
+            name, host, addr, port = f[3], f[6], f[7], f[8]
+            name = re.sub(r"\\(\d{3})", lambda m: chr(int(m.group(1))), name)   # (avahi's escapes)
+            txt = dict(kv.split("=", 1) for kv in re.findall(r'"([^"]*)"', f[9]) if "=" in kv)
+            rp = txt.get("rp", "ipp/print")
+            key = txt.get("UUID") or name
+            if key in found:
+                continue                     # (ipps first: the same printer over ipp is skipped)
+            scheme = "ipps" if kind == "_ipps._tcp" else "ipp"
+            usb = addr.startswith("127.") or host.startswith("localhost")
+            target = "localhost" if usb else (host.rstrip(".") if resolves(host.rstrip(".")) else addr)
+            found[key] = {"name": name, "model": txt.get("ty") or txt.get("product", "").strip("()") or "",
+                          "uri": f"{scheme}://{target}:{port}/{rp}", "usb": usb}
+    return sorted(found.values(), key=lambda d: d["name"].lower())
+
+
+def probe(address):
+    """A printer at a typed address: (uri, model) or raise ValueError."""
+    address = address.strip()
+    if not address:
+        raise ValueError("Type the printer's address, such as 192.168.1.50.")
+    if "://" in address:
+        uris = [address]
+    else:
+        if not re.fullmatch(r"[A-Za-z0-9.:\[\]_-]+", address):
+            raise ValueError("That doesn't look like an address. It's usually numbers like 192.168.1.50, "
+                             "or a name like printer.local.")
+        uris = [f"ipp://{address}/ipp/print", f"ipp://{address}:631/ipp/print", f"ipp://{address}/ipp"]
+    for uri in uris:
+        # (ipptool's test also "fails" over optional attributes a printer
+        # leaves out; what matters is that it answered and described itself)
+        p = run(["ipptool", "-T", "8", "-tv", uri, "get-printer-attributes.test"], timeout=20)
+        if re.search(r"printer-(uri-supported|make-and-model|name) \(", p.stdout):
+            m = re.search(r"printer-make-and-model \(textWithoutLanguage\) = (.+)", p.stdout)
+            return uri, (m.group(1).strip() if m else "")
+    raise ValueError("No printer answered at that address. Check it's switched on and on the same network; "
+                     "its address is usually printed on its network settings page.")
+
+
+class AddDialog(Gtk.Dialog):
+    def __init__(self, parent, existing):
+        super().__init__(title="Add a Printer", transient_for=parent, modal=True)
+        self.parent_win = parent
+        self.existing = existing
+        self.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        self.add_btn = self.add_button("Add Printer", Gtk.ResponseType.OK)
+        self.add_btn.get_style_context().add_class("suggested-action")
+        self.add_btn.set_sensitive(False)
+        self.set_default_size(520, 520)
+        box = self.get_content_area()
+        box.set_spacing(10)
+        box.set_border_width(16)
+        intro = Gtk.Label(xalign=0, wrap=True, max_width_chars=58)
+        intro.set_markup("<b>Pick your printer.</b> Make sure it's switched on, and connected to the same network "
+                         "as this computer (or plugged in by USB).")
+        box.pack_start(intro, False, False, 0)
+        self.state = Gtk.Box(spacing=8)
+        self.spinner = Gtk.Spinner()
+        self.state.pack_start(self.spinner, False, False, 0)
+        self.state_label = Gtk.Label(xalign=0, wrap=True, max_width_chars=50)
+        self.state.pack_start(self.state_label, True, True, 0)
+        box.pack_start(self.state, False, False, 0)
+        sw = Gtk.ScrolledWindow()
+        sw.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        sw.set_min_content_height(170)
+        sw.set_shadow_type(Gtk.ShadowType.IN)
+        self.list = Gtk.ListBox()
+        self.list.connect("row-selected", self.on_pick)
+        self.list.connect("row-activated", lambda *_: self.response(Gtk.ResponseType.OK))
+        sw.add(self.list)
+        box.pack_start(sw, True, True, 0)
+        again = Gtk.Button(label="Look Again")
+        again.set_halign(Gtk.Align.START)
+        again.connect("clicked", lambda *_: self.look())
+        box.pack_start(again, False, False, 0)
+
+        t = Gtk.Label(xalign=0)
+        t.set_markup("<b>Not in the list?</b> Type its address:")
+        box.pack_start(t, False, False, 4)
+        row = Gtk.Box(spacing=8)
+        self.address = Gtk.Entry(placeholder_text="such as 192.168.1.50 or printer.local")
+        self.address.get_accessible().set_name("Printer address")
+        self.address.connect("activate", lambda *_: self.try_address())
+        row.pack_start(self.address, True, True, 0)
+        find = Gtk.Button(label="Find")
+        find.connect("clicked", lambda *_: self.try_address())
+        row.pack_start(find, False, False, 0)
+        box.pack_start(row, False, False, 0)
+        more = Gtk.Label(xalign=0, wrap=True, max_width_chars=60)
+        more.set_markup("<small>A printer's address is on its own screen or network settings page. Older printers "
+                        "that need a driver (most from before 2013): use <a href=\"advanced\">Advanced</a>, which "
+                        "finds drivers for HP, Brother, Epson, Canon and many more.</small>")
+        more.connect("activate-link", lambda *_: (spawn(["system-config-printer"]), True)[1])
+        more.get_style_context().add_class("dim-label")
+        box.pack_start(more, False, False, 0)
+        self.note = Gtk.Label(xalign=0, wrap=True, max_width_chars=60)
+        box.pack_start(self.note, False, False, 0)
+        self.chosen = None
+        self.show_all()
+        self.look()
+
+    def look(self):
+        for r in self.list.get_children():
+            r.destroy()
+        self.spinner.start()
+        self.state_label.set_text("Looking for printers…")
+
+        def work():
+            found = discover()
+            GLib.idle_add(self.show_found, found)
+        threading.Thread(target=work, daemon=True).start()
+
+    def show_found(self, found):
+        self.spinner.stop()
+        known = {a.get("device-uri") for a in self.existing.values()}
+        fresh = [d for d in found if d["uri"] not in known]
+        for d in fresh:
+            self.add_row(d)
+        if fresh:
+            self.state_label.set_text(f"Found {len(fresh)} printer{'s' if len(fresh) != 1 else ''}:")
+        elif found:
+            self.state_label.set_text("The printers I can see are already added.")
+        else:
+            self.state_label.set_text("I couldn't find any printers. Check that yours is on and connected, then "
+                                      "click Look Again, or type its address below.")
+        return False
+
+    def add_row(self, d):
+        row = Gtk.ListBoxRow()
+        row.printer = d
+        line = Gtk.Box(spacing=10)
+        line.set_border_width(8)
+        line.pack_start(Gtk.Image.new_from_icon_name("printer" if d["usb"] else "printer-network",
+                                                     Gtk.IconSize.DND), False, False, 0)
+        lab = Gtk.Label(xalign=0, wrap=True, max_width_chars=44)
+        where = "Plugged in by USB" if d["usb"] else "On the network"
+        model = f" · {GLib.markup_escape_text(d['model'])}" if d["model"] and d["model"] != d["name"] else ""
+        lab.set_markup(f"<b>{GLib.markup_escape_text(d['name'])}</b>\n<small>{where}{model}</small>")
+        line.pack_start(lab, True, True, 0)
+        row.add(line)
+        row.get_accessible().set_name(f"{d['name']}, {where.lower()}")
+        self.list.add(row)
+        row.show_all()
+        return row
+
+    def on_pick(self, _lb, row):
+        self.chosen = row.printer if row is not None else None
+        self.add_btn.set_sensitive(self.chosen is not None)
+
+    def try_address(self):
+        text = self.address.get_text()
+        self.note.set_text("Asking the printer…")
+
+        def work():
+            try:
+                uri, model = probe(text)
+                d = {"name": model or text.strip(), "model": model, "uri": uri, "usb": False}
+                GLib.idle_add(self.found_address, d)
+            except ValueError as e:
+                GLib.idle_add(self.note.set_text, str(e))
+        threading.Thread(target=work, daemon=True).start()
+
+    def found_address(self, d):
+        self.note.set_text("Found it.")
+        row = self.add_row(d)
+        self.list.select_row(row)
+        return False
+
+
+class Printers(Gtk.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="Printers and Faxes")
+        self.set_default_size(660, 500)
+        self.set_icon_name("printer")
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        outer.set_border_width(16)
+        self.add(outer)
+        head = Gtk.Box(spacing=12)
+        head.pack_start(Gtk.Image.new_from_icon_name("printer", Gtk.IconSize.DIALOG), False, False, 0)
+        intro = Gtk.Label(xalign=0, wrap=True, max_width_chars=60)
+        intro.set_markup("<b>Printers and Faxes</b>\nPrinters on your network usually show up in the Print window "
+                         "by themselves. Add one here to keep it, make it your default, or check it works.")
+        head.pack_start(intro, True, True, 0)
+        outer.pack_start(head, False, False, 0)
+        buttons = Gtk.Box(spacing=8)
+        add = Gtk.Button(label="Add a Printer…")
+        add.get_style_context().add_class("suggested-action")
+        add.connect("clicked", lambda *_: self.add_printer())
+        buttons.pack_start(add, False, False, 0)
+        if shutil.which("simple-scan"):
+            scan = Gtk.Button(label="Scan a Document…")
+            scan.set_tooltip_text("Document Scanner: scanners on the network or plugged in by USB")
+            scan.connect("clicked", lambda *_: spawn(["simple-scan"]))
+            buttons.pack_start(scan, False, False, 0)
+        adv = Gtk.Button(label="Advanced…")
+        adv.set_tooltip_text("Printers that need a driver, and every printer setting (system-config-printer)")
+        adv.connect("clicked", lambda *_: spawn(["system-config-printer"]))
+        buttons.pack_end(adv, False, False, 0)
+        outer.pack_start(buttons, False, False, 0)
+        sw = Gtk.ScrolledWindow()
+        sw.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        sw.set_shadow_type(Gtk.ShadowType.IN)
+        self.list = Gtk.ListBox()
+        self.list.set_selection_mode(Gtk.SelectionMode.NONE)
+        empty = Gtk.Label(wrap=True, max_width_chars=50, justify=Gtk.Justification.CENTER)
+        empty.set_markup("No printers added yet.\n<small>Click <b>Add a Printer…</b> to find yours.</small>")
+        empty.set_margin_top(40)
+        empty.show()
+        self.list.set_placeholder(empty)
+        sw.add(self.list)
+        outer.pack_start(sw, True, True, 0)
+        self.note = Gtk.Label(xalign=0, wrap=True, max_width_chars=70)
+        outer.pack_start(self.note, False, False, 0)
+        help_ = Gtk.Label(xalign=0, wrap=True, max_width_chars=80)
+        help_.set_markup("<small><b>Not printing?</b> Check the printer is on, has paper and ink, and is on the same "
+                         "network. Print a test page from here: if that works, the problem is in the app you're "
+                         "printing from. Still stuck? See <a href=\"file:///usr/share/firox/help/index.html#printing\">"
+                         "Help: printing</a>.</small>")
+        help_.get_style_context().add_class("dim-label")
+        outer.pack_start(help_, False, False, 0)
+        if firox_a11y is not None:
+            firox_a11y.watch(self)
+        self.printers = {}
+        self.sig = None
+        self.show_all()
+        self.refresh()
+        GLib.timeout_add_seconds(3, lambda: self.refresh() or True)
+
+    # -- the list
+    def refresh(self):
+        printers, waiting = installed()
+        if printers is None:
+            if not self.list.get_children():
+                self.note.set_text("The printing service isn't answering. Restart the computer, and if that "
+                                   "doesn't help, see Help: printing.")
+            return
+        default = my_default()
+        sig = repr((sorted((n, a.get("printer-state"), a.get("printer-state-message"), a.get("printer-info"))
+                           for n, a in printers.items()), default, sorted(waiting.items())))
+        if sig == self.sig:
+            return
+        self.sig, self.printers = sig, printers
+        for r in self.list.get_children():
+            r.destroy()
+        for name in sorted(printers, key=lambda n: (n != default, n.lower())):
+            self.list.add(self.row(name, printers[name], name == default, waiting.get(name, 0)))
+        self.list.show_all()
+
+    def row(self, name, a, default, jobs):
+        row = Gtk.ListBoxRow()
+        box = Gtk.Box(spacing=12)
+        box.set_border_width(10)
+        uri = a.get("device-uri", "")
+        icon = "printer-network" if uri.startswith(("ipp", "dnssd", "http", "socket", "lpd")) else "printer"
+        box.pack_start(Gtk.Image.new_from_icon_name(icon, Gtk.IconSize.DIALOG), False, False, 0)
+        text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        title = Gtk.Label(xalign=0)
+        info = a.get("printer-info") or name
+        title.set_markup(f"<b>{GLib.markup_escape_text(info)}</b>" + ("  ✓ <small>Default</small>" if default else ""))
+        text.pack_start(title, False, False, 0)
+        state = STATES.get(a.get("printer-state"), "Unknown")
+        bits = [state]
+        msg = (a.get("printer-state-message") or "").strip()
+        if msg and msg.lower() not in (state.lower(), "ready to print."):
+            bits.append(msg)
+        if jobs:
+            bits.append(f"{jobs} document{'s' if jobs != 1 else ''} waiting")
+        if not a.get("printer-is-accepting-jobs", True):
+            bits.append("not accepting documents")
+        status = Gtk.Label(xalign=0, wrap=True, max_width_chars=50, label=" · ".join(bits))
+        status.get_style_context().add_class("dim-label")
+        text.pack_start(status, False, False, 0)
+        acts = Gtk.Box(spacing=6)
+        for label, cb, show in (("Print Test Page", self.test_page, True),
+                                ("Make Default", self.make_default, not default),
+                                ("See What's Printing", self.show_jobs, True),
+                                ("Remove", self.remove, True)):
+            if show:
+                b = Gtk.Button(label=label)
+                b.connect("clicked", lambda _b, cb=cb: cb(name, info))
+                acts.pack_start(b, False, False, 0)
+        text.pack_start(acts, False, False, 2)
+        box.pack_start(text, True, True, 0)
+        row.add(box)
+        row.get_accessible().set_name(f"{info}, {' , '.join(bits)}" + (", default printer" if default else ""))
+        return row
+
+    # -- actions
+    def admin(self, args, done_text):
+        self.note.set_text("Waiting for your password…")
+
+        def work():
+            p = run(["pkexec", ADMIN, *args], timeout=120)
+            if p.returncode == 0:
+                text = done_text
+            elif p.returncode in (126, 127):
+                text = "Nothing was changed (no password given)."
+            else:
+                text = (p.stderr or p.stdout).strip().splitlines()[-1:] or ["It didn't work."]
+                text = text[0]
+            GLib.idle_add(self.after_admin, text)
+        threading.Thread(target=work, daemon=True).start()
+
+    def after_admin(self, text):
+        self.note.set_text(text)
+        self.sig = None
+        self.refresh()
+        return False
+
+    def add_printer(self):
+        dlg = AddDialog(self, self.printers)
+        if dlg.run() == Gtk.ResponseType.OK and dlg.chosen:
+            d = dlg.chosen
+            name = queue_name(d["name"])
+            base, n = name, 2
+            while name in self.printers:
+                name, n = f"{base}_{n}", n + 1
+            self.note.set_text(f"Adding {d['name']}…")
+            self.admin(["add", name, d["uri"], d["name"]],
+                       f"Added {d['name']}. Click Print Test Page to check it works.")
+        dlg.destroy()
+
+    def remove(self, name, info):
+        dlg = Gtk.MessageDialog(transient_for=self, modal=True, message_type=Gtk.MessageType.QUESTION,
+                                buttons=Gtk.ButtonsType.NONE, text=f"Remove {info}?")
+        dlg.format_secondary_text("Documents waiting to print on it are cancelled. You can add it again later.")
+        dlg.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        dlg.add_button("Remove", Gtk.ResponseType.OK).get_style_context().add_class("destructive-action")
+        if dlg.run() == Gtk.ResponseType.OK:
+            self.admin(["remove", name], f"Removed {info}.")
+        dlg.destroy()
+
+    def make_default(self, name, info):
+        p = run(["lpoptions", "-d", name], timeout=15)
+        self.note.set_text(f"{info} is now your default printer." if p.returncode == 0 else
+                           f"Couldn't make it the default: {(p.stderr or '').strip()}")
+        self.sig = None
+        self.refresh()
+
+    def test_page(self, name, info):
+        p = run(["lp", "-d", name, "-t", "Test page", TESTPAGE], timeout=30)
+        self.note.set_text(f"A test page is on its way to {info}." if p.returncode == 0 else
+                           f"Couldn't send a test page: {(p.stderr or '').strip()}")
+        self.sig = None
+        self.refresh()
+
+    def show_jobs(self, name, info):
+        JobsDialog(self, name, info).run_and_close()
+
+
+class JobsDialog(Gtk.Dialog):
+    def __init__(self, parent, name, info):
+        super().__init__(title=f"Printing on {info}", transient_for=parent, modal=True)
+        self.name = name
+        self.add_button("Close", Gtk.ResponseType.CLOSE)
+        self.set_default_size(460, 300)
+        box = self.get_content_area()
+        box.set_border_width(12)
+        box.set_spacing(8)
+        self.store = Gtk.ListStore(int, str, str, str)
+        view = Gtk.TreeView(model=self.store)
+        for i, title in ((1, "Document"), (2, "Owner"), (3, "Status")):
+            view.append_column(Gtk.TreeViewColumn(title, Gtk.CellRendererText(), text=i))
+        self.view = view
+        sw = Gtk.ScrolledWindow()
+        sw.set_shadow_type(Gtk.ShadowType.IN)
+        sw.add(view)
+        box.pack_start(sw, True, True, 0)
+        row = Gtk.Box(spacing=8)
+        cancel = Gtk.Button(label="Cancel Document")
+        cancel.connect("clicked", lambda *_: self.cancel())
+        row.pack_start(cancel, False, False, 0)
+        self.note = Gtk.Label(xalign=0, wrap=True)
+        row.pack_start(self.note, True, True, 0)
+        box.pack_start(row, False, False, 0)
+        self.fill()
+        self.show_all()
+
+    def fill(self):
+        self.store.clear()
+        if cups is None:
+            return
+        try:
+            jobs = cups.Connection().getJobs(which_jobs="not-completed", requested_attributes=[
+                "job-name", "job-originating-user-name", "job-state", "job-printer-uri"])
+        except (cups.IPPError, RuntimeError):
+            return
+        names = {3: "Waiting", 4: "On hold", 5: "Printing", 6: "Stopped"}
+        for jid, j in sorted(jobs.items()):
+            if (j.get("job-printer-uri") or "").rsplit("/", 1)[-1] == self.name:
+                self.store.append([jid, j.get("job-name", ""), j.get("job-originating-user-name", ""),
+                                   names.get(j.get("job-state"), "")])
+        if not len(self.store):
+            self.note.set_text("Nothing is waiting to print.")
+
+    def cancel(self):
+        model, it = self.view.get_selection().get_selected()
+        if it is None:
+            self.note.set_text("Click a document first.")
+            return
+        p = run(["cancel", str(model[it][0])], timeout=15)
+        self.note.set_text("Cancelled." if p.returncode == 0 else
+                           "Only the person who printed it (or an administrator) can cancel it.")
+        self.fill()
+
+    def run_and_close(self):
+        self.run()
+        self.destroy()
+
+
+class App(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id="org.firox.Printers", flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE)
+        self.win = None
+
+    def do_command_line(self, cmdline):
+        args = cmdline.get_arguments()[1:]
+        if self.win is None:
+            self.win = Printers(self)
+        self.win.present()
+        if "--add" in args:
+            GLib.idle_add(lambda: self.win.add_printer() or False)
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(App().run(sys.argv))

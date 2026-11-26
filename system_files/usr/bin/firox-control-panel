@@ -72,7 +72,7 @@ APPLETS = [
       "ujust fix-realtek-audio; echo; read -r -p 'Press Enter to close' _"]),
     ("preferences-system-network", "Network Connections", "Wi-Fi, Ethernet and VPN", ["nm-connection-editor"]),
     ("bluetooth", "Bluetooth Devices", "Pair headphones, mice and phones", ["blueman-manager"]),
-    ("printer", "Printers and Faxes", "Add and manage printers", ["system-config-printer"]),
+    ("printer", "Printers and Faxes", "Add a printer, print a test page, scan a document", ["firox-printers"]),
     ("drive-harddisk", "Disk Management", "Drives, partitions and USB sticks", ["gnome-disks"]),
     ("bleachbit", "Disk Cleanup", "Free up space: caches, old logs, the Recycle Bin", ["firox-cleanmgr"]),
     ("gnome-device-manager", "Device Manager", "Devices, their drivers, and any without one", ["firox-devmgmt"]),

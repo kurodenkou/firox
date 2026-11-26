@@ -38,7 +38,7 @@ case "$verb" in
     task-manager) exec firox-taskmgr ;;
     startup)    exec firox-startup ;;
     help)       exec firefox "file:///usr/share/firox/help/index.html" ;;
-    printers)   exec system-config-printer ;;
+    printers)   exec firox-printers ;;
     software)
         if flatpak info io.github.kolunmi.Bazaar >/dev/null 2>&1; then
             exec flatpak run io.github.kolunmi.Bazaar
