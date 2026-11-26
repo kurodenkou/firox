@@ -1,0 +1,78 @@
+#!/usr/bin/python3
+"""
+firox-access: Ease of Access for Firox.
+
+    firox-access                      open Settings > Ease of Access
+    firox-access status               what's on
+    firox-access narrator [on|off|toggle]
+                                      the screen reader (Orca); Super+Ctrl+Enter
+    firox-access keyboard [show|hide|toggle]
+                                      the on-screen keyboard; Super+Ctrl+O
+    firox-access contrast [on|off|toggle]
+                                      high contrast apps; Left Alt+Left Shift+Print Screen
+    firox-access text FACTOR          text size, 1 to 2 (1.25 is 25% bigger)
+    firox-access cursor PIXELS        cursor size (24 is normal)
+    firox-access motion [on|off]      animations (off: reduce motion)
+    firox-access login                put everything back (run at login)
+
+The magnifier is part of the desktop itself: Super+Plus zooms in, Super+Minus
+zooms out, Super+Esc turns it off and on. Its shape and zoom are in Settings.
+"""
+
+import json
+import subprocess
+import sys
+
+sys.path.insert(0, "/usr/lib/firox/python")
+import firox_access as A  # noqa: E402
+
+
+def onoff(args, current):
+    word = args[0] if args else "toggle"
+    if word not in ("on", "off", "toggle"):
+        raise ValueError(word)
+    return (not current) if word == "toggle" else word == "on"
+
+
+def main(argv):
+    args = argv[1:]
+    cmd = args.pop(0) if args else ""
+    try:
+        if cmd == "":
+            subprocess.Popen(["firox-control-panel", "access"])
+        elif cmd == "status":
+            print(json.dumps(A.status(), indent=1))
+        elif cmd == "narrator":
+            on = onoff(args, A.running("orca"))
+            A.narrator_on() if on else A.narrator_off()
+            print(f"Narrator: {'on' if on else 'off'}")
+        elif cmd == "keyboard":
+            word = args[0] if args else "toggle"
+            if word not in ("show", "hide", "toggle"):
+                raise ValueError(word)
+            A.keyboard(word)
+        elif cmd == "contrast":
+            on = onoff(args, A.load()["CONTRAST"] == "1")
+            A.contrast(on)
+            print(f"High contrast: {'on' if on else 'off'}")
+        elif cmd == "text" and args:
+            A.text_size(args[0])
+        elif cmd == "cursor" and args:
+            A.cursor_size(int(args[0]))
+        elif cmd == "motion":
+            on = onoff(args, A.motion_on())
+            A.motion(on)
+            print(f"Animations: {'on' if on else 'off (reduced motion)'}")
+        elif cmd == "login":
+            A.login()
+        else:
+            print(__doc__.strip(), file=sys.stderr)
+            return 2
+    except ValueError as e:
+        print(f"firox-access: not understood: {e}", file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

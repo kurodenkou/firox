@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=On-Screen Keyboard
+Comment=Type with the mouse or a touch screen (Super+Ctrl+O)
+Exec=firox-osk --toggle
+Icon=input-keyboard
+Categories=Utility;Accessibility;
+Keywords=keyboard;osk;touch;type;accessibility;ease of access;
+StartupNotify=false

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Ease of Access
+Comment=Narrator, Magnifier, on-screen keyboard, high contrast and text size (Super+U)
+Exec=firox-control-panel access
+Icon=preferences-desktop-accessibility
+Categories=Settings;Accessibility;
+Keywords=accessibility;a11y;narrator;screen reader;orca;magnifier;zoom;contrast;text size;cursor;motion;
+StartupNotify=false

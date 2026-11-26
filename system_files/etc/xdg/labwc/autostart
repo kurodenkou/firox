@@ -96,6 +96,10 @@ firox-stream daemon >/dev/null 2>&1 &
 # Night Light, or the moon on the taskbar)
 firox-nightlight daemon >/dev/null 2>&1 &
 
+# Ease of Access as it was left: text size, contrast, motion, and Narrator
+# or the on-screen keyboard if they start at login (Settings > Ease of Access)
+firox-access login >/dev/null 2>&1 &
+
 # Desktop Gadgets (the Sidebar; off in Settings > Taskbar or `firox-gadgets off`)
 firox-gadgets start >/dev/null 2>&1 &
 

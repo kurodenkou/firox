@@ -86,6 +86,15 @@ def main():
     if icons in ("Papirus", "Papirus-Dark") and os.path.isdir("/usr/share/icons/Papirus-Dark"):
         icons = "Papirus-Dark" if dark else "Papirus"
     cfg = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    # High contrast (Settings > Ease of Access) wins over every look
+    try:
+        with open(os.path.join(cfg, "firox", "access.conf")) as fh:
+            contrast = any(line.strip() == "CONTRAST=1" for line in fh)
+    except OSError:
+        contrast = False
+    if contrast:
+        gtk_theme = "HighContrastInverse" if dark else "HighContrast"
+        icons = "Papirus-Dark" if dark else "Papirus"
 
     # GSettings: libadwaita, Firefox (via the settings portal), GTK3 on Wayland
     gsettings("color-scheme", "prefer-dark" if dark else "prefer-light")

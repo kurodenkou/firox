@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/x-firox-enrollment">
+    <comment>Firox enrollment file</comment>
+    <sub-class-of type="application/json"/>
+    <generic-icon name="network-workgroup"/>
+    <glob pattern="*.firoxenroll"/>
+  </mime-type>
+  <mime-type type="application/x-firox-policy">
+    <comment>Firox policy</comment>
+    <generic-icon name="text-x-generic"/>
+    <glob pattern="*.firoxpol"/>
+  </mime-type>
+</mime-info>

@@ -40,6 +40,7 @@ import threading
 import time
 
 sys.path.insert(0, "/usr/lib/firox/python")
+import firox_a11y  # noqa: E402
 import firox_rune_brain as B  # noqa: E402
 
 import gi  # noqa: E402
@@ -73,6 +74,8 @@ GADGETS_WIDTH = 194
 SIDEBAR_SHOWN = [False]
 FPS = 30                        # while he's busy, hovered or chatting
 IDLE_FPS = 15                   # the rest of the time (half the work)
+STILL_FPS = 2                   # Reduce motion (Settings > Ease of Access): he holds still
+STILL_T = 1.0                   # the moment of the scene he holds
 # The part of the wallpaper shown in the glade, in its pixels
 GLADE_CROP = (180, 40, 1230, 735)
 WIDTHS = {"small": 260, "medium": 340, "large": 440}
@@ -419,6 +422,7 @@ class RuneWindow(Gtk.Window):
         self.area.connect("button-release-event", self.on_click)
         self.area.set_tooltip_text("Rune: click to chat, right-click for settings")
         self.add(self.area)
+        firox_a11y.watch(self)
         self.scene = None
         self.t0 = time.monotonic()
         self.tick = None
@@ -447,6 +451,8 @@ class RuneWindow(Gtk.Window):
         self.area.queue_draw()
         chatting = self.app.chat is not None and self.app.chat.get_visible()
         want = FPS if (self.scene.mouse or self.scene.want_busy or self.scene.busy > 0.05 or chatting) else IDLE_FPS
+        if self.app.still():
+            want = STILL_FPS
         if want != self.fps:
             self.fps = want
             self.tick = GLib.timeout_add(1000 // want, self.on_tick)
@@ -462,7 +468,8 @@ class RuneWindow(Gtk.Window):
         try:
             if self.app.conf["glade"]:
                 draw_shadow(ctx, pad, pad, self.scene.w, self.scene.h)
-            self.scene.draw(ctx, time.monotonic() - self.t0, pad, pad)
+            # (Reduce motion: one still moment of the scene, no tilt)
+            self.scene.draw(ctx, STILL_T if self.app.still() else time.monotonic() - self.t0, pad, pad)
         except Exception:
             # (said once: a frame that can't be drawn mustn't stop the others)
             if not getattr(self, "draw_failed", False):
@@ -472,6 +479,8 @@ class RuneWindow(Gtk.Window):
         return True
 
     def on_motion(self, _w, ev):
+        if self.app.still():
+            return
         w, h = self.size()
         self.scene.mouse = (max(-1, min(1, ev.x / w * 2 - 1)), max(-1, min(1, ev.y / h * 2 - 1)))
 
@@ -702,6 +711,7 @@ class ChatWindow(Gtk.Window):
                     "I'll keep you company anyway.")
         self.stack.add_named(no, "policy")
 
+        firox_a11y.watch(self)
         bubble.show_all()
         self.refresh()
 
@@ -1137,6 +1147,7 @@ class SettingsWindow(Gtk.Window):
         bottom.pack_end(close, False, False, 0)
         box.pack_start(bottom, False, False, 6)
         self.update_service()
+        firox_a11y.watch(self)
         self.show_all()
 
     def update_service(self):
@@ -1284,6 +1295,10 @@ class RuneApp(Gtk.Application):
         if firox_monitors is not None:
             self.main_mon = Gio.File.new_for_path(firox_monitors.CONF).monitor_file(Gio.FileMonitorFlags.NONE, None)
             self.main_mon.connect("changed", lambda *_: self.schedule_place())
+
+    def still(self):
+        """Reduce motion is on (org.gnome.desktop.interface enable-animations)."""
+        return self.iface is not None and not self.iface.get_boolean("enable-animations")
 
     def follow_app_style(self):
         st = Gtk.Settings.get_default()

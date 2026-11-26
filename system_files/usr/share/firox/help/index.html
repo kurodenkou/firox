@@ -136,7 +136,14 @@
 
 <h2 id="sound">No sound?</h2>
 <p>Click the speaker in the notification area for a volume slider, <b>Mute</b>, and a list of speakers and headphones to play through. Then check <b>Settings &rarr; Sounds and Audio Devices</b>: make sure the right output is selected and nothing is muted.</p>
-<p>Some PCs with <b>Realtek</b> onboard audio stay silent or crackle on Linux. <b>Settings &rarr; Sound Troubleshooter</b> runs <a href="https://github.com/hello2himel/linux-audio-fix">linux-audio-fix</a>, which detects your chip, shows what it will change and asks before doing anything. It turns off Auto-Mute, sends the chip's startup commands, and sets them to be re-applied at every boot. It saves a backup first.</p>
+<p>Still nothing, crackling, or sound that cuts out? Open <b>Settings &rarr; Sound Troubleshooter</b>. It shows what sound hardware you have and what looks wrong (muted, playing to a monitor, no outputs at all), lets you pick the output and play a test sound, and offers the fixes that fit, in order:</p>
+<ul>
+  <li><b>Everyone:</b> <b>Reset the sound settings</b> forgets the chosen outputs, profiles and volumes and restarts the sound service (a backup is kept).</li>
+  <li><b>Realtek HD-Audio</b> (most desktops and older laptops): <b>Run the Realtek Fix</b> runs <a href="https://github.com/hello2himel/linux-audio-fix">linux-audio-fix</a>, which detects your chip, shows what it will change and asks first. It turns off Auto-Mute, sends the chip's startup commands and re-applies them at every start, with a backup.</li>
+  <li><b>USB audio on the motherboard</b> (Realtek ALC4080 and similar on newer MSI, ASUS, Gigabyte and ASRock boards): <b>Use Plain Profiles</b> swaps the device's own profile, which splits the jacks and can send sound to the wrong one, for the usual Analog Stereo and Surround. <b>Keep It Powered</b> stops USB power saving from cutting the start of sounds off or silencing it.</li>
+  <li><b>Intel laptops with SOF firmware:</b> it shows when the firmware couldn't start, explains laptops whose speakers sit behind a separate amplifier (Cirrus CS35L41, TI TAS2781), and as a last resort switches to the older Intel HD-Audio driver after a restart. Built-in digital microphones stop working with that driver.</li>
+</ul>
+<p>Every fix has an <b>Undo</b>. If nothing helps, <b>Copy Report</b> and paste it when you ask for help. In a terminal: <code>firox-sound --report</code>, and for the Realtek fix:</p>
 <table>
   <tr><td><code>ujust fix-realtek-audio</code></td><td>Guided fix</td></tr>
   <tr><td><code>ujust fix-realtek-audio --dry-run</code></td><td>Preview only, changes nothing</td></tr>
@@ -144,7 +151,6 @@
   <tr><td><code>ujust fix-realtek-audio --restore</code></td><td>Put the saved mixer settings back</td></tr>
   <tr><td><code>ujust fix-realtek-audio --uninstall</code></td><td>Stop re-applying the fix at boot</td></tr>
 </table>
-<p>It only applies to Realtek HD-Audio chips. USB audio (such as ALC4080 on some motherboards) and newer Intel laptops that use SOF firmware need different fixes; the tool tells you if that's your case.</p>
 
 <h2 id="software">Installing software</h2>
 <p>Firox Linux is an <em>image-based</em> system: the OS itself is read-only and updates as one piece. Install apps as web apps, Android apps or <b>Flatpaks</b> (<b>Start &rarr; Bazaar</b>). For command-line tools, use a <code>toolbox</code> or <code>distrobox</code> container.</p>
@@ -208,9 +214,9 @@ Settings a policy sets are greyed out in Settings (Power Options, Screen Saver, 
 <ol>
   <li><b>Create Admin Key&hellip;</b> once. It signs your policies, and your computers trust only it, so keep a backup of <code>~/.local/share/firox/policy-admin</code> somewhere safe.</li>
   <li>Choose settings, then <b>Save and Sign&hellip;</b>. Put the file where your computers can fetch it: a web server (<code>https://&hellip;</code>), a git repository (<code>git+https://host/repo.git#policy.firoxpol</code>) or a shared folder.</li>
-  <li><b>Enrollment File&hellip;</b> makes a file with that address and your key. On each computer, run <code>sudo firox-policy enroll FILE</code> once.</li>
+  <li><b>Enrollment File&hellip;</b> makes a file with that address and your key. On each computer, double-click the file (or open Settings → <b>Access Work or School</b>), check the details and click <b>Join</b>; it asks for that computer's administrator password. (In a terminal: <code>sudo firox-policy enroll FILE</code>.)</li>
 </ol>
-<p>Enrolled computers check for a new policy when they start and every 30 minutes (<code>sudo firox-policy update</code> checks now; <code>firox-policy status</code> shows what's in force). They apply only policies signed with your key, and never one older than the last, so nobody can slip them a fake or an old policy. <b>Encrypt the policy</b> also hides its contents from anyone but your computers; the enrollment file then holds the key to read it, so keep it to yourself. <code>sudo firox-policy unenroll</code> stops following policies: the settings stay as they were, but people can change them again.</p>
+<p>Enrolled computers check for a new policy when they start and every 30 minutes (<code>sudo firox-policy update</code> checks now; <code>firox-policy status</code> shows what's in force). They apply only policies signed with your key, and never one older than the last, so nobody can slip them a fake or an old policy. <b>Encrypt the policy</b> also hides its contents from anyone but your computers; the enrollment file then holds the key to read it, so keep it to yourself. <b>Access Work or School</b> on each computer shows who manages it and what, checks for a new policy now, and <b>Leave Organization&hellip;</b> stops following policies (<code>sudo firox-policy unenroll</code>): the settings stay as they were, but people can change them again.</p>
 
 <h2 id="restore">Going back after an update (System Restore)</h2>
 <p>Each update installs a complete new version of Firox Linux and keeps the one you used before. If something stopped working after an update, open <b>Settings &rarr; System Restore</b>, pick <b>Previous version</b> and click <b>Restore this version</b>; it starts the next time you restart (<b>Undo</b> changes your mind). Your files, settings and apps aren't touched.</p>
@@ -261,6 +267,28 @@ Settings a policy sets are greyed out in Settings (Power Options, Screen Saver, 
 <p>Press <kbd>Super</kbd>+<kbd>Enter</kbd> for the Command Prompt (Firox Terminal). <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>T</kbd> opens another tab in the same folder, <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>W</kbd> closes one, and <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>F</kbd> finds text. To connect to another computer with SSH, click the server button at the top right and choose <b>Connect to a Server</b>: tick <b>Save this connection</b> to find it in that list next time. Your password is typed in the tab when the server asks for it; it isn't saved. When a connection drops, click <b>Reconnect</b>.</p>
 <p>Type <code>fastfetch</code> (or <code>neofetch</code>) to see a summary of your computer next to the Firox logo.</p>
 
+<h2 id="printing">Printing and scanning</h2>
+<p><b>Printers on your network</b> usually show up in the Print window by themselves: just print. To keep one, make it your default or check it works, open Start → <b>Printers and Faxes</b> (also in Settings).</p>
+<ul>
+  <li><b>Adding a printer:</b> click <b>Add a Printer…</b>. Firox looks for printers on your network and plugged in by USB; pick yours, click <b>Add Printer</b> and type your password. Then click <b>Print Test Page</b>. The first printer you add becomes the default.</li>
+  <li><b>Not in the list?</b> Make sure it's switched on and on the same network (Wi-Fi printers sometimes need setting up on their own screen first), then click <b>Look Again</b>. Or type its address (on the printer's screen or network settings page, such as 192.168.1.50).</li>
+  <li><b>Older printers</b> (most from before 2013) need a driver: click <b>Advanced…</b> and then <b>Add</b>. Drivers for HP, Brother, Epson, Canon and many more are already installed. For HP printers you can also type <code>hp-setup</code> in the Command Prompt.</li>
+  <li><b>Something stuck?</b> Click <b>See What's Printing</b> to see and cancel documents. If a test page prints but an app's document doesn't, the problem is in that app.</li>
+  <li><b>Scanning:</b> click <b>Scan a Document…</b> (Document Scanner). Scanners on your network and most USB scanners are found by themselves.</li>
+</ul>
+<p>At work or school, printers may also be added for you by a <a href="#policy">policy</a>.</p>
+
+<h2 id="access">Ease of Access</h2>
+<p>Open Settings → <b>Ease of Access</b> (or press <kbd>Super</kbd>+<kbd>U</kbd>) to make the computer easier to see, hear and use. Every change there takes effect straight away.</p>
+<ul>
+  <li><b>Narrator</b> reads the screen aloud: <kbd>Super</kbd>+<kbd>Ctrl</kbd>+<kbd>Enter</kbd> turns it on or off, and you can have it start when you log in. It's Orca, which reads Firox's own programs, Firefox and most other apps; <kbd>Insert</kbd>+<kbd>H</kbd> gives its help.</li>
+  <li><b>Magnifier:</b> <kbd>Super</kbd>+<kbd>Plus</kbd> zooms in, <kbd>Super</kbd>+<kbd>Minus</kbd> zooms out and <kbd>Super</kbd>+<kbd>Esc</kbd> turns it off (or back on). It can magnify the whole screen or a lens around the pointer.</li>
+  <li><b>On-screen keyboard:</b> <kbd>Super</kbd>+<kbd>Ctrl</kbd>+<kbd>O</kbd>, or Start → On-Screen Keyboard. Type with the mouse or a touch screen. Shift, Ctrl, Alt and the Windows key apply to the next key you press (click Shift twice to keep it on).</li>
+  <li><b>High contrast</b> for apps: <kbd>Left Alt</kbd>+<kbd>Left Shift</kbd>+<kbd>Print Screen</kbd>.</li>
+  <li><b>Text size</b> and <b>pointer size</b>, up to twice as big.</li>
+  <li><b>Reduce motion</b> turns off animations; Rune holds still in his glade.</li>
+</ul>
+
 <h2 id="keys">Keyboard shortcuts</h2>
 <table>
   <tr><td><kbd>Super</kbd></td><td>Start menu</td></tr>
@@ -276,6 +304,11 @@ Settings a policy sets are greyed out in Settings (Power Options, Screen Saver, 
   <tr><td><kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Del</kbd></td><td>Task Manager</td></tr>
   <tr><td><kbd>Super</kbd>+<kbd>Shift</kbd>+<kbd>S</kbd></td><td>Snipping Tool: select part of the screen</td></tr>
   <tr><td><kbd>Print Screen</kbd></td><td>Screenshot to Pictures (<kbd>Shift</kbd> to select an area)</td></tr>
+  <tr><td><kbd>Super</kbd>+<kbd>U</kbd></td><td>Ease of Access</td></tr>
+  <tr><td><kbd>Super</kbd>+<kbd>Ctrl</kbd>+<kbd>Enter</kbd></td><td>Narrator on or off</td></tr>
+  <tr><td><kbd>Super</kbd>+<kbd>Plus</kbd>/<kbd>Minus</kbd></td><td>Magnifier: zoom in / out (<kbd>Super</kbd>+<kbd>Esc</kbd>: off)</td></tr>
+  <tr><td><kbd>Super</kbd>+<kbd>Ctrl</kbd>+<kbd>O</kbd></td><td>On-screen keyboard</td></tr>
+  <tr><td><kbd>Left Alt</kbd>+<kbd>Left Shift</kbd>+<kbd>Print Screen</kbd></td><td>High contrast on or off</td></tr>
 </table>
 
 <h2 id="display">Screen resolution and monitors</h2>

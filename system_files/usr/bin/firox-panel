@@ -45,6 +45,7 @@ import sys
 import time
 
 sys.path.insert(0, "/usr/lib/firox/python")
+import firox_a11y  # noqa: E402
 
 CANT_RUN = 3
 
@@ -1159,6 +1160,8 @@ class Indicator:
             btn.firox_image.set_pixel_size(16)
         btn.firox_image.set_visible(bool(self.icon))
         btn.set_tooltip_text(self.tip or None)
+        # (for screen readers: the tooltip, or at least what this is)
+        btn.get_accessible().set_name((self.tip or "").split("\n")[0] or READABLE.get(self.name, self.name))
         ctx = btn.get_style_context()
         for cls in getattr(btn, "firox_classes", set()) - self.classes:
             ctx.remove_class(cls)
@@ -1181,6 +1184,12 @@ class Indicator:
 
     def on_scroll(self, _event):
         pass
+
+
+READABLE = {"idle_inhibitor": "Keep the screen on", "pulseaudio": "Volume", "battery": "Battery",
+            "network": "Network", "bluetooth": "Bluetooth", "custom-updates": "Updates",
+            "security": "Security Center", "nightlight": "Night Light", "custom-notifications": "Notifications",
+            "clock": "Clock"}
 
 
 class Awake(Indicator):
@@ -1789,6 +1798,7 @@ class Bar(Gtk.Window):
         for ind in indicators:
             tray_row.pack_start(ind.make(), False, False, 0)
         row.pack_end(area, False, False, 0)
+        firox_a11y.watch(self)          # (names for screen readers on the icon-only buttons)
         self.show_all()
         for ind in indicators:
             ind.set()

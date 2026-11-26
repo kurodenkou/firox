@@ -1,0 +1,400 @@
+#!/usr/bin/python3
+"""
+firox-sound: the Sound Troubleshooter (Settings > Sound Troubleshooter).
+
+    firox-sound            find out what's wrong and offer the fixes that fit
+    firox-sound --report   print a report to paste when asking for help
+
+It looks at the sound hardware (see firox_sound) and offers, in order:
+  - for everyone: choose the output and play a test sound, unmute, and reset
+    the sound settings (WirePlumber's saved state)
+  - Realtek HD-Audio: the guided chip fix (ujust fix-realtek-audio)
+  - USB audio on the motherboard (ALC4080 and similar): plain profiles
+    instead of the device's UCM profile (a WirePlumber rule, yours alone),
+    and keeping it powered so USB power saving can't make it drop out
+  - Intel laptops with SOF: what the kernel said, a note about separate
+    speaker amplifiers, and as a last resort the older HD-Audio driver
+Fixes that need root (USB power, the driver) go through pkexec and
+/usr/libexec/firox/sound-admin. Every fix can be undone here.
+"""
+
+import os
+import shutil
+import subprocess
+import sys
+import threading
+import time
+
+sys.path.insert(0, "/usr/lib/firox/python")
+import firox_sound as S  # noqa: E402
+
+if __name__ == "__main__" and "--report" in sys.argv:
+    sys.stdout.write(S.report())
+    sys.exit(0)
+
+import gi  # noqa: E402
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+from gi.repository import Gdk, Gio, GLib, Gtk  # noqa: E402
+
+ADMIN = "/usr/libexec/firox/sound-admin"
+TEST_SOUNDS = ["/usr/share/sounds/freedesktop/stereo/audio-channel-front-left.oga",
+               "/usr/share/sounds/freedesktop/stereo/bell.oga"]
+
+
+def run(argv, timeout=60):
+    return S.run(argv, timeout)
+
+
+def spawn(argv):
+    try:
+        subprocess.Popen(argv, start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError as e:
+        print(f"firox-sound: couldn't run {argv[0]}: {e}", file=sys.stderr)
+
+
+def reset_settings():
+    """Forget WirePlumber's saved choices (a backup is kept) and restart the sound services."""
+    state = os.path.expanduser("~/.local/state/wireplumber")
+    run(["systemctl", "--user", "stop", "wireplumber"])
+    if os.path.isdir(state):
+        os.replace(state, f"{state}.bak-{time.strftime('%Y%m%d-%H%M%S')}")
+    rc, _o, err = run(["systemctl", "--user", "restart", "pipewire", "pipewire-pulse", "wireplumber"])
+    time.sleep(2)
+    return rc == 0, err.strip()
+
+
+def plain_profiles(cards, on):
+    """A WirePlumber rule: these USB cards get plain ALSA profiles instead of UCM."""
+    if on:
+        names = S.pulse_cards()
+        matches = []
+        for c in cards:
+            v, _, p = c["usbid"].partition(":")
+            if v and p:
+                matches.append(f'{{ device.vendor.id = "0x{v}", device.product.id = "0x{p}" }}')
+            if names.get(str(c["index"])):
+                matches.append(f'{{ device.name = "{names[str(c["index"])]}" }}')
+        os.makedirs(os.path.dirname(S.WP_CONF), exist_ok=True)
+        with open(S.WP_CONF, "w") as fh:
+            fh.write("# Sound Troubleshooter (firox-sound): plain profiles for these USB sound devices,\n"
+                     "# instead of their UCM profile. Delete this file (or click Undo) to go back.\n"
+                     "monitor.alsa.rules = [\n  {\n    matches = [\n      "
+                     + ",\n      ".join(matches) + "\n    ]\n"
+                     "    actions = { update-props = { api.alsa.use-ucm = false } }\n  }\n]\n")
+    else:
+        try:
+            os.unlink(S.WP_CONF)
+        except FileNotFoundError:
+            pass
+    rc, _o, err = run(["systemctl", "--user", "restart", "wireplumber"])
+    time.sleep(2)
+    return rc == 0, err.strip()
+
+
+class Troubleshooter(Gtk.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="Sound Troubleshooter")
+        self.set_default_size(640, 680)
+        self.set_icon_name("audio-card")
+        sw = Gtk.ScrolledWindow()
+        sw.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self.add(sw)
+        self.box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        self.box.set_border_width(18)
+        sw.add(self.box)
+        self.status = ""
+        self.refresh()
+        self.show_all()
+
+    # -- building the page
+    def clear(self):
+        for c in self.box.get_children():
+            c.destroy()
+
+    def label(self, markup, dim=False, top=0):
+        lab = Gtk.Label(xalign=0, wrap=True, max_width_chars=70)
+        lab.set_markup(markup)
+        if dim:
+            lab.get_style_context().add_class("dim-label")
+        self.box.pack_start(lab, False, False, top)
+        return lab
+
+    def section(self, title):
+        self.label(f"<b>{GLib.markup_escape_text(title)}</b>", top=8)
+
+    def fix(self, title, text, buttons):
+        """A fix: what it is, why, and its buttons [(label, callback, style)]."""
+        frame = Gtk.Frame()
+        inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        inner.set_border_width(10)
+        t = Gtk.Label(xalign=0, wrap=True, max_width_chars=66)
+        t.set_markup(f"<b>{GLib.markup_escape_text(title)}</b>")
+        inner.pack_start(t, False, False, 0)
+        d = Gtk.Label(xalign=0, wrap=True, max_width_chars=66)
+        d.set_markup(text)
+        inner.pack_start(d, False, False, 0)
+        row = Gtk.Box(spacing=8)
+        for label, cb, style in buttons:
+            b = Gtk.Button(label=label)
+            if style:
+                b.get_style_context().add_class(style)
+            b.connect("clicked", lambda _b, cb=cb: cb())
+            row.pack_start(b, False, False, 0)
+        inner.pack_start(row, False, False, 2)
+        frame.add(inner)
+        self.box.pack_start(frame, False, False, 0)
+
+    def refresh(self):
+        self.clear()
+        f = self.f = S.findings()
+        head = Gtk.Box(spacing=14)
+        head.pack_start(Gtk.Image.new_from_icon_name("audio-card", Gtk.IconSize.DIALOG), False, False, 0)
+        intro = Gtk.Label(xalign=0, wrap=True, max_width_chars=60)
+        intro.set_markup("<big><b>Let's get your sound working</b></big>\nHere's what I found. Try the steps "
+                         "below in order, and play the test sound after each one.")
+        head.pack_start(intro, True, True, 0)
+        self.box.pack_start(head, False, False, 0)
+
+        self.section("Your sound hardware")
+        real = [c for c in f["cards"] if c["kind"] != "hdmi"]
+        for c in f["cards"]:
+            self.label("• " + GLib.markup_escape_text(c["label"]))
+        if not f["cards"]:
+            self.label("• None found")
+        if f["amps"]:
+            self.label("• Speaker amplifier: " + GLib.markup_escape_text(", ".join(f["amps"])))
+        for p in f["problems"]:
+            self.label("⚠ " + GLib.markup_escape_text(p))
+        if self.status:
+            self.label(f"<i>{GLib.markup_escape_text(self.status)}</i>")
+
+        # 1. output, test, unmute
+        self.section("1. Check what's playing, and where")
+        sinks = [s for s in f["outputs"] if s["name"] != "auto_null"]
+        if sinks:
+            row = Gtk.Box(spacing=8)
+            row.pack_start(Gtk.Label(label="Play through:"), False, False, 0)
+            combo = Gtk.ComboBoxText()
+            for s in sinks:
+                combo.append(s["name"], s["description"] + (" (muted)" if s["muted"] else ""))
+            combo.set_active_id(f["default"]) or combo.set_active(0)
+            combo.connect("changed", lambda c: self.set_output(c.get_active_id()))
+            combo.get_accessible().set_name("Play through")
+            row.pack_start(combo, True, True, 0)
+            test = Gtk.Button(label="Play Test Sound")
+            test.get_style_context().add_class("suggested-action")
+            test.connect("clicked", lambda *_: self.test_sound())
+            row.pack_start(test, False, False, 0)
+            self.box.pack_start(row, False, False, 0)
+            row2 = Gtk.Box(spacing=8)
+            unmute = Gtk.Button(label="Unmute and Turn Up")
+            unmute.connect("clicked", lambda *_: self.unmute())
+            row2.pack_start(unmute, False, False, 0)
+            mixer = Gtk.Button(label="Sounds and Audio Devices…")
+            mixer.set_tooltip_text("Every output and input, their volume, and each device's profile (pavucontrol)")
+            mixer.connect("clicked", lambda *_: spawn(["pavucontrol"]))
+            row2.pack_start(mixer, False, False, 0)
+            self.box.pack_start(row2, False, False, 0)
+            self.label("<small>Headphones or speakers plugged into the right jack? On desktops, the green one at "
+                       "the back, or the front panel's.</small>", dim=True)
+        else:
+            self.label("There's nothing to play through yet: try the fixes below.")
+
+        # 2. for everyone: reset
+        self.section("2. Fixes to try")
+        self.fix("Reset the sound settings",
+                 "Forgets which outputs, profiles and volumes were chosen, and restarts the sound service. "
+                 "Fixes a lot of \"it worked yesterday\". Your old settings are kept as a backup.",
+                 [("Reset", self.reset, None)])
+
+        kinds = {c["kind"] for c in real}
+        if "hda-realtek" in kinds:
+            self.fix("Realtek HD-Audio: wake up the chip",
+                     "Some Realtek chips stay silent or crackle until they're sent their startup commands. This "
+                     "guided fix (linux-audio-fix) finds your chip, shows what it will change and asks before "
+                     "doing anything; it keeps a backup and re-applies itself at every start.",
+                     [("Run the Realtek Fix…", self.realtek, None)])
+        usb = [c for c in real if c["kind"] in ("usb-board", "usb")]
+        if usb:
+            names = ", ".join(c["label"] for c in usb)
+            on = S.plain_profiles_on()
+            self.fix("USB audio: use plain profiles" + (" (on)" if on else ""),
+                     f"For {GLib.markup_escape_text(names)}. Its built-in profile (UCM) splits the jacks into "
+                     "separate outputs and can send sound to the wrong one. Plain profiles give the usual "
+                     "<i>Analog Stereo</i> and <i>Surround</i> choices instead. Only affects you.",
+                     [("Undo", lambda: self.profiles(usb, False), None)] if on else
+                     [("Use Plain Profiles", lambda: self.profiles(usb, True), None)])
+            on = S.usb_power_rule()
+            board = [c for c in usb if c["usbid"]]
+            if board:
+                self.fix("USB audio: stop it dropping out" + (" (on)" if on else ""),
+                         "USB power saving can switch the sound device off between sounds, so the start of "
+                         "sounds is cut off, it crackles, or it goes silent until you restart. This keeps it "
+                         "powered. Asks for an administrator's password.",
+                         [("Undo", self.usb_power_off, None)] if on else
+                         [("Keep It Powered", lambda: self.usb_power_on(board), None)])
+            self.label("<small>Front and back jacks still mixed up? In <b>Sounds and Audio Devices… → "
+                       "Configuration</b>, try the device's other profiles.</small>", dim=True)
+        if "sof" in kinds:
+            trouble = S.sof_trouble(f["kernel"])
+            if f["amps"]:
+                self.fix("Laptop speakers behind an amplifier",
+                         f"This laptop's speakers go through a separate amplifier "
+                         f"({GLib.markup_escape_text(', '.join(f['amps']))}). If headphones work but the speakers "
+                         "don't, the amplifier needs support for this exact model in the kernel and its firmware. "
+                         "Updates often bring it: check for updates, and copy the report below to ask for help "
+                         "with your laptop's model.",
+                         [("Check for Updates", lambda: spawn(["firox-updates"]), None)])
+            legacy = S.legacy_driver_on()
+            text = ("Intel laptops play sound through SOF firmware. When it can't start (the report shows "
+                    "errors like <i>failed to load topology</i>), the older HD-Audio driver often works instead. "
+                    "<b>Try this last</b>: on laptops with built-in digital microphones, the microphone stops "
+                    "working with it. It takes effect after a restart, and asks for an administrator's password.")
+            if trouble:
+                text = "<b>The kernel says SOF couldn't start here.</b> " + text
+            self.fix("Intel laptop: use the older sound driver" + (" (on, from the next restart)" if legacy else ""),
+                     text, [("Go Back to SOF", lambda: self.legacy(False), None)] if legacy else
+                     [("Use the Older Driver…", lambda: self.legacy(True), None)])
+        if not real:
+            self.label("No fixes for this hardware: check the computer's BIOS/UEFI settings that onboard audio is "
+                       "on, then copy the report below to ask for help.", dim=True)
+
+        # 3. ask for help
+        self.section("3. Still nothing?")
+        self.label("Copy a report (your sound hardware, what's selected and what the kernel said, nothing personal) "
+                   "and paste it when you ask for help, for example on the Firox issue tracker.", dim=True)
+        row = Gtk.Box(spacing=8)
+        copy = Gtk.Button(label="Copy Report")
+        copy.connect("clicked", lambda *_: self.copy_report())
+        row.pack_start(copy, False, False, 0)
+        save = Gtk.Button(label="Save Report…")
+        save.connect("clicked", lambda *_: self.save_report())
+        row.pack_start(save, False, False, 0)
+        self.box.pack_start(row, False, False, 0)
+        self.box.show_all()
+
+    # -- doing things
+    def busy(self, text, work):
+        """Run work() off the main thread; show its (ok, message) and look again."""
+        self.status = text
+        for c in self.box.get_children():
+            c.set_sensitive(False)
+
+        def go():
+            try:
+                ok, msg = work()
+            except OSError as e:
+                ok, msg = False, str(e)
+            GLib.idle_add(self.done, ok, msg)
+        threading.Thread(target=go, daemon=True).start()
+
+    def done(self, ok, msg):
+        self.status = msg
+        self.refresh()
+        return False
+
+    def set_output(self, name):
+        if name:
+            run(["pactl", "set-default-sink", name])
+
+    def test_sound(self):
+        sound = next((p for p in TEST_SOUNDS if os.path.exists(p)), None)
+        if sound and shutil.which("pw-play"):
+            spawn(["pw-play", sound])
+        else:
+            spawn(["speaker-test", "-t", "sine", "-f", "440", "-l", "1", "-c", "2"])
+
+    def unmute(self):
+        run(["pactl", "set-sink-mute", "@DEFAULT_SINK@", "0"])
+        d = next((s for s in self.f["outputs"] if s["name"] == self.f["default"]), None)
+        if d is None or d["volume"] < 40:
+            run(["pactl", "set-sink-volume", "@DEFAULT_SINK@", "60%"])
+        self.done(True, "Unmuted. Play the test sound.")
+
+    def reset(self):
+        self.busy("Resetting the sound settings…",
+                  lambda: (lambda r: (r[0], "Sound settings reset. Play the test sound." if r[0] else
+                                      f"Couldn't restart the sound service: {r[1]}"))(reset_settings()))
+
+    def realtek(self):
+        spawn(["firox-terminal", "-T", "Realtek HD-Audio fix", "-x", "sh", "-c",
+               "ujust fix-realtek-audio; echo; read -r -p 'Press Enter to close' _"])
+
+    def profiles(self, cards, on):
+        self.busy("Changing the profiles…",
+                  lambda: (lambda r: (r[0], ("Plain profiles are on. Pick the output above and play the test sound."
+                                             if on else "Back to the device's own profile.") if r[0] else
+                                      f"Couldn't restart the sound service: {r[1]}"))(plain_profiles(cards, on)))
+
+    def admin(self, args, text):
+        def work():
+            rc, out, err = run(["pkexec", ADMIN, *args], timeout=300)
+            if rc in (126, 127):
+                return False, "Nothing was changed (no administrator's password given)."
+            lines = [ln for ln in (out + "\n" + err).splitlines() if ln.strip()]
+            return rc == 0, (lines[-1] if lines else ("Done." if rc == 0 else "It didn't work."))
+        self.busy(text, work)
+
+    def usb_power_on(self, cards):
+        ids = sorted({c["usbid"] for c in cards})
+
+        def work():
+            msg = ""
+            for usbid in ids:
+                rc, out, err = run(["pkexec", ADMIN, "usb-power-on", usbid], timeout=120)
+                if rc in (126, 127):
+                    return False, "Nothing was changed (no administrator's password given)."
+                if rc != 0:
+                    lines = (err or out).strip().splitlines()
+                    return False, lines[-1] if lines else "It didn't work."
+                msg = out.strip()
+            return True, msg
+        self.busy("Waiting for an administrator's password…", work)
+
+    def usb_power_off(self):
+        self.admin(["usb-power-auto"], "Waiting for an administrator's password…")
+
+    def legacy(self, on):
+        if on:
+            dlg = Gtk.MessageDialog(transient_for=self, modal=True, message_type=Gtk.MessageType.WARNING,
+                                    buttons=Gtk.ButtonsType.NONE, text="Use the older Intel sound driver?")
+            dlg.format_secondary_text("On laptops with built-in digital microphones, the microphone stops working. "
+                                      "You can go back here at any time. It takes effect after a restart.")
+            dlg.add_button("Cancel", Gtk.ResponseType.CANCEL)
+            dlg.add_button("Use the Older Driver", Gtk.ResponseType.OK)
+            ok = dlg.run() == Gtk.ResponseType.OK
+            dlg.destroy()
+            if not ok:
+                return
+        self.admin(["legacy-driver", "on" if on else "off"], "Waiting for an administrator's password…")
+
+    def copy_report(self):
+        Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).set_text(S.report(self.f), -1)
+        self.done(True, "Report copied. Paste it (Ctrl+V) where you ask for help.")
+
+    def save_report(self):
+        dlg = Gtk.FileChooserNative.new("Save the Sound Report", self, Gtk.FileChooserAction.SAVE, "_Save", "_Cancel")
+        dlg.set_current_name("sound-report.txt")
+        dlg.set_do_overwrite_confirmation(True)
+        if dlg.run() == Gtk.ResponseType.ACCEPT:
+            with open(dlg.get_filename(), "w") as fh:
+                fh.write(S.report(self.f))
+            self.done(True, f"Saved {os.path.basename(dlg.get_filename())}.")
+        dlg.destroy()
+
+
+class App(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id="org.firox.SoundTroubleshooter", flags=Gio.ApplicationFlags.FLAGS_NONE)
+        self.win = None
+
+    def do_activate(self):
+        if self.win is None:
+            self.win = Troubleshooter(self)
+        self.win.present()
+
+
+if __name__ == "__main__":
+    sys.exit(App().run([sys.argv[0]]))

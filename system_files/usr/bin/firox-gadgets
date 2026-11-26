@@ -44,6 +44,7 @@ except (ValueError, ImportError):
     GtkLayerShell = None
 
 sys.path.insert(0, "/usr/lib/firox/python")
+import firox_a11y  # noqa: E402
 import firox_monitors  # noqa: E402
 
 try:
@@ -1871,6 +1872,7 @@ class Sidebar(Gtk.Window):
         scroll.add(self.column)
         col.pack_start(scroll, True, True, 0)
         self.fill()
+        firox_a11y.watch(self)
         self.show_all()
 
     def place(self):

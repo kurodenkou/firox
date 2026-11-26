@@ -148,7 +148,9 @@ PACKAGES=(
     network-manager-applet       # tray icon
     nm-connection-editor         # Network Connections
     blueman                      # Bluetooth
-    system-config-printer        # Printers and Faxes
+    system-config-printer        # Printers and Faxes: Advanced… (printers that need a driver)
+    cups-pk-helper               # ...which then asks for your password, not root's
+    simple-scan                  # Document Scanner (Printers and Faxes: Scan a Document)
     gnome-disk-utility           # Disk Management
     mate-polkit                  # polkit auth agent
     gnome-keyring
@@ -200,7 +202,8 @@ cp -avf /ctx/system_files/. /
 
 chmod 0755 /usr/bin/firox-* /usr/bin/umu-run
 # System Preparation, Powerwash and first-time setup (root helpers, polkit rule)
-chmod 0755 /usr/libexec/firox/reset /usr/libexec/firox/oobe-apply /usr/libexec/firox/firox-oobe
+chmod 0755 /usr/libexec/firox/reset /usr/libexec/firox/oobe-apply /usr/libexec/firox/firox-oobe \
+    /usr/libexec/firox/printer-admin /usr/libexec/firox/sound-admin
 chmod 0644 /usr/share/polkit-1/rules.d/50-firox-oobe.rules
 # SELinux: setup's helper runs from the login screen (xdm_t) through pkexec, which
 # keeps that domain; there useradd can't lock /etc/group. The module labels it
@@ -210,6 +213,8 @@ semodule -i /usr/share/selinux/packages/firox/firox-oobe.cil
 # Our .desktop files' file types (Windows programs open with firox-windows,
 # folders with Firox Explorer): GIO only sees what mimeinfo.cache lists
 update-desktop-database -q /usr/share/applications
+# File types of our own (.firoxenroll opens Access Work or School)
+update-mime-database /usr/share/mime
 
 # Compile dconf defaults (GTK4/libadwaita apps read these)
 dconf update || true
@@ -230,6 +235,10 @@ systemctl set-default graphical.target
 
 # Waydroid container manager (images are downloaded by `ujust setup-waydroid`)
 systemctl enable waydroid-container.service
+
+# Names like printer.local (printers, other Firox computers): the image's
+# authselect profile ("local") leaves nss-mdns out of nsswitch.conf
+authselect enable-feature with-mdns4 >/dev/null 2>&1 || true
 
 # Sync between Firox computers: Bonjour (Avahi) discovery, Syncthing, and
 # firox-sync's pairing port. Nothing listens on them unless Sync is on.

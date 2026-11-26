@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Sound Troubleshooter
+Comment=No sound, crackling or dropouts? Find the cause and fix it
+Exec=firox-sound
+Icon=audio-card
+Categories=Settings;HardwareSettings;Audio;
+Keywords=sound;audio;speaker;headphones;no sound;crackling;realtek;alc4080;sof;troubleshoot;fix;
+StartupNotify=false

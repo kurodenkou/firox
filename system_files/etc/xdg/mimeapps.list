@@ -1,6 +1,7 @@
 # Firox Linux default applications (your own choices, made in Settings >
 # Default Programs, go in ~/.config/mimeapps.list and win over these).
 [Default Applications]
+application/x-firox-enrollment=firox-join.desktop
 inode/directory=firox-explorer.desktop
 application/x-msdownload=firox-windows.desktop
 application/x-ms-dos-executable=firox-windows.desktop

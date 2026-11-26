@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Printers and Faxes
+Comment=Add a printer, print a test page, see what's printing, scan a document
+Exec=firox-printers
+Icon=printer
+Categories=Settings;HardwareSettings;Printing;
+Keywords=printer;print;printing;add printer;cups;scanner;scan;fax;
+StartupNotify=false
