@@ -1,0 +1,317 @@
+#!/usr/bin/python3
+"""
+firox-osk: the on-screen keyboard (Settings > Ease of Access; Super+Ctrl+O).
+
+    firox-osk [--toggle]     show it, or hide it if it's showing
+    firox-osk --show
+    firox-osk --hide
+
+A strip along the bottom of the main display, above the taskbar; maximised
+windows make room for it. It never takes the keyboard from the window you're typing
+in: each key is sent with wtype (Wayland's virtual keyboard). Shift, Ctrl,
+Alt and the Windows key apply to the next key (click twice to keep Shift
+on); Caps Lock stays on until clicked again. Backspace and the arrows repeat
+while held.
+"""
+
+import os
+import subprocess
+import sys
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+from gi.repository import Gdk, Gio, GLib, Gtk  # noqa: E402
+
+try:
+    gi.require_version("GtkLayerShell", "0.1")
+    from gi.repository import GtkLayerShell  # noqa: E402
+except (ValueError, ImportError):
+    GtkLayerShell = None
+
+sys.path.insert(0, "/usr/lib/firox/python")
+try:
+    import firox_monitors  # noqa: E402
+except ImportError:
+    firox_monitors = None
+
+U = 2           # grid columns per ordinary key
+SETTLE_MS = 60  # pause before each key (see wtype())
+KEY_H = 46
+
+# (label, keysym, shifted label, shifted keysym, width in U)
+CHAR = {
+    "`": ("grave", "~", "asciitilde"), "1": ("1", "!", "exclam"), "2": ("2", "@", "at"),
+    "3": ("3", "#", "numbersign"), "4": ("4", "$", "dollar"), "5": ("5", "%", "percent"),
+    "6": ("6", "^", "asciicircum"), "7": ("7", "&", "ampersand"), "8": ("8", "*", "asterisk"),
+    "9": ("9", "(", "parenleft"), "0": ("0", ")", "parenright"), "-": ("minus", "_", "underscore"),
+    "=": ("equal", "+", "plus"), "[": ("bracketleft", "{", "braceleft"), "]": ("bracketright", "}", "braceright"),
+    "\\": ("backslash", "|", "bar"), ";": ("semicolon", ":", "colon"), "'": ("apostrophe", '"', "quotedbl"),
+    ",": ("comma", "<", "less"), ".": ("period", ">", "greater"), "/": ("slash", "?", "question"),
+}
+# Every row is 30 columns wide
+ROWS = [
+    [*"`1234567890-=", ("⌫ Backspace", "BackSpace", 4)],
+    [("Tab", "Tab", 3), *"qwertyuiop[]", ("\\", None, 3)],
+    [("Caps", "@caps", 4), *"asdfghjkl;'", ("Enter ↵", "Return", 4)],
+    [("Shift", "@shift", 5), *"zxcvbnm,./", ("Shift", "@shift", 5)],
+    [("Esc", "Escape", 2), ("Ctrl", "@ctrl", 3), ("⊞", "@logo", 2), ("Alt", "@alt", 2), ("", "space", 10),
+     ("←", "Left", 2), ("↓", "Down", 2), ("↑", "Up", 2), ("→", "Right", 2), ("⌨ Hide", "@hide", 3)],
+]
+REPEAT = {"BackSpace", "Left", "Right", "Up", "Down", "space"}
+MOD_NAMES = {"@shift": "shift", "@ctrl": "ctrl", "@alt": "alt", "@logo": "logo"}
+TIPS = {"@shift": "Shift: the next key, capitals and symbols (click twice to keep it on)",
+        "@ctrl": "Ctrl, for the next key", "@alt": "Alt, for the next key",
+        "@logo": "The Windows key, for the next key (or on its own: the Start menu)",
+        "@caps": "Caps Lock", "@hide": "Hide the keyboard (Super+Ctrl+O brings it back)", "space": "Space"}
+
+CSS = b"""
+#osk { background-color: rgba(28, 30, 36, 0.96); border-top: 1px solid rgba(255, 255, 255, 0.12); }
+#osk button {
+    min-height: 40px; padding: 0 4px; border-radius: 8px; border: 1px solid rgba(255, 255, 255, 0.08);
+    background-image: none; background-color: #3b3f4a; color: #f2f4f8; box-shadow: none; text-shadow: none;
+    font-size: 1.15em;
+}
+#osk button label { color: #f2f4f8; }
+#osk button:hover { background-color: #4a4f5c; }
+#osk button:active { background-color: #2f7fd8; }
+#osk button.mod { background-color: #2c2f37; font-size: 0.95em; }
+#osk button.on { background-color: #2f7fd8; border-color: #8cc4ff; }
+#osk button.locked { background-color: #1f5fae; border: 2px solid #ffffff; }
+/* high contrast (Settings > Ease of Access) */
+#osk.contrast { background-color: #000000; border-top: 2px solid #ffffff; }
+#osk.contrast button { background-color: #000000; border: 2px solid #ffffff; }
+#osk.contrast button label { color: #ffffff; font-weight: bold; }
+#osk.contrast button.on, #osk.contrast button.locked { background-color: #ffff00; }
+#osk.contrast button.on label, #osk.contrast button.locked label { color: #000000; }
+"""
+
+
+def wtype(args):
+    if os.environ.get("FIROX_OSK_DEBUG"):
+        print("firox-osk: wtype", " ".join(args), file=sys.stderr, flush=True)
+    try:
+        # (each wtype is a new virtual keyboard: a short pause first lets the
+        # window take in its key map, or the first key can be lost)
+        subprocess.Popen(["wtype", "-s", str(SETTLE_MS), *args], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL)
+    except OSError as e:
+        print(f"firox-osk: couldn't run wtype: {e}", file=sys.stderr)
+
+
+class Keyboard(Gtk.Window):
+    def __init__(self, app):
+        super().__init__(title="On-Screen Keyboard")
+        self.app = app
+        self.set_name("osk")
+        self.mods = set()           # one-shot modifiers for the next key
+        self.shift_lock = False
+        self.caps = False
+        self.repeat = None
+        self.buttons = []           # (button, spec)
+        if GtkLayerShell and GtkLayerShell.is_supported():
+            GtkLayerShell.init_for_window(self)
+            GtkLayerShell.set_namespace(self, "firox-osk")
+            GtkLayerShell.set_layer(self, GtkLayerShell.Layer.TOP)
+            for edge in (GtkLayerShell.Edge.BOTTOM, GtkLayerShell.Edge.LEFT, GtkLayerShell.Edge.RIGHT):
+                GtkLayerShell.set_anchor(self, edge, True)
+            GtkLayerShell.auto_exclusive_zone_enable(self)     # windows make room
+            GtkLayerShell.set_keyboard_mode(self, GtkLayerShell.KeyboardMode.NONE)
+            if firox_monitors is not None:
+                try:
+                    mon = firox_monitors.main_gdk_monitor(Gdk.Display.get_default())
+                    if mon is not None:
+                        GtkLayerShell.set_monitor(self, mon)
+                except Exception:  # noqa: BLE001
+                    pass
+        else:
+            self.set_accept_focus(False)
+            self.set_keep_above(True)
+        grid = Gtk.Grid(row_spacing=5, column_spacing=5, row_homogeneous=True, column_homogeneous=True)
+        grid.set_border_width(8)
+        cols = max(sum(self.width(k) for k in row) for row in ROWS)
+        for r, row in enumerate(ROWS):
+            c = 0
+            for k in row:
+                spec = self.spec(k)
+                b = Gtk.Button()
+                b.set_can_focus(False)
+                b.set_size_request(-1, KEY_H)
+                if spec["sym"] in TIPS:
+                    b.set_tooltip_text(TIPS[spec["sym"]])
+                if spec["sym"].startswith("@") or spec["sym"] in ("Escape", "Tab", "BackSpace", "Return"):
+                    b.get_style_context().add_class("mod")
+                b.connect("pressed", self.on_press, spec)
+                b.connect("released", self.on_release, spec)
+                grid.attach(b, c, r, spec["w"], 1)
+                self.buttons.append((b, spec))
+                c += spec["w"]
+            # (a short row ends flush right like the others)
+            if c < cols:
+                self.buttons[-1][0].get_parent().child_set_property(self.buttons[-1][0], "width",
+                                                                    spec["w"] + cols - c)
+        self.add(grid)
+        self.relabel()
+        self.follow_contrast()
+
+    def width(self, k):
+        return k[2] if isinstance(k, tuple) else U
+
+    def spec(self, k):
+        if isinstance(k, tuple):
+            label, sym, w = k
+            if sym is None:                       # (a character key, wider)
+                sym = CHAR[label][0]
+                return {"label": label, "sym": sym, "shifted": CHAR[label][1], "ssym": CHAR[label][2], "w": w}
+            return {"label": label, "sym": sym, "shifted": None, "ssym": None, "w": w}
+        if k in CHAR:
+            return {"label": k, "sym": CHAR[k][0], "shifted": CHAR[k][1], "ssym": CHAR[k][2], "w": U}
+        return {"label": k, "sym": k, "shifted": k.upper(), "ssym": k.upper(), "w": U}
+
+    def shifted(self, spec):
+        """Does this key type its shifted character right now?"""
+        shift = "@shift" in self.mods or self.shift_lock
+        if spec["label"].isalpha() and len(spec["label"]) == 1:
+            return shift != self.caps
+        return shift
+
+    def relabel(self):
+        for b, spec in self.buttons:
+            sym = spec["sym"]
+            if spec["shifted"] is not None:
+                text = spec["shifted"] if self.shifted(spec) else spec["label"]
+            else:
+                text = spec["label"]
+            b.set_label(text)
+            b.get_accessible().set_name({"space": "Space"}.get(sym, text.replace("⌫ ", "").replace(" ↵", "")))
+            ctx = b.get_style_context()
+            on = (sym in self.mods) or (sym == "@caps" and self.caps)
+            locked = sym == "@shift" and self.shift_lock
+            ctx.remove_class("on")
+            ctx.remove_class("locked")
+            if locked:
+                ctx.add_class("locked")
+            elif on:
+                ctx.add_class("on")
+
+    def follow_contrast(self):
+        try:
+            s = Gio.Settings.new("org.gnome.desktop.a11y.interface")
+        except Exception:  # noqa: BLE001
+            return
+        self.a11y = s
+
+        def apply(*_):
+            ctx = self.get_style_context()
+            (ctx.add_class if s.get_boolean("high-contrast") else ctx.remove_class)("contrast")
+        s.connect("changed::high-contrast", apply)
+        apply()
+
+    # -- keys
+    def on_press(self, _b, spec):
+        sym = spec["sym"]
+        if sym in REPEAT:
+            self.send(spec)
+            self.repeat = GLib.timeout_add(450, self.start_repeat, spec)
+
+    def start_repeat(self, spec):
+        self.repeat = GLib.timeout_add(60, lambda: self.send(spec, repeat=True) or True)
+        return False
+
+    def on_release(self, _b, spec):
+        sym = spec["sym"]
+        if self.repeat is not None:
+            GLib.source_remove(self.repeat)
+            self.repeat = None
+        if sym in REPEAT:
+            return
+        if sym == "@hide":
+            self.app.hide_keyboard()
+        elif sym == "@caps":
+            self.caps = not self.caps
+            self.relabel()
+        elif sym == "@shift":
+            if self.shift_lock:
+                self.shift_lock = False
+                self.mods.discard("@shift")
+            elif "@shift" in self.mods:
+                self.shift_lock = True              # (clicked twice: keep it on)
+            else:
+                self.mods.add("@shift")
+            self.relabel()
+        elif sym in MOD_NAMES:
+            if sym in self.mods:
+                self.mods.discard(sym)
+                if sym == "@logo" and not self.mods:
+                    wtype(["-k", "Super_L"])        # (the Windows key on its own: Start menu)
+            else:
+                self.mods.add(sym)
+            self.relabel()
+        else:
+            self.send(spec)
+
+    def send(self, spec, repeat=False):
+        mods = [MOD_NAMES[m] for m in ("@ctrl", "@alt", "@logo") if m in self.mods]
+        sym = spec["sym"]
+        if spec["shifted"] is not None and self.shifted(spec):
+            if mods:
+                mods.append("shift")                # Ctrl+Shift+T and the like
+            else:
+                sym = spec["ssym"]                  # typed as the character itself
+        elif ("@shift" in self.mods or self.shift_lock) and spec["shifted"] is None:
+            mods.append("shift")                    # Shift+Tab, Shift+arrows
+        args = []
+        for m in mods:
+            args += ["-M", m]
+        args += ["-k", sym]
+        for m in reversed(mods):
+            args += ["-m", m]
+        wtype(args)
+        if not repeat and self.mods:
+            self.mods.clear()                       # (one-shot)
+            self.relabel()
+
+
+class App(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id="org.firox.Keyboard", flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE)
+        self.win = None
+
+    def do_startup(self):
+        Gtk.Application.do_startup(self)
+        prov = Gtk.CssProvider()
+        prov.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), prov,
+                                                 Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+    def show_keyboard(self):
+        if self.win is None:
+            self.win = Keyboard(self)
+            self.add_window(self.win)
+        self.win.show_all()
+
+    def hide_keyboard(self):
+        if self.win is not None:
+            self.win.destroy()
+            self.win = None
+        self.quit()
+
+    def do_command_line(self, cmdline):
+        args = cmdline.get_arguments()[1:]
+        cmd = args[0] if args else "--toggle"
+        if cmd == "--hide" or (cmd == "--toggle" and self.win is not None):
+            self.hide_keyboard()
+        elif cmd in ("--show", "--toggle"):
+            self.show_keyboard()
+        else:
+            print(__doc__.strip(), file=sys.stderr)
+            if self.win is None:
+                self.quit()
+            return 2
+        return 0
+
+
+if __name__ == "__main__":
+    os.environ.setdefault("GDK_BACKEND", "wayland")
+    sys.exit(App().run(sys.argv))

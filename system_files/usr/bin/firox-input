@@ -58,12 +58,14 @@ SETTINGS = {
     "REPEAT_DELAY": (int, 600),           # ms
     "REPEAT_RATE": (int, 25),             # per second
     "NUMLOCK": (bool, False),
+    "MAGNIFIER_FULL": (bool, True),       # the whole screen, or a lens around the pointer
+    "MAGNIFIER_SCALE": (float, 2.0),      # how much it zooms when it comes on
 }
 CHOICES = {"TOUCHPAD_SCROLL": ("twofinger", "edge"),
            "TOUCHPAD_CLICK": ("auto", "clickfinger", "buttonAreas")}
 RANGES = {"MOUSE_SPEED": (-1, 1), "TOUCHPAD_SPEED": (-1, 1), "SCROLL_SPEED": (0.1, 10),
           "DOUBLE_CLICK": (100, 2000), "CURSOR_SIZE": (16, 128),
-          "REPEAT_DELAY": (100, 2000), "REPEAT_RATE": (1, 100)}
+          "REPEAT_DELAY": (100, 2000), "REPEAT_RATE": (1, 100), "MAGNIFIER_SCALE": (1.5, 8)}
 
 
 def read_kv(path):
@@ -198,6 +200,17 @@ def build_rc(v):
     set_child(keyboard, "repeatRate", str(v["REPEAT_RATE"]))
     set_child(keyboard, "repeatDelay", str(v["REPEAT_DELAY"]))
     set_child(keyboard, "numlock", "on" if v["NUMLOCK"] else "off")
+
+    # The magnifier (Settings > Ease of Access; Super+Plus / Super+Minus)
+    for old in root.findall("magnifier"):
+        root.remove(old)
+    mag = ET.SubElement(root, "magnifier")
+    size = "-1" if v["MAGNIFIER_FULL"] else "400"
+    set_child(mag, "width", size)
+    set_child(mag, "height", size if v["MAGNIFIER_FULL"] else "300")
+    set_child(mag, "initScale", f"{v['MAGNIFIER_SCALE']:g}")
+    set_child(mag, "increment", "0.5")
+    set_child(mag, "useFilter", "yes")
 
     mouse_el = root.find("mouse")
     if mouse_el is None:

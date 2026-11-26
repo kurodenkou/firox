@@ -42,6 +42,8 @@ except (ValueError, ImportError):
     GtkLayerShell = None
 
 sys.path.insert(0, "/usr/lib/firox/python")
+import firox_a11y  # noqa: E402
+import firox_access  # noqa: E402
 import firox_monitors  # noqa: E402
 import firox_wallpaper  # noqa: E402
 
@@ -54,6 +56,8 @@ APPLETS = [
     ("org.kde.plasma.clipboard", "Clipboard", "Copy and paste history (Super+V)", ["@clipboard"]),
     ("preferences-system-power", "Power Options", "Turn off the monitor and sleep when idle", ["@power"]),
     ("redshift", "Night Light", "Warmer screen colours in the evening", ["@nightlight"]),
+    ("preferences-desktop-accessibility", "Ease of Access",
+     "Narrator, Magnifier, on-screen keyboard, high contrast and text size (Super+U)", ["@access"]),
     ("input-mouse", "Mouse", "Pointer speed, buttons, scrolling and touchpad", ["@mouse"]),
     ("input-keyboard", "Keyboard", "Layouts, repeat speed and Num Lock", ["@keyboard"]),
     ("preferences-desktop-theme", "Appearance", "Classic, Modern or Glass look, light or dark apps", ["@appearance"]),
@@ -1496,6 +1500,128 @@ def nightlight_module():
     return mod
 
 
+class AccessDialog(Gtk.Dialog):
+    """Ease of Access (firox_access). Every change takes effect at once, so
+    there's nothing to Apply: someone using Narrator or the magnifier hears
+    or sees each change as they make it."""
+
+    def __init__(self, parent):
+        super().__init__(title="Ease of Access", transient_for=parent, modal=True)
+        self.add_button("Close", Gtk.ResponseType.CLOSE)
+        self.set_default_size(560, 640)
+        A = firox_access
+        st = A.status()
+        inp = {k: firox_input_get(k) for k in ("CURSOR_SIZE", "MAGNIFIER_FULL", "MAGNIFIER_SCALE")}
+        outer = self.get_content_area()
+        sw = Gtk.ScrolledWindow()
+        sw.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        sw.set_vexpand(True)
+        outer.pack_start(sw, True, True, 0)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        box.set_border_width(16)
+        sw.add(box)
+        header = Gtk.Box(spacing=12)
+        header.pack_start(Gtk.Image.new_from_icon_name("preferences-desktop-accessibility", Gtk.IconSize.DIALOG),
+                          False, False, 0)
+        intro = Gtk.Label(xalign=0, wrap=True, max_width_chars=52,
+                          label="Make your computer easier to see, hear and use. Changes take effect straight "
+                                "away, and the shortcuts work anywhere. Super is the key with the Windows logo.")
+        header.pack_start(intro, True, True, 0)
+        box.pack_start(header, False, False, 4)
+
+        def section(title):
+            t = Gtk.Label(xalign=0)
+            t.set_markup(f"<b>{GLib.markup_escape_text(title)}</b>")
+            box.pack_start(t, False, False, 6)
+
+        def hint(text):
+            h = Gtk.Label(xalign=0, wrap=True, max_width_chars=60, label=text)
+            h.get_style_context().add_class("dim-label")
+            h.set_margin_start(4)
+            box.pack_start(h, False, False, 0)
+
+        def switch(label, active, on_change):
+            row = Gtk.Box(spacing=12)
+            lab = Gtk.Label(label=label, xalign=0)
+            row.pack_start(lab, True, True, 0)
+            sw_ = Gtk.Switch(active=active)
+            sw_.set_valign(Gtk.Align.CENTER)
+            sw_.get_accessible().set_name(label)
+            lab.set_mnemonic_widget(sw_)
+            sw_.connect("notify::active", lambda w, _p: on_change(w.get_active()))
+            row.pack_end(sw_, False, False, 0)
+            box.pack_start(row, False, False, 0)
+            return sw_
+
+        def check(label, active, on_change):
+            c = Gtk.CheckButton(label=label, active=active)
+            c.connect("toggled", lambda w: on_change(w.get_active()))
+            box.pack_start(c, False, False, 0)
+            return c
+
+        def combo(label, options, current, on_change):
+            row = Gtk.Box(spacing=12)
+            lab = Gtk.Label(label=label, xalign=0)
+            row.pack_start(lab, True, True, 0)
+            c = Gtk.ComboBoxText()
+            for k, v in options:
+                c.append(str(k), v)
+            c.set_active_id(str(current))
+            if c.get_active() < 0:
+                c.set_active(0)
+            c.get_accessible().set_name(label)
+            lab.set_mnemonic_widget(c)
+            c.connect("changed", lambda w: on_change(w.get_active_id()))
+            row.pack_end(c, False, False, 0)
+            box.pack_start(row, False, False, 0)
+            return c
+
+        section("Narrator (screen reader)")
+        switch("Read the screen aloud", st["narrator"], lambda on: A.narrator_on() if on else A.narrator_off())
+        check("Start Narrator when I log in", st["narrator_at_login"],
+              lambda on: A.setting("NARRATOR", "1" if on else "0"))
+        hint("Super+Ctrl+Enter turns Narrator on or off. It's Orca, which reads Firox's own programs, Firefox "
+             "and most other apps; Insert+H gives its help.")
+
+        section("Magnifier")
+        hint("Super+Plus zooms in, Super+Minus zooms out, and Super+Esc turns the magnifier off (or back on).")
+        combo("What it magnifies", [("1", "The whole screen"), ("0", "A lens around the pointer")],
+              "1" if inp["MAGNIFIER_FULL"] in ("1", "") else "0",
+              lambda v: A.magnifier(full=v == "1"))
+        combo("How much, when it comes on", [("1.5", "1.5×"), ("2", "2×"), ("3", "3×"), ("4", "4×")],
+              f"{float(inp['MAGNIFIER_SCALE'] or 2):g}", lambda v: A.magnifier(scale=v))
+
+        section("On-screen keyboard")
+        switch("Show the on-screen keyboard", st["keyboard"], lambda on: A.keyboard("show" if on else "hide"))
+        check("Show it when I log in", st["keyboard_at_login"], lambda on: A.setting("KEYBOARD", "1" if on else "0"))
+        hint("Super+Ctrl+O shows or hides it. Type with the mouse, a touch screen or a pointing device; "
+             "maximised windows make room for it.")
+
+        section("Make things easier to see")
+        switch("High contrast", st["contrast"], A.contrast)
+        hint("Left Alt+Left Shift+Print Screen turns high contrast on or off. It applies to apps; the taskbar "
+             "and Start menu keep their look.")
+        combo("Text size", A.TEXT_SIZES, f"{st['text']:g}", A.text_size)
+        combo("Pointer size", A.CURSOR_SIZES, inp["CURSOR_SIZE"] or "24", A.cursor_size)
+        hint("A new pointer size shows in apps straight away, and everywhere after you log in again.")
+
+        section("Motion")
+        check("Reduce motion (fewer animations)", not st["motion"], lambda on: A.motion(not on))
+        hint("Apps skip their animations, and Rune holds still in his glade.")
+        self.show_all()
+
+    def apply(self):
+        pass
+
+
+def firox_input_get(key):
+    try:
+        return subprocess.run(["firox-input", "get", key], capture_output=True, text=True,
+                              timeout=5).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
 class NightLightDialog(Gtk.Dialog):
     """Night Light: warmer colours in the evening (firox-nightlight)."""
 
@@ -1866,6 +1992,7 @@ class AccountsDialog(Gtk.Dialog):
 class ControlPanel(Gtk.ApplicationWindow):
     def __init__(self, app):
         super().__init__(application=app, title="Settings")
+        firox_a11y.watch(self)
         self.set_default_size(820, 560)
         self.set_icon_name("preferences-system")
 
@@ -1998,6 +2125,10 @@ class ControlPanel(Gtk.ApplicationWindow):
             if dlg.run() == Gtk.ResponseType.APPLY:
                 dlg.apply()
             dlg.destroy()
+        elif argv == ["@access"]:
+            dlg = AccessDialog(self)
+            dlg.run()
+            dlg.destroy()
         elif argv == ["@nightlight"]:
             dlg = NightLightDialog(self)
             if dlg.run() == Gtk.ResponseType.APPLY:
@@ -2037,6 +2168,7 @@ class App(Gtk.Application):
         page = args[0] if args else None
         direct = {"system": ["@system"], "datetime": ["@datetime"], "appearance": ["@appearance"],
                   "accounts": ["@accounts"], "power": ["@power"], "nightlight": ["@nightlight"],
+                  "access": ["@access"],
                   "screensaver": ["@screensaver"], "clipboard": ["@clipboard"],
                   "mouse": ["@mouse"], "keyboard": ["@keyboard"],
                   "taskbar": ["@taskbar"], "defaults": ["@defaults"],
@@ -2049,7 +2181,7 @@ class App(Gtk.Application):
                 cls = {"system": SystemDialog, "datetime": DateTimeDialog,
                        "appearance": AppearanceDialog, "accounts": AccountsDialog,
                        "power": PowerDialog, "screensaver": ScreenSaverDialog,
-                       "nightlight": NightLightDialog,
+                       "nightlight": NightLightDialog, "access": AccessDialog,
                        "clipboard": ClipboardDialog, "taskbar": TaskbarDialog,
                        "defaults": DefaultsDialog, "display": DisplayDialog,
                        "background": BackgroundDialog,

@@ -45,6 +45,7 @@
     <li><a href="#tools">Everyday tools</a></li>
     <li><a href="#safe">Updates, restore and backup</a></li>
     <li><a href="#settings">Settings and login</a></li>
+    <li><a href="#access">Ease of Access</a></li>
     <li><a href="#shortcuts">Keyboard shortcuts</a></li>
 </ul>
 
@@ -659,6 +660,31 @@
     <figcaption>User Accounts</figcaption>
 </figure>
 
+<h2 id="access">Ease of Access</h2>
+
+<div class="feature">
+    <div class="feature-text">
+        <h3>Easier to see, hear and use</h3>
+        <p>Settings → <b>Ease of Access</b> (<kbd>Super</kbd>+<kbd>U</kbd>). Every change takes effect straight away, so you see or hear it as you make it.</p>
+        <ul>
+            <li><b>Narrator</b> (<kbd>Super</kbd>+<kbd>Ctrl</kbd>+<kbd>Enter</kbd>): reads the screen aloud. It's Orca, the screen reader GNOME uses, and it can start when you log in. Firox's own icon-only buttons (the taskbar's battery, shield and moon, Rune, the gadgets) all have names it can read.</li>
+            <li><b>Magnifier</b> (<kbd>Super</kbd>+<kbd>Plus</kbd> / <kbd>Minus</kbd>, <kbd>Super</kbd>+<kbd>Esc</kbd> to turn it off): the whole screen, or a lens around the pointer.</li>
+            <li><b>On-screen keyboard</b> (<kbd>Super</kbd>+<kbd>Ctrl</kbd>+<kbd>O</kbd>): type with the mouse or a touch screen. It never takes the keyboard from the window you're typing in.</li>
+            <li><b>High contrast</b> (<kbd>Left Alt</kbd>+<kbd>Left Shift</kbd>+<kbd>Print Screen</kbd>), <b>bigger text</b> and a <b>bigger pointer</b>.</li>
+            <li><b>Reduce motion:</b> apps skip their animations, and Rune holds still.</li>
+        </ul>
+        <p class="tech">firox-access (Orca, gsettings, firox-input for the pointer and labwc's magnifier), firox-osk (GTK layer-shell, keys sent with wtype), firox_a11y (tooltips as accessible names)</p>
+    </div>
+    <figure>
+        <img src="screenshots/ease-of-access.png" alt="Ease of Access in Settings: Narrator, Magnifier, On-screen keyboard and high contrast, each with its shortcut" loading="lazy">
+        <figcaption>Settings → Ease of Access</figcaption>
+    </figure>
+</div>
+<figure>
+    <img src="screenshots/on-screen-keyboard.png" alt="The on-screen keyboard along the bottom of the screen, above the taskbar, with a text editor open" loading="lazy">
+    <figcaption>The on-screen keyboard</figcaption>
+</figure>
+
 <h2 id="shortcuts">Keyboard shortcuts</h2>
 <div class="keys">
     <div><span><kbd>Super</kbd></span><span>Start menu</span></div>
@@ -674,6 +700,10 @@
     <div><span><kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Del</kbd></span><span>Task Manager</span></div>
     <div><span><kbd>PrtSc</kbd></span><span>Screenshot to Pictures</span></div>
     <div><span><kbd>Super</kbd>+<kbd>Shift</kbd>+<kbd>S</kbd></span><span>Snipping Tool</span></div>
+    <div><span><kbd>Super</kbd>+<kbd>U</kbd></span><span>Ease of Access</span></div>
+    <div><span><kbd>Super</kbd>+<kbd>Ctrl</kbd>+<kbd>Enter</kbd></span><span>Narrator</span></div>
+    <div><span><kbd>Super</kbd>+<kbd>Plus</kbd> / <kbd>Minus</kbd></span><span>Magnifier</span></div>
+    <div><span><kbd>Super</kbd>+<kbd>Ctrl</kbd>+<kbd>O</kbd></span><span>On-screen keyboard</span></div>
 </div>
 
 </div>
