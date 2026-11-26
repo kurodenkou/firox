@@ -5,6 +5,10 @@ firox-policy: manage Firox computers from one place, with signed policies.
     firox-policy                    open the policy editor (write, sign and
                                     publish policies; make enrollment files)
     firox-policy status             what policy this computer follows
+    firox-policy join [FILE]        Access Work or School: join with an
+                                    enrollment file, see what's managed,
+                                    check now or leave (asks for an
+                                    administrator's password)
     sudo firox-policy enroll FILE   follow the policies described in an
                                     enrollment file (.firoxenroll)
     sudo firox-policy unenroll      stop following them
@@ -446,6 +450,9 @@ def main(argv):
         return cmd_enroll(argv[2])
     if cmd == "unenroll":
         return cmd_unenroll()
+    if cmd == "join":
+        import firox_policy_join
+        return firox_policy_join.run(argv[2] if len(argv) > 2 else None)
     if cmd == "":
         import firox_policy_editor
         return firox_policy_editor.run(sys.modules[__name__])

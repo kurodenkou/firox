@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Access Work or School
+Comment=Join your organization's managed computers with an enrollment file
+Exec=firox-policy join %f
+Icon=network-workgroup
+Categories=Settings;System;
+MimeType=application/x-firox-enrollment;
+Keywords=enroll;enrollment;organization;work;school;managed;policy;join;domain;
+StartupNotify=false

@@ -730,7 +730,9 @@ def run(fp):
             note = ("It holds the key that decrypts your policies: copy it only to the computers you "
                     "enroll, then delete the copies. " if encrypted else "")
             message(self, Gtk.MessageType.INFO, "Enrollment file saved",
-                    f"{note}On each computer, run:\n\n<tt>sudo firox-policy enroll "
+                    f"{note}On each computer, double-click the file (or open Settings → <b>Access Work or "
+                    f"School</b>) and click <b>Join</b>; it asks for that computer's administrator password. "
+                    f"Or, in a terminal:\n\n<tt>sudo firox-policy enroll "
                     f"{GLib.markup_escape_text(os.path.basename(path))}</tt>")
 
     class App(Gtk.Application):

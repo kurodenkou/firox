@@ -213,6 +213,8 @@ semodule -i /usr/share/selinux/packages/firox/firox-oobe.cil
 # Our .desktop files' file types (Windows programs open with firox-windows,
 # folders with Firox Explorer): GIO only sees what mimeinfo.cache lists
 update-desktop-database -q /usr/share/applications
+# File types of our own (.firoxenroll opens Access Work or School)
+update-mime-database /usr/share/mime
 
 # Compile dconf defaults (GTK4/libadwaita apps read these)
 dconf update || true

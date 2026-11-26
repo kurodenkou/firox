@@ -91,10 +91,14 @@
             <li>a file or network share: <code>/mnt/share/policy.firoxpol</code></li>
         </ul>
     </li>
-    <li><b>Make an enrollment file</b> (<b>Enrollment File…</b>) with that address, and on each computer run:
+    <li><b>Make an enrollment file</b> (<b>Enrollment File…</b>) with that address, and get it to each computer: a USB stick, a shared folder, an email. There, <b>double-click it</b> (or open Settings → <b>Access Work or School</b>). The window shows the organization, where its policies come from and your key's fingerprint; click <b>Join</b> and type that computer's administrator password. In a terminal it's:
         <div class="code"><pre><code>sudo firox-policy enroll firox.firoxenroll</code></pre></div>
     </li>
 </ol>
+<figure>
+    <img src="screenshots/work-or-school.png" alt="Access Work or School: joining Riverside School shows the organization, where its policies come from and the signing key's fingerprint; once joined, it lists what the school manages, with Check for a New Policy Now and Leave Organization" loading="lazy">
+    <figcaption>On each computer: Access Work or School, before and after joining</figcaption>
+</figure>
 <p>That's it. Computers check for a new policy when they start and every 30 minutes. To change something, edit, sign and publish again.</p>
 <div class="note"><b>Encrypted policies</b> need an enrollment file made after you turn encryption on: it carries the key computers decrypt with. Copy it only to the computers you enroll.</div>
 
@@ -187,6 +191,7 @@
     <tbody>
         <tr><th scope="row"><code>firox-policy</code></th><td>Open the Policy Editor</td></tr>
         <tr><th scope="row"><code>firox-policy status</code></th><td>What policy this computer follows, and what's in force</td></tr>
+        <tr><th scope="row"><code>firox-policy join [FILE]</code></th><td>Access Work or School: join with an enrollment file (asks for an administrator's password), see what's managed, check now, leave</td></tr>
         <tr><th scope="row"><code>sudo firox-policy enroll FILE</code></th><td>Follow the policies an enrollment file describes</td></tr>
         <tr><th scope="row"><code>sudo firox-policy update</code></th><td>Fetch and apply the policy now (the timer does this every 30 minutes)</td></tr>
         <tr><th scope="row"><code>sudo firox-policy apply FILE</code></th><td>Apply a policy file once, from here (still checks the signature)</td></tr>
