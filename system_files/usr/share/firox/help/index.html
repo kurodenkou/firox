@@ -136,7 +136,14 @@
 
 <h2 id="sound">No sound?</h2>
 <p>Click the speaker in the notification area for a volume slider, <b>Mute</b>, and a list of speakers and headphones to play through. Then check <b>Settings &rarr; Sounds and Audio Devices</b>: make sure the right output is selected and nothing is muted.</p>
-<p>Some PCs with <b>Realtek</b> onboard audio stay silent or crackle on Linux. <b>Settings &rarr; Sound Troubleshooter</b> runs <a href="https://github.com/hello2himel/linux-audio-fix">linux-audio-fix</a>, which detects your chip, shows what it will change and asks before doing anything. It turns off Auto-Mute, sends the chip's startup commands, and sets them to be re-applied at every boot. It saves a backup first.</p>
+<p>Still nothing, crackling, or sound that cuts out? Open <b>Settings &rarr; Sound Troubleshooter</b>. It shows what sound hardware you have and what looks wrong (muted, playing to a monitor, no outputs at all), lets you pick the output and play a test sound, and offers the fixes that fit, in order:</p>
+<ul>
+  <li><b>Everyone:</b> <b>Reset the sound settings</b> forgets the chosen outputs, profiles and volumes and restarts the sound service (a backup is kept).</li>
+  <li><b>Realtek HD-Audio</b> (most desktops and older laptops): <b>Run the Realtek Fix</b> runs <a href="https://github.com/hello2himel/linux-audio-fix">linux-audio-fix</a>, which detects your chip, shows what it will change and asks first. It turns off Auto-Mute, sends the chip's startup commands and re-applies them at every start, with a backup.</li>
+  <li><b>USB audio on the motherboard</b> (Realtek ALC4080 and similar on newer MSI, ASUS, Gigabyte and ASRock boards): <b>Use Plain Profiles</b> swaps the device's own profile, which splits the jacks and can send sound to the wrong one, for the usual Analog Stereo and Surround. <b>Keep It Powered</b> stops USB power saving from cutting the start of sounds off or silencing it.</li>
+  <li><b>Intel laptops with SOF firmware:</b> it shows when the firmware couldn't start, explains laptops whose speakers sit behind a separate amplifier (Cirrus CS35L41, TI TAS2781), and as a last resort switches to the older Intel HD-Audio driver after a restart. Built-in digital microphones stop working with that driver.</li>
+</ul>
+<p>Every fix has an <b>Undo</b>. If nothing helps, <b>Copy Report</b> and paste it when you ask for help. In a terminal: <code>firox-sound --report</code>, and for the Realtek fix:</p>
 <table>
   <tr><td><code>ujust fix-realtek-audio</code></td><td>Guided fix</td></tr>
   <tr><td><code>ujust fix-realtek-audio --dry-run</code></td><td>Preview only, changes nothing</td></tr>
@@ -144,7 +151,6 @@
   <tr><td><code>ujust fix-realtek-audio --restore</code></td><td>Put the saved mixer settings back</td></tr>
   <tr><td><code>ujust fix-realtek-audio --uninstall</code></td><td>Stop re-applying the fix at boot</td></tr>
 </table>
-<p>It only applies to Realtek HD-Audio chips. USB audio (such as ALC4080 on some motherboards) and newer Intel laptops that use SOF firmware need different fixes; the tool tells you if that's your case.</p>
 
 <h2 id="software">Installing software</h2>
 <p>Firox Linux is an <em>image-based</em> system: the OS itself is read-only and updates as one piece. Install apps as web apps, Android apps or <b>Flatpaks</b> (<b>Start &rarr; Bazaar</b>). For command-line tools, use a <code>toolbox</code> or <code>distrobox</code> container.</p>

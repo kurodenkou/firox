@@ -190,6 +190,23 @@
 </div>
 <div class="feature">
     <div class="feature-text">
+        <h3>Sound Troubleshooter</h3>
+        <p>No sound, crackling or dropouts? <b>Settings → Sound Troubleshooter</b> works out what you have and what looks wrong (muted, playing to a monitor, no outputs at all), lets you pick the output and play a test sound, and offers the fixes that fit:</p>
+        <ul>
+            <li><b>Realtek HD-Audio:</b> the guided chip fix (linux-audio-fix).</li>
+            <li><b>USB audio on newer motherboards</b> (ALC4080 and similar): plain profiles instead of the device's own, and keeping it powered so it doesn't drop out.</li>
+            <li><b>Intel laptops with SOF:</b> what the kernel said, laptops with separate speaker amplifiers, and the older driver as a last resort.</li>
+            <li>For everyone: reset the sound settings, and copy a report to ask for help. Every fix can be undone.</li>
+        </ul>
+        <p class="tech">firox-sound and firox_sound (/proc/asound, pactl, journalctl), WirePlumber rules (api.alsa.use-ucm), /usr/libexec/firox/sound-admin through pkexec (a udev rule for USB power, rpm-ostree kargs for snd_intel_dspcfg.dsp_driver=1)</p>
+    </div>
+    <figure>
+        <img src="screenshots/sound-troubleshooter.png" alt="Sound Troubleshooter on a desktop with Realtek HD-Audio and MSI motherboard USB audio: sound is going to a muted HDMI output, with an output picker, Play Test Sound, and fixes for each kind of hardware" loading="lazy">
+        <figcaption>The Sound Troubleshooter</figcaption>
+    </figure>
+</div>
+<div class="feature">
+    <div class="feature-text">
         <h3>Mouse, touchpad and keyboard</h3>
         <ul>
     <li><b>Settings → Mouse:</b> pointer speed, left-handed buttons, double-click speed, pointer size, scrolling. Its Touchpad tab covers tap to click, two-finger scrolling, the right-click method, ignore while typing, and off when a mouse is plugged in.</li>

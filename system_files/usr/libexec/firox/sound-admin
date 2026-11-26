@@ -1,0 +1,102 @@
+#!/usr/bin/python3
+"""
+sound-admin: the Sound Troubleshooter's two fixes that need root. Run through
+pkexec, which asks for an administrator's password.
+
+    sound-admin usb-power-on VENDOR:PRODUCT
+        keep a USB sound device powered (no autosuspend), now and from now on:
+        USB power saving makes some motherboard USB audio (Realtek ALC4080
+        and similar) drop out or go silent
+    sound-admin usb-power-auto
+        undo that
+    sound-admin legacy-driver on|off
+        Intel laptops: use the older HD-Audio driver instead of SOF (a kernel
+        option, from the next restart). For laptops whose SOF firmware can't
+        start; their built-in microphones may stop working.
+"""
+
+import glob
+import os
+import re
+import subprocess
+import sys
+
+RULE = "/etc/udev/rules.d/90-firox-usb-audio.rules"
+KARG = "snd_intel_dspcfg.dsp_driver=1"
+
+
+def fail(msg, code=1):
+    print(msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def usb_power_on(usbid):
+    if not re.fullmatch(r"[0-9a-f]{4}:[0-9a-f]{4}", usbid):
+        fail("That isn't a USB device ID (like 0db0:a073).", 2)
+    vendor, product = usbid.split(":")
+    rules = []
+    try:
+        with open(RULE) as fh:
+            rules = [ln.rstrip("\n") for ln in fh if ln.strip() and not ln.startswith("#")]
+    except OSError:
+        pass
+    line = (f'ACTION=="add|change", SUBSYSTEM=="usb", ATTR{{idVendor}}=="{vendor}", '
+            f'ATTR{{idProduct}}=="{product}", TEST=="power/control", ATTR{{power/control}}="on"')
+    if line not in rules:
+        rules.append(line)
+    os.makedirs(os.path.dirname(RULE), exist_ok=True)
+    with open(RULE + ".tmp", "w") as fh:
+        fh.write("# Sound Troubleshooter (firox-sound): keep these USB sound devices powered\n")
+        fh.write("\n".join(rules) + "\n")
+    os.replace(RULE + ".tmp", RULE)
+    # ...and now, without unplugging or restarting
+    n = 0
+    for dev in glob.glob("/sys/bus/usb/devices/*"):
+        try:
+            with open(f"{dev}/idVendor") as a, open(f"{dev}/idProduct") as b:
+                if (a.read().strip(), b.read().strip()) != (vendor, product):
+                    continue
+            with open(f"{dev}/power/control", "w") as fh:
+                fh.write("on")
+            n += 1
+        except OSError:
+            continue
+    subprocess.run(["udevadm", "control", "--reload"], capture_output=True)
+    print(f"USB power saving is off for {usbid}" + (" (now and from now on)." if n else " (from now on)."))
+
+
+def usb_power_auto():
+    try:
+        os.unlink(RULE)
+    except FileNotFoundError:
+        pass
+    subprocess.run(["udevadm", "control", "--reload"], capture_output=True)
+    print("USB power saving is back to normal (after the device is next plugged in, or a restart).")
+
+
+def legacy_driver(on):
+    flag = f"--append-if-missing={KARG}" if on else f"--delete-if-present={KARG}"
+    p = subprocess.run(["rpm-ostree", "kargs", flag], capture_output=True, text=True, timeout=300)
+    if p.returncode != 0:
+        fail((p.stderr or p.stdout).strip().splitlines()[-1] if (p.stderr or p.stdout).strip()
+             else "rpm-ostree kargs failed")
+    print("Restart to use the older Intel sound driver." if on else "Restart to go back to the SOF driver.")
+
+
+def main(argv):
+    if os.geteuid() != 0:
+        fail("This needs to run as root (through pkexec).")
+    cmd = argv[1] if len(argv) > 1 else ""
+    if cmd == "usb-power-on" and len(argv) > 2:
+        usb_power_on(argv[2].lower())
+    elif cmd == "usb-power-auto":
+        usb_power_auto()
+    elif cmd == "legacy-driver" and len(argv) > 2 and argv[2] in ("on", "off"):
+        legacy_driver(argv[2] == "on")
+    else:
+        fail(__doc__.strip(), 2)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

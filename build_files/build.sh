@@ -203,7 +203,7 @@ cp -avf /ctx/system_files/. /
 chmod 0755 /usr/bin/firox-* /usr/bin/umu-run
 # System Preparation, Powerwash and first-time setup (root helpers, polkit rule)
 chmod 0755 /usr/libexec/firox/reset /usr/libexec/firox/oobe-apply /usr/libexec/firox/firox-oobe \
-    /usr/libexec/firox/printer-admin
+    /usr/libexec/firox/printer-admin /usr/libexec/firox/sound-admin
 chmod 0644 /usr/share/polkit-1/rules.d/50-firox-oobe.rules
 # SELinux: setup's helper runs from the login screen (xdm_t) through pkexec, which
 # keeps that domain; there useradd can't lock /etc/group. The module labels it
