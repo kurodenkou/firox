@@ -175,7 +175,28 @@ PACKAGES=(
     python3-pyclip               # Waydroid shares the clipboard with Android
 )
 
+# zstd and libzstd must stay the same version. The zstd program only asks for
+# "a libzstd.so.1", so when a package below pulls in a newer libzstd from
+# updates, dnf upgrades the library (64- and 32-bit) and leaves the program
+# behind: zstd 1.5.7 on libzstd 1.6.0 broke the build when Fedora 44 moved to
+# 1.6.0 before the base image did. Upgrade the pair together first, with
+# fresh metadata (/var/cache is a cache mount kept between builds, so dnf's
+# copy can be days old), and check again after the last package step.
+zstd_versions() { rpm -q --qf '%{NAME}.%{ARCH} %{VERSION}-%{RELEASE}\n' zstd libzstd || true; }
+zstd_in_step() {
+    [ "$(zstd_versions | awk '{print $2}' | sort -u | wc -l)" -eq 1 ] && return 0
+    echo "zstd and libzstd differ:"; zstd_versions
+    dnf5 -y upgrade zstd libzstd || true
+    [ "$(zstd_versions | awk '{print $2}' | sort -u | wc -l)" -eq 1 ] && return 0
+    dnf5 -y distro-sync zstd libzstd || true
+    [ "$(zstd_versions | awk '{print $2}' | sort -u | wc -l)" -eq 1 ] && return 0
+    echo "ERROR: couldn't bring zstd and libzstd to the same version:" >&2; zstd_versions >&2
+    exit 1
+}
+dnf5 -y --refresh upgrade zstd libzstd
+
 dnf5 install -y --setopt=install_weak_deps=False "${PACKAGES[@]}"
+zstd_in_step
 
 # Don't leave third-party repos enabled on the deployed system; updates come
 # from rebuilding the image.
@@ -364,5 +385,7 @@ fi
 ### ---------------------------------------------------------------------------
 ### 7. Cleanup
 ### ---------------------------------------------------------------------------
+zstd_in_step                        # (after every package step above, NVIDIA's included)
+zstd_versions
 dnf5 clean all
 rm -rf /var/lib/dnf /var/cache/* /tmp/* /run/dnf /run/selinux-policy || true
