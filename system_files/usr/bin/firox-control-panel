@@ -793,6 +793,19 @@ class ClipboardDialog(Gtk.Dialog):
         self.keep.set_active(self.values.get("KEEP_AFTER_RESTART", 0) == 1)
         box.pack_start(self.keep, False, False, 0)
 
+        self.middle = Gtk.CheckButton()
+        self.middle.add(Gtk.Label(xalign=0, wrap=True, max_width_chars=44,
+                                  label="Middle-click pastes the text I highlight (the Linux way). Off: the "
+                                        "mouse and Ctrl+V always paste the same thing."))
+        self.middle.set_active(self.values.get("MIDDLE_CLICK_PASTE", 0) == 1)
+        box.pack_start(self.middle, False, False, 0)
+        note = Gtk.Label(xalign=0, wrap=True, max_width_chars=44,
+                         label="For most apps, including the Command Prompt; Firefox after you restart it. "
+                               "Chrome and similar apps always paste the highlighted text with a middle-click.")
+        note.get_style_context().add_class("dim-label")
+        note.set_margin_start(26)
+        box.pack_start(note, False, False, 0)
+
         clear = Gtk.Button(label="Clear clipboard history")
         clear.set_halign(Gtk.Align.START)
         clear.connect("clicked", self.on_clear)
@@ -815,7 +828,8 @@ class ClipboardDialog(Gtk.Dialog):
     def apply(self):
         new = {"HISTORY": int(self.history.get_active()),
                "MAX_ITEMS": int(self.max_items.get_value()),
-               "KEEP_AFTER_RESTART": int(self.keep.get_active())}
+               "KEEP_AFTER_RESTART": int(self.keep.get_active()),
+               "MIDDLE_CLICK_PASTE": int(self.middle.get_active())}
         changed = [f"{k}={v}" for k, v in new.items() if self.before.get(k) != v]
         if changed:
             subprocess.run(["firox-clipboard", "set"] + changed)

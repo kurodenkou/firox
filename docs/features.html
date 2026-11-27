@@ -329,11 +329,12 @@
     <div class="feature-text">
         <h3>Clipboard history</h3>
         <ul>
-    <li>What you copy stays available after the app you copied it from closes.</li>
+    <li>What you copy stays available after the app you copied it from closes: exactly what you copied, never an older item.</li>
+    <li>The mouse and the keyboard paste the same thing: middle-click paste of highlighted text is off (in Firefox a middle-click scrolls), unless you turn it back on.</li>
     <li><kbd>Super</kbd>+<kbd>V</kbd> shows your clipboard history, with search and images.</li>
     <li>Passwords that password managers mark as sensitive are never kept, and the history is cleared when you log off.</li>
 </ul>
-        <p class="tech">firox-clipboard (cliphist). Settings → Clipboard sets the size or turns it off.</p>
+        <p class="tech">firox-clipboard (wl-paste --watch, cliphist). Settings → Clipboard sets the size, turns it off, or brings middle-click paste back (gtk-enable-primary-paste; Firefox's middlemouse.paste).</p>
     </div>
     <figure>
     <img src="screenshots/clipboard-history.png" alt="Clipboard history" loading="lazy">

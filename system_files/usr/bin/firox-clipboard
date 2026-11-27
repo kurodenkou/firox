@@ -5,21 +5,35 @@
 #                                 it goes back on the clipboard, ready to paste
 #   firox-clipboard clear         forget everything copied
 #   firox-clipboard set KEY=VALUE change a setting (HISTORY=1|0, MAX_ITEMS=N,
-#                                 KEEP_AFTER_RESTART=1|0)
+#                                 KEEP_AFTER_RESTART=1|0, MIDDLE_CLICK_PASTE=1|0)
 #   firox-clipboard               show the settings
 #   firox-clipboard start         start the background watcher (at login)
 #
 # On Wayland, copied text belongs to the app it was copied from and is gone
-# once that app closes. The watcher keeps a copy (with cliphist) and puts it
-# back when that happens, so copy -> close the window -> paste works. Items
-# that password managers mark as sensitive are never stored.
+# once that app closes. On every copy the watcher snapshots exactly what was
+# copied (an image, or the text: rich text keeps its words) and, when that
+# app closes, puts that snapshot back, so copy -> close the window -> paste
+# works and pastes what you copied, never an older item. Items password
+# managers mark as sensitive are never stored or brought back. History for
+# Super+V is kept with cliphist.
+#
+# Middle-click paste (Linux's "primary selection": highlighting text makes
+# middle-click paste it, separately from Ctrl+C/Ctrl+V) is off unless
+# MIDDLE_CLICK_PASTE=1, so the mouse and the keyboard paste the same thing.
+# It's switched off in the apps (GTK apps and the Command Prompt through
+# gtk-enable-primary-paste; Firefox through middlemouse.paste, with
+# middle-click scrolling instead), not in labwc: without labwc's primary
+# selection, highlighting text in a GTK app empties the clipboard.
+# Chromium and Electron apps have no such switch.
 # Settings: ~/.config/firox/clipboard.conf (defaults: /etc/firox/clipboard.conf)
 set -u
 
 SYS_CONF=/etc/firox/clipboard.conf
 USER_CONF="${XDG_CONFIG_HOME:-$HOME/.config}/firox/clipboard.conf"
 CFG="${XDG_CONFIG_HOME:-$HOME/.config}"
-KEYS="HISTORY MAX_ITEMS KEEP_AFTER_RESTART"
+KEYS="HISTORY MAX_ITEMS KEEP_AFTER_RESTART MIDDLE_CLICK_PASTE"
+# What's on the clipboard now (data + type), to bring back after its app closes
+SNAP="${XDG_RUNTIME_DIR:-/tmp/firox-$UID}/firox-clipboard"
 
 get() {
     local v=""
@@ -37,10 +51,73 @@ max_items() {
 
 notify() { notify-send -a Clipboard -i org.kde.plasma.clipboard "$@" 2>/dev/null; }
 
+# Middle-click paste on or off in the apps (at login, and when it's changed)
+middle_click() {
+    local on=false line profile
+    [ "$(get MIDDLE_CLICK_PASTE)" = 1 ] && on=true
+    gsettings set org.gnome.desktop.interface gtk-enable-primary-paste "$on" 2>/dev/null
+    # Firefox: Firox's policy makes "off" the default; this records your choice
+    # in each of your profiles (a marked block in user.js, replaced each time)
+    for profile in "$HOME"/.mozilla/firefox/*/prefs.js; do
+        [ -e "$profile" ] || continue
+        line="${profile%/prefs.js}/user.js"
+        touch "$line"
+        sed -i '/firox-clipboard: middle-click/d' "$line"
+        if [ "$on" = true ]; then
+            printf '%s\n' 'user_pref("middlemouse.paste", true); // firox-clipboard: middle-click' \
+                'user_pref("general.autoScroll", false); // firox-clipboard: middle-click' >> "$line"
+        else
+            printf '%s\n' 'user_pref("middlemouse.paste", false); // firox-clipboard: middle-click' \
+                'user_pref("general.autoScroll", true); // firox-clipboard: middle-click' >> "$line"
+        fi
+    done
+}
+
 start() {
+    middle_click
     pkill -u "$USER" -f '^wl-paste --watch firox-clipboard' 2>/dev/null
     [ "$(get KEEP_AFTER_RESTART)" = 1 ] || cliphist wipe 2>/dev/null
+    rm -rf "$SNAP"
     setsid -f wl-paste --watch firox-clipboard _changed </dev/null >/dev/null 2>&1
+}
+
+html_to_text() {
+    python3 -c '
+import html.parser, sys
+class P(html.parser.HTMLParser):
+    def __init__(s): super().__init__(); s.out = []
+    def handle_data(s, d): s.out.append(d)
+    def handle_starttag(s, t, a):
+        if t in ("br", "p", "div", "li", "tr", "h1", "h2", "h3"): s.out.append("\n")
+p = P(); p.feed(sys.stdin.read()); sys.stdout.write("".join(p.out).strip())'
+}
+
+# Save what was just copied, in the one format that pastes everywhere once
+# its app is gone: an image as an image, anything with text as plain text
+# (from the rich text if that's all there is), a file list as a file list.
+snapshot() {
+    local types tmp img
+    types="$(wl-paste --list-types 2>/dev/null)" || return 1
+    tmp="$SNAP.new.$$"
+    rm -rf "$tmp"; mkdir -p -m 700 "$tmp"
+    img="$(printf '%s\n' "$types" | grep -m1 -x 'image/png' || printf '%s\n' "$types" | grep -m1 '^image/')"
+    if [ -n "$img" ]; then
+        wl-paste --no-newline --type "$img" > "$tmp/data" 2>/dev/null && echo "$img" > "$tmp/type"
+    elif printf '%s\n' "$types" | grep -qx -e 'text/plain;charset=utf-8' -e 'text/plain' -e 'UTF8_STRING' \
+            -e 'STRING' -e 'TEXT'; then
+        wl-paste --no-newline --type text > "$tmp/data" 2>/dev/null && echo 'text/plain;charset=utf-8' > "$tmp/type"
+    elif printf '%s\n' "$types" | grep -qx 'text/html'; then
+        wl-paste --no-newline --type text/html 2>/dev/null | html_to_text > "$tmp/data" &&
+            echo 'text/plain;charset=utf-8' > "$tmp/type"
+    elif printf '%s\n' "$types" | grep -qx 'text/uri-list'; then
+        wl-paste --no-newline --type text/uri-list > "$tmp/data" 2>/dev/null && echo 'text/uri-list' > "$tmp/type"
+    fi
+    if [ -s "$tmp/type" ]; then
+        rm -rf "$SNAP"; mv "$tmp" "$SNAP"
+    else
+        rm -rf "$tmp" "$SNAP"           # (something we can't keep: don't bring back an older item)
+        return 1
+    fi
 }
 
 # Run by `wl-paste --watch` on every clipboard change, with the new contents
@@ -49,13 +126,21 @@ start() {
 changed() {
     case "${CLIPBOARD_STATE:-data}" in
         data)
-            cliphist -max-items "$(max_items)" store
+            cat >/dev/null              # (read what wl-paste passed, so the app isn't kept waiting)
+            snapshot && case "$(cat "$SNAP/type")" in
+                image/*|text/plain*) cliphist -max-items "$(max_items)" store < "$SNAP/data" ;;
+            esac
+            ;;
+        sensitive)
+            cat >/dev/null
+            rm -rf "$SNAP"              # a password: nothing to keep, and nothing older to bring back
+            ;;
+        clear)
+            rm -rf "$SNAP"              # an app emptied the clipboard on purpose
             ;;
         nil)
-            # The app that owned the clipboard closed: put its last item back.
-            # (No contents on stdin in this state, so don't read it.)
-            last="$(cliphist list 2>/dev/null | head -n1)"
-            [ -n "$last" ] && printf '%s\n' "$last" | cliphist decode | wl-copy >/dev/null 2>&1
+            # The app that owned the clipboard closed: offer exactly what it had.
+            [ -s "$SNAP/type" ] && wl-copy --type "$(cat "$SNAP/type")" < "$SNAP/data" >/dev/null 2>&1
             ;;
     esac
     return 0
@@ -109,6 +194,7 @@ case "${1:-show}" in
             case "$v" in ''|*[!0-9]*) echo "firox-clipboard: $k needs a number" >&2; exit 2 ;; esac
             sed -i "/^$k=/d" "$USER_CONF"
             echo "$k=$v" >> "$USER_CONF"
+            [ "$k" = MIDDLE_CLICK_PASTE ] && middle_click
         done
         # Shrink the history now if it was made smaller or turned off
         cliphist list 2>/dev/null | tail -n +"$(( $(max_items) + 1 ))" | cliphist delete 2>/dev/null
@@ -119,7 +205,7 @@ case "${1:-show}" in
     history) history ;;
     clear) clear_all ;;
     *)
-        sed -n '2,17s/^# \{0,1\}//p' "$0" >&2
+        sed -n '2,25s/^# \{0,1\}//p' "$0" >&2
         exit 2
         ;;
 esac
