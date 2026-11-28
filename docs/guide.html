@@ -122,11 +122,14 @@ COMMAND=pipes.sh</code></pre></div>
 </ul>
 <div class="code"><pre><code>cp scripts/nightly-build.conf.example ~/.config/firox-build.conf</code></pre></div>
 <p>To push to ghcr.io, put a <a href="https://github.com/settings/tokens/new?scopes=write:packages">token with <code>write:packages</code></a> in <code>~/.config/firox-ghcr-token</code> (<code>chmod 600</code>). To update your Firox machines over the LAN, set <code>LOCAL_REGISTRY</code> and switch them to it with <code>sudo bootc switch 192.168.1.10:5000/firox:latest</code>.</p>
-<p><b>Nightly with cron</b> (<code>crontab -e</code>):</p>
-<div class="code"><pre><code>MAILTO=you@example.com
-30 2 * * *  $HOME/firox/scripts/nightly-build.sh</code></pre></div>
+<p><b>Run it nightly</b> (as the user that builds, not with sudo):</p>
+<div class="code"><pre><code>~/firox/scripts/nightly-build.sh --install-timer 02:30</code></pre></div>
+<p>This makes a systemd user timer, <code>firox-nightly.timer</code>, and turns on lingering so it runs with nobody logged in. A night the machine was off is caught up when it next starts. <code>--remove-timer</code> takes it away.</p>
 <ul>
-    <li><b>Results:</b> each run writes a log to <code>~/.local/state/firox-build/</code> (kept 14 days) and prints a short summary. It exits non-zero if anything failed, so cron mails you.</li>
+    <li><b>Why not cron:</b> rootless podman needs the user's systemd session (<code>XDG_RUNTIME_DIR</code> and its cgroups). Cron jobs don't get one, so builds fail with container runtime errors. If you used cron before, remove that line (<code>crontab -e</code>).</li>
+    <li><b>Run it now and watch:</b> <code>systemctl --user start --no-block firox-nightly</code>, then <code>journalctl --user -fu firox-nightly</code>.</li>
+    <li><b>Results:</b> each run writes a log to <code>~/.local/state/firox-build/</code> (kept 14 days), and its summary goes to the journal. A failed night shows in <code>systemctl --user --failed</code>.</li>
+    <li><b>A new build machine:</b> before building, the script checks what rootless podman needs and says how to fix what's missing. The usual gap is no <code>/etc/subuid</code> and <code>/etc/subgid</code> range for the user: <code>sudo usermod --add-subuids 524288-589823 --add-subgids 524288-589823 $USER</code>, then <code>podman system migrate</code>.</li>
     <li><b>Overlaps:</b> a night that finds the previous build still running skips itself.</li>
     <li><b>Options:</b> <code>--variant main|nvidia</code>, <code>--no-push</code>, <code>--dry-run</code>.</li>
     <li><b>No stale images:</b> every image records the commit it was built from in <code>/usr/share/firox/build-info</code>, and the build step can't be reused from podman's cache once the Firox files change. The nightly build checks the record before pushing, and a mismatch is reported as a failure instead of being published. If the newest kernel has no NVIDIA modules yet, the NVIDIA image is built on the newest earlier base that has them.</li>

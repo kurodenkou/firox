@@ -12,17 +12,21 @@
 #   scripts/nightly-build.sh --dry-run    show what would run
 #   scripts/nightly-build.sh --pr 42      test-build a pull request
 #   scripts/nightly-build.sh --branch NAME        test-build a branch
+#   scripts/nightly-build.sh --install-timer [HH:MM]   run nightly (default 02:30)
+#   scripts/nightly-build.sh --remove-timer       stop running nightly
 #
 # A test build (--pr, --branch) only builds: it never publishes or makes ISOs.
 #
 # Settings: ~/.config/firox-build.conf (or the file in $FIROX_BUILD_CONF);
-# copy scripts/nightly-build.conf.example there. Nightly with cron:
+# copy scripts/nightly-build.conf.example there.
 #
-#   30 2 * * *  /path/to/firox/scripts/nightly-build.sh
-#
-# Logs go to ~/.local/state/firox-build/ (one per run, kept for 14 days).
-# The exit status is non-zero if anything failed, and a short summary is
-# printed at the end, so cron's mail (MAILTO) tells you about failures.
+# Nightly: --install-timer makes a systemd user timer (firox-nightly.timer)
+# and turns on lingering, so it runs without anyone logged in. Prefer it to
+# cron: rootless podman needs the user's systemd session (XDG_RUNTIME_DIR,
+# cgroups), which cron jobs don't get. Logs go to ~/.local/state/firox-build/
+# (one per run, kept for 14 days) and the summary to the journal
+# (journalctl --user -u firox-nightly). The exit status is non-zero if
+# anything failed, so a failed night shows in systemctl --user --failed.
 # Only one run happens at a time; a run that finds another still going exits.
 
 set -uo pipefail
@@ -67,11 +71,77 @@ while [ $# -gt 0 ]; do
         --dry-run) DRY=1 ;;
         --pr) TEST="PR #$2"; FETCH="pull/$2/head"; shift ;;
         --branch) TEST="branch $2"; FETCH="$2"; shift ;;
-        -h|--help) sed -n '2,26s/^# \{0,1\}//p' "$0"; exit 0 ;;
+        --install-timer) TIMER=install; case "${2:-}" in [0-9]*:[0-9]*) AT="$2"; shift ;; esac ;;
+        --remove-timer) TIMER=remove ;;
+        -h|--help) sed -n '2,31s/^# \{0,1\}//p' "$0"; exit 0 ;;
         *) echo "Unknown option: $1 (see --help)" >&2; exit 2 ;;
     esac
     shift
 done
+
+# ------------------------------------------------------------ the timer --
+UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+if [ "${TIMER:-}" = remove ]; then
+    systemctl --user disable --now firox-nightly.timer 2>/dev/null
+    rm -f "$UNIT_DIR/firox-nightly.timer" "$UNIT_DIR/firox-nightly.service"
+    systemctl --user daemon-reload
+    echo "The nightly build timer is removed. (Lingering is left as it is: loginctl disable-linger to turn it off.)"
+    exit 0
+fi
+if [ "${TIMER:-}" = install ]; then
+    AT="${AT:-02:30}"
+    if ! [[ "$AT" =~ ^([01]?[0-9]|2[0-3]):[0-5][0-9]$ ]]; then
+        echo "That isn't a time like 02:30." >&2; exit 2
+    fi
+    if ! systemctl --user show-environment >/dev/null 2>&1; then
+        echo "Can't reach your systemd user session. Log in on the console or over SSH as $(id -un) (not su/sudo) and try again." >&2
+        exit 1
+    fi
+    self="$(readlink -f "$0")"
+    mkdir -p "$UNIT_DIR"
+    cat >"$UNIT_DIR/firox-nightly.service" <<EOF
+[Unit]
+Description=Firox nightly image build
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$self
+# just and cosign are often in ~/.local/bin
+Environment=PATH=%h/.local/bin:%h/bin:/usr/local/bin:/usr/bin:/bin
+TimeoutStartSec=infinity
+Nice=10
+IOSchedulingClass=idle
+EOF
+    cat >"$UNIT_DIR/firox-nightly.timer" <<EOF
+[Unit]
+Description=Firox nightly image build at $AT
+
+[Timer]
+OnCalendar=*-*-* $AT:00
+# Catch up after a night the machine was off
+Persistent=true
+RandomizedDelaySec=5m
+
+[Install]
+WantedBy=timers.target
+EOF
+    systemctl --user daemon-reload &&
+        systemctl --user enable --now firox-nightly.timer || exit 1
+    # Without lingering the user's systemd (and the timer) stops at logout
+    if [ "$(loginctl show-user "$(id -un)" -p Linger --value 2>/dev/null)" != yes ]; then
+        loginctl enable-linger "$(id -un)" 2>/dev/null || sudo -n loginctl enable-linger "$(id -un)" 2>/dev/null ||
+            echo "Couldn't turn on lingering; run: sudo loginctl enable-linger $(id -un)  (else the timer only runs while you're logged in)" >&2
+    fi
+    echo "The Firox build will run every night at $AT, as $(id -un)."
+    systemctl --user list-timers firox-nightly.timer --no-pager | head -2
+    echo "Run it now: systemctl --user start --no-block firox-nightly; follow it: journalctl --user -fu firox-nightly"
+    if crontab -l 2>/dev/null | grep -q nightly-build.sh; then
+        echo "Your crontab still runs nightly-build.sh: remove that line (crontab -e), or it runs twice."
+    fi
+    exit 0
+fi
 
 FETCH="${FETCH:-$BRANCH}"
 if [ -n "$TEST" ]; then
@@ -136,6 +206,27 @@ if [ -n "$COSIGN_KEY_FILE" ] && ! command -v cosign >/dev/null; then missing+=(c
 if [ ${#missing[@]} -gt 0 ]; then
     fail "missing programs: ${missing[*]}"
     finish
+fi
+
+# Rootless podman's needs, each with what to do: these are what fail on a new
+# machine, or under cron, as "container runtime" errors
+if [ "$(id -u)" != 0 ] && [ "$DRY" != 1 ]; then
+    problems=()
+    if [ -z "${XDG_RUNTIME_DIR:-}" ] || [ ! -d "${XDG_RUNTIME_DIR:-/nonexistent}" ]; then
+        problems+=("no user session (XDG_RUNTIME_DIR isn't set; cron doesn't give one): use the timer instead, scripts/nightly-build.sh --install-timer")
+    fi
+    me="$(id -un)"
+    for f in /etc/subuid /etc/subgid; do
+        grep -q "^\($me\|$(id -u)\):" "$f" 2>/dev/null ||
+            problems+=("$me has no range in $f: sudo usermod --add-subuids 524288-589823 --add-subgids 524288-589823 $me, then podman system migrate")
+    done
+    if [ ${#problems[@]} -eq 0 ] && ! perr="$(podman info --format '{{.Host.OCIRuntime.Name}}' 2>&1)"; then
+        problems+=("podman doesn't work: $(tail -n1 <<<"$perr")")
+    fi
+    if [ ${#problems[@]} -gt 0 ]; then
+        for p in "${problems[@]}"; do fail "$p"; done
+        finish
+    fi
 fi
 
 # ----------------------------------------------------------- update source --

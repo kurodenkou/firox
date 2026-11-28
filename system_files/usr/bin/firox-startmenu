@@ -95,6 +95,7 @@ HIDDEN = {
     "firox-startmenu.desktop",
     "org.xfce.mousepad-settings.desktop",
     "network.cycles.wdisplays.desktop",  # use firox-display, which saves the layout
+    "system-config-printer.desktop",     # "Print Settings": Printers and Faxes opens it (Advanced…)
 }
 
 # Freedesktop main categories -> XP-ish folder names, in display order.
