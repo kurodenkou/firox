@@ -231,6 +231,10 @@ chmod 0644 /usr/share/polkit-1/rules.d/50-firox-oobe.rules
 # like GDM's root hooks so it runs unconfined (see the .cil file).
 semodule -i /usr/share/selinux/packages/firox/firox-oobe.cil
 
+# Print Settings duplicates Printers and Faxes, which opens it from Advanced…:
+# hide it from every menu and search, not just Firox's start menu
+desktop-file-edit --set-key=NoDisplay --set-value=true /usr/share/applications/system-config-printer.desktop
+
 # Our .desktop files' file types (Windows programs open with firox-windows,
 # folders with Firox Explorer): GIO only sees what mimeinfo.cache lists
 update-desktop-database -q /usr/share/applications
