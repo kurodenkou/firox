@@ -66,6 +66,8 @@ CSS = b"""
 #card .dim { color: #b8bcc4; }
 #card .title { font-size: 22px; font-weight: 600; }
 #card .error { color: #ff9b8f; }
+#card textview.log, #card textview.log text { background-color: rgba(0, 0, 0, 0.35); color: #d6d9de; font-size: 11px; }
+#card expander title label { color: #b8bcc4; }
 #card scrolledwindow { border: 1px solid rgba(255, 255, 255, 0.20); border-radius: 8px; }
 #card list { background-color: rgba(255, 255, 255, 0.06); border-radius: 8px; }
 #card list row { padding: 6px 10px; color: #f2f2f2; }
@@ -170,6 +172,76 @@ def current_layout():
         pass
     return "us"
 
+
+
+def size_text(n):
+    """Bytes as people read them: 812 MB, 3.4 GB."""
+    for unit, scale in (("GB", 1e9), ("MB", 1e6), ("kB", 1e3)):
+        if n >= scale:
+            return f"{n / scale:.1f} {unit}" if n < 100 * scale else f"{n / scale:.0f} {unit}"
+    return f"{n} bytes"
+
+
+def rate_text(bytes_per_s):
+    """A download speed in bits per second, as ISPs sell them: 42.1 Mbit/s."""
+    bits = bytes_per_s * 8
+    for unit, scale in (("Gbit/s", 1e9), ("Mbit/s", 1e6), ("kbit/s", 1e3)):
+        if bits >= scale:
+            return f"{bits / scale:.1f} {unit}"
+    return f"{bits:.0f} bit/s"
+
+
+def eta_text(seconds):
+    if seconds < 60:
+        return "less than a minute left"
+    minutes = round(seconds / 60)
+    if minutes < 60:
+        return f"about {minutes} minute{'s' if minutes != 1 else ''} left"
+    hours, minutes = divmod(minutes, 60)
+    return f"about {hours} h {minutes:02d} min left"
+
+
+class Speedometer:
+    """Download speed over the last few seconds, from (bytes so far, total) readings."""
+    WINDOW = 5.0
+
+    def __init__(self, clock=time.monotonic):
+        self.clock = clock
+        self.samples = []
+        self.started = None
+        self.last_tick = 0.0
+        self.done = 0
+
+    def describe(self, done, total):
+        now = self.clock()
+        if self.samples and done < self.samples[-1][1]:
+            self.samples = []                       # (a new download began)
+        if self.started is None:
+            self.started = (now, done)
+        self.samples.append((now, done))
+        self.done = done
+        while len(self.samples) > 2 and now - self.samples[0][0] > self.WINDOW:
+            self.samples.pop(0)
+        text = f"{size_text(done)} of {size_text(total)}"
+        (t0, b0), (t1, b1) = self.samples[0], self.samples[-1]
+        if t1 - t0 >= 1.0:
+            rate = (b1 - b0) / (t1 - t0)
+            text += f"  ·  {rate_text(rate)}"
+            if rate > 0 and done < total:
+                text += f"  ·  {eta_text((total - done) / rate)}"
+        return text
+
+    def ticked(self, every=5.0):
+        now = self.clock()
+        if now - self.last_tick >= every:
+            self.last_tick = now
+            return True
+        return False
+
+    def summary(self):
+        t0, b0 = self.started
+        took = max(1.0, self.clock() - t0)
+        return f"Downloaded {size_text(self.done)} at {rate_text((self.done - b0) / took)} on average"
 
 class Greetd:
     """Minimal greetd IPC client (as in firox-welcome)."""
@@ -551,7 +623,32 @@ class Setup(Gtk.Window):
         self.update_log = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END, max_width_chars=52)
         self.update_log.get_style_context().add_class("dim")
         box.pack_start(self.update_log, False, False, 0)
+        # How much, how fast, how long: "1.2 GB of 3.4 GB · 42.1 Mbit/s · about 6 minutes left"
+        self.update_stats = Gtk.Label(xalign=0)
+        box.pack_start(self.update_stats, False, False, 0)
+        self.speed = Speedometer()
+        # Everything bootc says, for whoever wants to watch
+        self.update_details = Gtk.TextView(editable=False, cursor_visible=False, monospace=True,
+                                           wrap_mode=Gtk.WrapMode.WORD_CHAR, left_margin=8, right_margin=8,
+                                           top_margin=6, bottom_margin=6)
+        buf = self.update_details.get_buffer()
+        self.update_end = buf.create_mark("end", buf.get_end_iter(), False)
+        self.update_details.get_style_context().add_class("log")
+        scroller = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
+        scroller.set_size_request(-1, 150)
+        scroller.add(self.update_details)
+        expander = Gtk.Expander(label="Show details")
+        expander.add(scroller)
+        box.pack_start(expander, False, False, 0)
         return box
+
+    def update_detail(self, text):
+        buf = self.update_details.get_buffer()
+        if buf.get_line_count() > 2000:            # (keep the newest)
+            buf.delete(buf.get_start_iter(), buf.get_iter_at_line(500))
+        buf.insert(buf.get_end_iter(), f"{time.strftime('%H:%M:%S')}  {text}\n")
+        # (once GTK has measured the new line)
+        GLib.idle_add(lambda: self.update_details.scroll_to_mark(self.update_end, 0, False, 0, 1) and False)
 
     def page_region(self):
         box = self.title("Time zone and keyboard", None)
@@ -729,8 +826,30 @@ class Setup(Gtk.Window):
 
     def update_line(self, line):
         kind, _, text = line.partition(" ")
+        if kind in ("STEP", "LOG"):
+            self.update_detail(text)
         if kind == "STEP":
             self.update_log.set_text(text)
+        elif kind == "BYTES":
+            try:
+                done, total = (int(n) for n in text.split()[:2])
+            except ValueError:
+                return False
+            if self.pulse:
+                GLib.source_remove(self.pulse)
+                self.pulse = None
+            self.update_bar.set_fraction(min(1.0, done / total) if total else 0)
+            self.update_stats.set_text(self.speed.describe(done, total))
+            if self.speed.ticked():                 # (a line a few seconds in the details, not hundreds)
+                self.update_detail("Downloaded " + ", ".join(self.update_stats.get_text().split("  ·  ")[:2]))
+        elif kind == "PHASE":
+            parts = text.split(" ", 2)
+            if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+                what = parts[2] if len(parts) > 2 else "Getting it ready"
+                self.update_log.set_text(f"{what} (step {parts[0]} of {parts[1]})")
+                self.update_detail(self.update_log.get_text())
+                if self.speed.started and self.update_bar.get_fraction() >= 0.999:
+                    self.update_stats.set_text(self.speed.summary())
         elif kind == "LOG":
             m = re.search(r"(\d{1,3})%", text)
             if m and self.pulse:

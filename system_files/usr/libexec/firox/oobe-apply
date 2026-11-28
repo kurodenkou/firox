@@ -15,6 +15,8 @@ NVIDIA's driver built in); otherwise update the image this computer
 follows. Progress goes to stdout, one line at a time:
 
     STEP <what's happening>     LOG <bootc's own output>
+    BYTES <done> <total>        (the download so far, from bootc --progress-fd)
+    PHASE <n> <of> <what>       (bootc's steps after the download)
     RESULT staged|current       (staged: restart to use it)
     MOK <password>              (Secure Boot is on: the NVIDIA driver's
                                  signing key is waiting to be enrolled at
@@ -34,6 +36,7 @@ import pwd
 import re
 import subprocess
 import sys
+import threading
 
 FLAG = "/var/lib/firox/oobe"
 USER_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
@@ -101,8 +104,77 @@ def nvidia_image(ref):
     return f"{name}-nvidia-open:{tag}"
 
 
+SAY_LOCK = threading.Lock()
+
+
 def say(kind, text=""):
-    print(f"{kind} {text}".rstrip(), flush=True)
+    with SAY_LOCK:                  # (bootc's output and its progress come from two threads)
+        print(f"{kind} {text}".rstrip(), flush=True)
+
+
+BOOTC_NO_PROGRESS_FD = False
+
+
+def progress_lines(event):
+    """bootc's progress events (JSON lines, org.containers.bootc.progress/v1) as
+    BYTES/PHASE lines, or None."""
+    kind = event.get("type")
+    if kind == "ProgressBytes":
+        done, total = event.get("bytes"), event.get("bytesTotal")
+        if isinstance(done, int) and isinstance(total, int) and total > 0:
+            return f"BYTES {done} {total}"
+    elif kind == "ProgressSteps":
+        n, of = event.get("steps"), event.get("stepsTotal")
+        what = " ".join(str(event.get("description") or "").split())[:120]
+        if isinstance(n, int) and isinstance(of, int) and of > 0:
+            return f"PHASE {n} {of} {what}".rstrip()
+    return None
+
+
+def run_bootc(cmd, progress):
+    """Run bootc upgrade/switch, passing its output on as LOG lines and (with
+    progress) its progress as BYTES/PHASE lines. Its exit status."""
+    global BOOTC_NO_PROGRESS_FD
+    rfd = wfd = None
+    argv = list(cmd)
+    if progress:
+        rfd, wfd = os.pipe()
+        argv += ["--progress-fd", str(wfd)]
+
+    def read_progress():
+        with os.fdopen(rfd, errors="replace") as fh:
+            last = None
+            for raw in fh:
+                try:
+                    event = json.loads(raw)
+                except ValueError:
+                    continue
+                line = progress_lines(event) if isinstance(event, dict) else None
+                if line and line != last:
+                    say(*line.split(" ", 1))
+                    last = line
+    reader = None
+    try:
+        proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+                                pass_fds=(wfd,) if progress else ())
+    finally:
+        if wfd is not None:
+            os.close(wfd)           # bootc holds the write end now
+    if progress:
+        reader = threading.Thread(target=read_progress, daemon=True)
+        reader.start()
+    output = []
+    for line in proc.stdout:
+        line = line.strip()
+        if line:
+            output.append(line)
+            say("LOG", line[:300])
+    rc = proc.wait()
+    if reader:
+        reader.join(5)
+    if progress and rc == 2 and any("progress-fd" in ln for ln in output[-5:]):
+        BOOTC_NO_PROGRESS_FD = True
+    return rc
 
 
 def update():
@@ -117,14 +189,11 @@ def update():
     else:
         say("STEP", "Downloading the latest Firox")
         cmd = ["bootc", "upgrade"]
-    # (bootc's progress bars: their carriage returns become lines here)
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
-    for line in proc.stdout:
-        line = line.strip()
-        if line:
-            say("LOG", line[:300])
-    if proc.wait() != 0:
-        fail(f"{' '.join(cmd)} failed (exit {proc.returncode})")
+    rc = run_bootc(cmd, progress=True)
+    if rc == 2 and BOOTC_NO_PROGRESS_FD:
+        rc = run_bootc(cmd, progress=False)     # an older bootc, without --progress-fd
+    if rc != 0:
+        fail(f"{' '.join(cmd)} failed (exit {rc})")
     staged = bool((bootc_status().get("status") or {}).get("staged"))
     if staged and target != current and os.path.exists(MOK_CERT):
         sb = subprocess.run(["mokutil", "--sb-state"], capture_output=True, text=True).stdout.lower()
